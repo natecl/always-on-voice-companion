@@ -30,9 +30,10 @@ config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 - macOS 13+ for audio capture; 15+ for in-stream mic.
 
 ## Permission UX
-- **Purely TCC-gated — no entitlement, no Apple approval.** `NSScreenCaptureUsageDescription` in Info.plist (missing = app terminated).
-- User grants once: System Settings → Privacy & Security → Screen & System Audio Recording.
-- Dev gotcha: during development the granted binary is the terminal/IDE, not the app.
+- **Screen capture is purely TCC-gated — no entitlement, no Apple approval.** `NSScreenCaptureUsageDescription` in Info.plist (missing = app terminated).
+- **Microphone is not, once the hardened runtime is on:** a hardened binary needs `com.apple.security.device.audio-input` or TCC opens no microphone case — no Allow, no row in the Microphone pane, and `AVCaptureDevice.authorizationStatus` is not a grant. Catcher.app is hardened; the entitlement lives in `Catcher.entitlements`.
+- User grants once: System Settings → Privacy & Security → Screen & System Audio Recording, and Microphone.
+- Dev gotcha: TCC bills the *responsible process*. A binary exec'd from a shell inherits Terminal/Cursor/Xcode as that process, so the grant and the prompt belong to them, not the app. Launch through LaunchServices (`open -n`, Finder, `NSWorkspace.openApplication`). `responsibility_get_pid_responsible_for_pid(getpid()) == getpid()` is the check.
 - Verifier hook: attempt `startCapture()` at launch — no grant → loud onboarding block, never a fake "recording" state.
 
 ## Grok streaming wire format
