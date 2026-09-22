@@ -35,6 +35,8 @@ export CATCHER_APP="$PWD/build/Build/Products/Debug/Catcher.app"
 
 Info.plist keys: `NSScreenCaptureUsageDescription`, `NSMicrophoneUsageDescription`. Bundle id: `com.catcher.app`.
 
+**Microphone Allow dialog:** the Microphone pane has no +. Catcher is listed there only after the system Allow dialog. Launch finishes the screen-capture prompt before asking for the microphone, and both microphone calls run on the main thread (`AVAudioApplication.requestRecordPermission` while status is `.notDetermined`, then `AVCaptureDevice.requestAccess`). Off-main `requestAccess` returns false and stores `.denied` with no dialog — that is the launch banner `BLOCKED: microphone access denied` right after a Microphone reset. **Request microphone** prompts only and does not open System Settings. If Allow still does not appear, the red line in the window shows authorizationStatus at launch and before/after `requestAccess`. Console logs the same lines as `Catcher mic authorizationStatus`. A Zoom call can hide the dialog. Re-grant opens Screen & System Audio only for a screen-recording block.
+
 `XAI_API_KEY` is required for `CATCHER_ENGINE=grok`. Audio is not sent until the socket receives `transcript.created`.
 
 ## Where sessions land

@@ -7,6 +7,7 @@ struct VerifierStatusView: View {
     var updatedAt: Date
     var isRecording: Bool
     var regrant: () -> Void
+    var requestMicrophone: () -> Void
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { _ in
@@ -25,6 +26,8 @@ struct VerifierStatusView: View {
                     .foregroundStyle(color)
                     .clipShape(Capsule())
                     .accessibilityIdentifier("verifierPill")
+                Button("Request microphone", action: requestMicrophone)
+                    .accessibilityIdentifier("requestMicrophoneButton")
                 if status.isBlocked {
                     Button("Re-grant", action: regrant)
                         .accessibilityIdentifier("regrantButton")

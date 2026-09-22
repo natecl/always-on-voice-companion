@@ -22,16 +22,123 @@ public enum PermissionGate {
         #endif
     }
 
-    /// System microphone dialog, only while access is still `.notDetermined`.
-    /// Returns true when the user grants it. Denied, restricted, and
-    /// already-determined statuses return false and do not present a dialog.
-    /// Until this runs, the app is missing from the Microphone list.
-    public static func requestMicrophoneAccessIfNotDetermined() async -> Bool {
+    /// Microphone Allow dialog only. Does not open System Settings.
+    /// The launch probe calls this only after the screen-capture prompt has
+    /// finished. A denied or still-undetermined result does not mean Catcher
+    /// is on the Microphone list — that pane has no +.
+    public static func promptMicrophone() async -> MicrophonePromptReport {
         #if canImport(ScreenCaptureKit)
-        return await SCKPermissionProbe.requestMicrophoneAccessIfNotDetermined()
+        return await SCKPermissionProbe.promptMicrophone()
         #else
-        return false
+        return MicrophonePromptReport(
+            attempt: .notDetermined,
+            statusAtLaunch: "unavailable",
+            statusBeforeRequestAccess: "unavailable",
+            statusAfterRequestAccess: "unavailable"
+        )
         #endif
+    }
+
+    public static func latestMicrophonePrompt() async -> MicrophonePromptReport? {
+        #if canImport(ScreenCaptureKit)
+        return await SCKPermissionProbe.latestMicrophonePrompt()
+        #else
+        return nil
+        #endif
+    }
+}
+
+/// Statuses around the launch / Request microphone prompt. Settings is not opened.
+public struct MicrophonePromptReport: Sendable, Equatable {
+    public var attempt: MicrophonePromptAttempt
+    public var statusAtLaunch: String
+    public var statusBeforeRequestAccess: String
+    public var statusAfterRequestAccess: String
+
+    public var loudFailure: String? {
+        guard attempt != .granted else { return nil }
+        return MicrophoneRegrant.dialogFailedCopy(
+            atLaunch: statusAtLaunch,
+            before: statusBeforeRequestAccess,
+            after: statusAfterRequestAccess
+        )
+    }
+}
+
+/// Result of a microphone prompt that did not open System Settings.
+public enum MicrophonePromptAttempt: String, Sendable, Equatable {
+    case granted
+    case denied
+    case notDetermined
+    case restricted
+
+    public var authorizationStatus: String {
+        switch self {
+        case .granted: "authorized"
+        case .denied: "denied"
+        case .notDetermined: "notDetermined"
+        case .restricted: "restricted"
+        }
+    }
+}
+
+/// Launch order. Screen capture must settle before any microphone prompt.
+public enum LaunchPermissionOrder: Sendable {
+    public static let steps: [LaunchPermissionStep] = [
+        .resolveScreenCapture,
+        .promptMicrophone,
+    ]
+}
+
+public enum LaunchPermissionStep: String, Sendable, Equatable {
+    case resolveScreenCapture
+    case promptMicrophone
+}
+
+public enum MicrophoneRegrant {
+    public static func blockReason(for attempt: MicrophonePromptAttempt) -> String {
+        switch attempt {
+        case .granted:
+            ""
+        case .denied:
+            "microphone access denied"
+        case .notDetermined:
+            "microphone access not determined"
+        case .restricted:
+            "microphone access unavailable"
+        }
+    }
+
+    public static func statusName(forBlockReason reason: String) -> String {
+        let lower = reason.lowercased()
+        if lower.contains("not determined") { return "notDetermined" }
+        if lower.contains("unavailable") || lower.contains("restricted") { return "restricted" }
+        return "denied"
+    }
+
+    /// Shown when the prompt did not grant access. Not a substitute for opening Settings.
+    public static func dialogFailedCopy(atLaunch: String, before: String, after: String) -> String {
+        let verdict: String
+        if atLaunch == "notDetermined" && before != "notDetermined" && before != "authorized" {
+            verdict = "Status went from notDetermined at launch to \(before) before requestAccess, then requestAccess saw \(after)."
+        } else if before == "notDetermined" && (after == "denied" || after == "restricted") {
+            verdict = "requestAccess changed \(before) to \(after) without an Allow answer."
+        } else if before == "denied" || before == "restricted" {
+            verdict = "Status was already \(before) before requestAccess, so macOS will not show Allow."
+        } else if after == "notDetermined" {
+            verdict = "Status is still notDetermined after requestAccess. The Allow dialog did not finish."
+        } else {
+            verdict = "Microphone stayed \(after)."
+        }
+        return "\(verdict) The Microphone list has no +. System Settings was not opened. Press Request microphone with Catcher in front and other permission windows closed. A Zoom call can hide Allow. Launch status was \(atLaunch). Console logs Catcher mic authorizationStatus before and after requestAccess."
+    }
+
+    /// The Microphone pane has no +. Never open it as the recovery for a failed prompt.
+    public static func opensMicrophoneSettings(after attempt: MicrophonePromptAttempt) -> Bool {
+        switch attempt {
+        case .granted, .denied, .notDetermined, .restricted:
+            false
+        }
     }
 }
 
@@ -59,21 +166,26 @@ public enum PrivacySettingsPane: Sendable, Equatable {
         return .screenCapture
     }
 
-    /// `nil` when a microphone prompt just granted and nothing remains to toggle.
-    /// A follow-up block opens that pane, so a mic grant does not keep sending
-    /// the user to Microphone after the blocker is screen recording.
+    /// `nil` when Settings must stay closed.
+    /// A microphone block never opens the Microphone pane: that list has no +,
+    /// and Catcher is absent until an Allow dialog completes. A mic grant that
+    /// is still blocked opens the follow-up pane (screen recording), not Microphone.
     public static func settingsPane(
         blockReason: String,
         microphonePromptGranted: Bool,
         followUp: PermissionState
     ) -> PrivacySettingsPane? {
         let pane = forBlockReason(blockReason)
-        guard pane == .microphone, microphonePromptGranted else { return pane }
-        switch followUp {
-        case .granted:
-            return nil
-        case .blocked(let reason):
-            return forBlockReason(reason)
+        if pane == .microphone {
+            guard microphonePromptGranted else { return nil }
+            switch followUp {
+            case .granted:
+                return nil
+            case .blocked(let reason):
+                let next = forBlockReason(reason)
+                return next == .microphone ? nil : next
+            }
         }
+        return pane
     }
 }

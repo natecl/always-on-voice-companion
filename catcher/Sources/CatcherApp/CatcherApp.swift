@@ -36,6 +36,7 @@ final class CatcherModel {
     var banner: String?
     var statusUpdatedAt = Date.distantPast
     var lines: [TranscriptLine] = []
+    var permissionAlert: String?
     var sessions: [SessionSummary] = []
     var selectedID: String?
     var selectedTranscript = ""
@@ -89,11 +90,7 @@ final class CatcherModel {
         }
         await refreshSessions()
         let probe = await PermissionGate.startCaptureProbe()
-        if case .blocked(let reason) = probe {
-            status = .blocked(reason)
-            banner = "BLOCKED: \(reason)"
-            statusUpdatedAt = Date()
-        }
+        await applyLaunchProbe(probe)
         listen()
         if autoRecord, !status.isBlocked {
             await toggle()
@@ -121,32 +118,59 @@ final class CatcherModel {
         Task { await self.performRegrant(reason: reason) }
     }
 
+    /// Allow dialog only. Does not open System Settings.
+    func requestMicrophone() {
+        Task { await self.finishMicrophonePrompt(openScreenSettingsIfNeeded: false) }
+    }
+
     private var blockReason: String {
         if case .blocked(let reason) = status { return reason }
         return ""
     }
 
-    /// Mic blocks open Microphone. Screen blocks open Screen & System Audio
-    /// (`Privacy_ScreenCapture`). A still-undetermined mic also gets
-    /// `AVCaptureDevice.requestAccess` so the system dialog can put Catcher
-    /// on the Microphone list without a manual +.
+    /// Microphone blocks prompt for Allow. They do not open the Microphone pane:
+    /// it has no +, and Catcher is missing there until that dialog completes.
+    /// Screen blocks still open Screen & System Audio.
     private func performRegrant(reason: String) async {
-        let asksForMicrophone = PrivacySettingsPane.forBlockReason(reason) == .microphone
-        let promptGranted: Bool
-        if asksForMicrophone {
-            promptGranted = await PermissionGate.requestMicrophoneAccessIfNotDetermined()
-        } else {
-            promptGranted = false
+        if PrivacySettingsPane.forBlockReason(reason) == .microphone {
+            await finishMicrophonePrompt(openScreenSettingsIfNeeded: true)
+            return
         }
-        let followUp: PermissionState = promptGranted ? PermissionGate.recheck() : .blocked(reason: reason)
-        if promptGranted {
+        openSettings(.screenCapture)
+    }
+
+    private func finishMicrophonePrompt(openScreenSettingsIfNeeded: Bool) async {
+        let report = await PermissionGate.promptMicrophone()
+        switch report.attempt {
+        case .granted:
+            permissionAlert = nil
+            let followUp = PermissionGate.recheck()
             applyPermission(followUp)
+            guard openScreenSettingsIfNeeded,
+                  case .blocked(let reason) = followUp,
+                  PrivacySettingsPane.forBlockReason(reason) == .screenCapture else { return }
+            openSettings(.screenCapture)
+        case .denied, .notDetermined, .restricted:
+            applyPermission(.blocked(reason: MicrophoneRegrant.blockReason(for: report.attempt)))
+            permissionAlert = report.loudFailure
         }
-        guard let pane = PrivacySettingsPane.settingsPane(
-            blockReason: reason,
-            microphonePromptGranted: promptGranted,
-            followUp: followUp
-        ) else { return }
+    }
+
+    private func applyLaunchProbe(_ probe: PermissionState) async {
+        guard case .blocked(let reason) = probe else {
+            permissionAlert = nil
+            return
+        }
+        applyPermission(.blocked(reason: reason))
+        guard PrivacySettingsPane.forBlockReason(reason) == .microphone,
+              let report = await PermissionGate.latestMicrophonePrompt() else {
+            permissionAlert = nil
+            return
+        }
+        permissionAlert = report.loudFailure
+    }
+
+    private func openSettings(_ pane: PrivacySettingsPane) {
         #if os(macOS)
         if let url = pane.systemSettingsURL {
             NSWorkspace.shared.open(url)
@@ -203,6 +227,8 @@ final class CatcherModel {
             statusUpdatedAt = snapshot.updatedAt
             if snapshot.status.isBlocked {
                 isRecording = false
+            } else {
+                permissionAlert = nil
             }
         }
     }
@@ -256,8 +282,16 @@ struct ContentView: View {
                     banner: model.banner,
                     updatedAt: model.statusUpdatedAt,
                     isRecording: model.isRecording,
-                    regrant: { model.regrant() }
+                    regrant: { model.regrant() },
+                    requestMicrophone: { model.requestMicrophone() }
                 )
+            }
+            if let alert = model.permissionAlert, !alert.isEmpty {
+                Text(alert)
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("microphonePromptFailure")
             }
             LiveTranscriptView(lines: model.lines)
             SessionListView(

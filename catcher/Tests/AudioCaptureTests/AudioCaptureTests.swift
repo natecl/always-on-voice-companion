@@ -269,7 +269,17 @@ import Testing
         blockReason: "microphone access denied",
         microphonePromptGranted: false,
         followUp: .blocked(reason: "microphone access denied")
-    ) == .microphone)
+    ) == nil)
+    #expect(MicrophoneRegrant.opensMicrophoneSettings(after: .denied) == false)
+    #expect(MicrophoneRegrant.opensMicrophoneSettings(after: .notDetermined) == false)
+    let silentDeny = MicrophoneRegrant.dialogFailedCopy(atLaunch: "notDetermined", before: "notDetermined", after: "denied")
+    #expect(silentDeny.contains("requestAccess changed notDetermined to denied"))
+    #expect(silentDeny.contains("no +"))
+    #expect(silentDeny.contains("System Settings was not opened"))
+    #expect(silentDeny.contains("Request microphone"))
+    let alreadyDenied = MicrophoneRegrant.dialogFailedCopy(atLaunch: "denied", before: "denied", after: "denied")
+    #expect(alreadyDenied.contains("already denied"))
+    #expect(LaunchPermissionOrder.steps == [.resolveScreenCapture, .promptMicrophone])
     #expect(PrivacySettingsPane.settingsPane(
         blockReason: "screen recording access denied",
         microphonePromptGranted: false,
