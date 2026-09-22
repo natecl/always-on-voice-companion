@@ -10,6 +10,12 @@ export CATCHER_ENGINE=stub
 launch_catcher "$SESSION" 1
 afplay "$ROOT/fixtures/known-60s.wav"
 sleep 2
+# kill -9 leaves no end row. The relaunch runs Recovery, which writes ann + end
+# — the same row types a recovered Grok session has. A plain kill does neither.
+kill -9 "$(cat "$SESSION/catcher.pid")" || true
+sleep 1
+launch_catcher "$SESSION" 0
+sleep 3
 kill "$(cat "$SESSION/catcher.pid")" || true
 TARGET="$(resolve_session "$SESSION")"
 ARGS=(--session "$TARGET" --gate P5)

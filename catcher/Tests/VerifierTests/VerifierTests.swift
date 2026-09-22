@@ -24,6 +24,38 @@ import Verifier
     #expect(tripped.snapshot.notificationBody?.isEmpty == false)
 }
 
+@Test func lateSilentFramesStillTripNoAudioAtSessionTenSeconds() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    let system = PCMFrame.silence(track: .system, sampleCount: 160, hostTime: 0)
+    let mic = PCMFrame.silence(track: .microphone, sampleCount: 160, hostTime: 0)
+    _ = await verifier.observeFrame(system, atMs: 2_500)
+    _ = await verifier.observeFrame(mic, atMs: 2_500)
+    let early = await verifier.tick(atMs: 9_999)
+    #expect(early.annotations.isEmpty)
+    let tripped = await verifier.tick(atMs: 10_000)
+    #expect(tripped.annotations.contains { $0.kind == "noAudio" && $0.atMs == 10_000 })
+}
+
+@Test func emptyFinalDoesNotResetTheSilenceClock() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    _ = await verifier.observeFrame(PCMFrame.silence(track: .system, sampleCount: 160, hostTime: 0), atMs: 0)
+    _ = await verifier.observeFrame(PCMFrame.silence(track: .microphone, sampleCount: 160, hostTime: 0), atMs: 0)
+    let blank = TranscriptEvent(
+        track: .system,
+        kind: .final,
+        text: "",
+        words: [],
+        seq: 1,
+        startMs: 2_000,
+        endMs: 4_000
+    )
+    _ = await verifier.observeEngine(.transcript(blank), track: .system, atMs: 4_000, storedCount: 0)
+    let tripped = await verifier.tick(atMs: 10_000)
+    #expect(tripped.annotations.contains { $0.kind == "noAudio" && $0.atMs == 10_000 })
+}
+
 @Test func loudSystemTrackDoesNotFailBecauseTheMicIsQuiet() async {
     let verifier = Verifier()
     _ = await verifier.beginSession(atMs: 0)

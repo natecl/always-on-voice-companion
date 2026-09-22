@@ -6,6 +6,7 @@ public actor SessionStore {
     public private(set) var fsyncCount = 0
     private let writer: JSONLWriter
     private var seq = 0
+    private var committed: [String: [SegmentRow]] = [:]
 
     public init(directory: URL) throws {
         self.directory = directory
@@ -23,13 +24,20 @@ public actor SessionStore {
     }
 
     /// Partials are never written. Every stored segment is a final and is fsync'd.
-    public func appendSegment(_ segment: SegmentRow) throws {
+    /// Blank text is silence-endpoint spam. A row whose words restate finals it
+    /// already covers is the stitched utterance, not new speech.
+    @discardableResult
+    public func appendSegment(_ segment: SegmentRow) throws -> Bool {
+        if Self.normalizedWords(segment.text).isEmpty { return false }
+        if isCoveredRestatement(segment) { return false }
         var stored = segment
         seq += 1
         stored.seq = seq
         stored.final = true
         try append(.seg(stored), fsync: true)
         syncedFinalCount += 1
+        committed[stored.track, default: []].append(stored)
+        return true
     }
 
     public func appendAnnotation(_ annotation: AnnotationRow) throws {
@@ -66,6 +74,44 @@ public actor SessionStore {
             summaries.append(Assembler.summary(rows: contents.rows, recovered: false))
         }
         return summaries.sorted { $0.startedAt > $1.startedAt }
+    }
+
+    /// `speech_final` / `transcript.done` repeat chunk text over the same span.
+    /// A later sentence that merely uses the same words does not cover that span.
+    private func isCoveredRestatement(_ segment: SegmentRow) -> Bool {
+        let candidate = Self.normalizedWords(segment.text)
+        let prior = committed[segment.track] ?? []
+        let tolerance = 250
+        var collected: [[String]] = []
+        for row in prior.reversed() {
+            if row.endMs + tolerance < segment.startMs { break }
+            let covers = segment.startMs <= row.startMs + tolerance
+                && segment.endMs + tolerance >= row.endMs
+            if !covers { break }
+            collected.append(Self.normalizedWords(row.text))
+            var joined: [String] = []
+            for words in collected.reversed() {
+                joined.append(contentsOf: words)
+            }
+            if joined == candidate { return true }
+            if joined.count > candidate.count { return false }
+        }
+        return false
+    }
+
+    static func normalizedWords(_ text: String) -> [String] {
+        var words: [String] = []
+        var current = ""
+        for scalar in text.lowercased().unicodeScalars {
+            if CharacterSet.alphanumerics.contains(scalar) || scalar == "'" {
+                current.unicodeScalars.append(scalar)
+            } else if !current.isEmpty {
+                words.append(current)
+                current = ""
+            }
+        }
+        if !current.isEmpty { words.append(current) }
+        return words
     }
 
     private func append(_ row: SessionRow, fsync: Bool) throws {

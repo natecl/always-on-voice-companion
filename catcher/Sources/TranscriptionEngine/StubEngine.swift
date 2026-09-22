@@ -65,9 +65,11 @@ public actor StubEngine: TranscriptionEngine {
             track: track,
             kind: .final,
             text: "catcher stub \(finalIndex)",
-            words: [TranscriptWord(w: "catcher", startMs: startMs, endMs: endMs, conf: 0.99)],
+            words: [TranscriptWord(w: "catcher", startMs: startMs, endMs: endMs)],
             speaker: track == .system ? "S1" : nil,
-            confidence: 0.99,
+            // No segment-level confidence. Grok omits `conf` unless the server
+            // sent word scores; a canned 0.99 makes the stub JSONL a different shape.
+            confidence: nil,
             seq: finalSeq,
             startMs: startMs,
             endMs: endMs

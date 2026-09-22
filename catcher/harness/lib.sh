@@ -60,6 +60,10 @@ launch_catcher() {
   if [[ "$auto" == "1" ]]; then
     export CATCHER_AUTO_RECORD=1
     args+=(--auto-record)
+  else
+    # The record launch exports this. A recovery relaunch must not inherit it,
+    # or it opens a second empty session and that directory is what gets graded.
+    unset CATCHER_AUTO_RECORD
   fi
   "$bin" "${args[@]}" &
   echo $! > "$session/catcher.pid"

@@ -155,6 +155,76 @@ import TranscriptionEngine
     await engine.finish()
 }
 
+@Test func chunkFinalsAreKeptAndTheStitchedSpeechFinalIsDropped() async throws {
+    let transport = ScriptedTransport()
+    let engine = GrokEngine(track: .system, configuration: testConfig(transport))
+    var iterator = engine.events.makeAsyncIterator()
+    let connecting = Task { try await engine.connect(track: .system) }
+    transport.push(.text(#"{"type":"transcript.created"}"#))
+    try await connecting.value
+    transport.push(.text(partial(text: "alpha", start: 0, duration: 3, isFinal: true, speechFinal: false)))
+    transport.push(.text(partial(text: "beta", start: 3, duration: 3, isFinal: true, speechFinal: false)))
+    transport.push(.text(partial(text: "alpha beta", start: 0, duration: 6, isFinal: true, speechFinal: true)))
+    transport.push(.text(#"{"type":"transcript.done","text":"alpha beta","duration":6}"#))
+    var finals: [String] = []
+    for _ in 0..<12 {
+        guard let event = await iterator.next() else { break }
+        if case .transcript(let transcript) = event, transcript.kind == .final {
+            finals.append(transcript.text)
+            if finals.count == 2 { break }
+        }
+    }
+    #expect(finals == ["alpha", "beta"])
+    let extra = Task { await iterator.next() }
+    try await Task.sleep(for: .milliseconds(80))
+    await engine.finish()
+    if case .transcript(let transcript) = await extra.value, transcript.kind == .final {
+        Issue.record("stitched final was emitted: \(transcript.text)")
+    }
+}
+
+@Test func emptyFinalsAreDroppedAndALaterUtteranceIsKept() async throws {
+    let transport = ScriptedTransport()
+    let engine = GrokEngine(track: .system, configuration: testConfig(transport))
+    var iterator = engine.events.makeAsyncIterator()
+    let connecting = Task { try await engine.connect(track: .system) }
+    transport.push(.text(#"{"type":"transcript.created"}"#))
+    try await connecting.value
+    transport.push(.text(partial(text: "  ", start: 0, duration: 2, isFinal: true, speechFinal: true)))
+    transport.push(.text(partial(text: "", start: 2, duration: 2, isFinal: true, speechFinal: false)))
+    transport.push(.text(partial(text: "hello", start: 4, duration: 1, isFinal: true, speechFinal: true)))
+    var finals: [String] = []
+    for _ in 0..<10 {
+        guard let event = await iterator.next() else { break }
+        if case .transcript(let transcript) = event, transcript.kind == .final {
+            finals.append(transcript.text)
+            break
+        }
+    }
+    #expect(finals == ["hello"])
+    await engine.finish()
+}
+
+@Test func transcriptDoneAloneIsTheFinalWhenNothingElseWasCommitted() async throws {
+    let transport = ScriptedTransport()
+    let engine = GrokEngine(track: .microphone, configuration: testConfig(transport))
+    var iterator = engine.events.makeAsyncIterator()
+    let connecting = Task { try await engine.connect(track: .microphone) }
+    transport.push(.text(#"{"type":"transcript.created"}"#))
+    try await connecting.value
+    transport.push(.text(#"{"type":"transcript.done","text":"only tail","duration":1.5}"#))
+    var finals: [String] = []
+    for _ in 0..<8 {
+        guard let event = await iterator.next() else { break }
+        if case .transcript(let transcript) = event, transcript.kind == .final {
+            finals.append(transcript.text)
+            break
+        }
+    }
+    #expect(finals == ["only tail"])
+    await engine.finish()
+}
+
 @Test func missingAPIKeyFailsLoud() async {
     let engine = GrokEngine(track: .system, configuration: GrokEngineConfiguration(
         apiKey: "",
@@ -170,6 +240,19 @@ import TranscriptionEngine
     GrokEngineBootstrap.install()
     let engine = try EngineFactory.make(track: .microphone, environment: ["CATCHER_ENGINE": "grok"])
     #expect(String(describing: type(of: engine)).contains("GrokEngine"))
+}
+
+private func testConfig(_ transport: ScriptedTransport) -> GrokEngineConfiguration {
+    GrokEngineConfiguration(
+        apiKey: "test-key",
+        url: GrokWebSocket.url(),
+        makeTransport: { transport },
+        handshakeTimeout: .seconds(2)
+    )
+}
+
+private func partial(text: String, start: Double, duration: Double, isFinal: Bool, speechFinal: Bool) -> String {
+    #"{"type":"transcript.partial","text":"\#(text)","is_final":\#(isFinal),"speech_final":\#(speechFinal),"start":\#(start),"duration":\#(duration)}"#
 }
 
 private func seconds(_ duration: Duration) -> Double {

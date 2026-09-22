@@ -48,6 +48,24 @@ import Testing
     #expect(seg.words.first?.w == "hello")
 }
 
+@Test func blankAndRestatedFinalsAreNotWritten() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("catcher-dedupe-\(UUID().uuidString)", isDirectory: true)
+    let store = try SessionStore(directory: directory)
+    try await store.begin(SessionHeader(
+        id: "abc", startedAt: "t", engine: "grok", tracks: ["system"], app: "0.0.1"
+    ))
+    #expect(try await store.appendSegment(segment("  ", start: 0, end: 1_000)) == false)
+    #expect(try await store.appendSegment(segment("Hello, there.", start: 0, end: 3_000)) == true)
+    #expect(try await store.appendSegment(segment("friend", start: 3_000, end: 5_000)) == true)
+    #expect(try await store.appendSegment(segment("hello there friend", start: 0, end: 5_000)) == false)
+    #expect(try await store.appendSegment(segment("hello there", start: 8_000, end: 9_000)) == true)
+    #expect(await store.syncedFinalCount == 3)
+    let text = try String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)
+    #expect(!text.contains("\"conf\""))
+    #expect(text.components(separatedBy: "hello there friend").count == 1)
+}
+
 @Test func assemblerNamespacesSpeakersByTrack() {
     let rows: [SessionRow] = [
         .session(SessionHeader(id: "1", startedAt: "t", engine: "stub", tracks: ["system", "microphone"], app: "0.0.1")),
@@ -149,6 +167,19 @@ import Testing
         engine: "stub",
         autoRecord: true
     ))
+}
+
+private func segment(_ text: String, start: Int, end: Int) -> SegmentRow {
+    SegmentRow(
+        seq: 0,
+        track: "system",
+        startMs: start,
+        endMs: end,
+        final: true,
+        text: text,
+        speaker: "S1",
+        words: []
+    )
 }
 
 private func decodeLines(_ text: String) throws -> [SessionRow] {

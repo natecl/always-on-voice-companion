@@ -209,14 +209,26 @@ public actor Pipeline {
             if Task.isCancelled { break }
             let stamped = TrackRouter.stamp(event, track: track)
             let at = nowMs()
+            if case .transcript(let transcript) = stamped, transcript.kind == .final {
+                guard sessionOpen, !ended else {
+                    let stored = await store?.syncedFinalCount ?? 0
+                    await emit(await verifier.observeEngine(stamped, track: track, atMs: at, storedCount: stored))
+                    continue
+                }
+                let before = await store?.syncedFinalCount ?? 0
+                // Blank and restated finals are not written. Crash-safety must not
+                // treat that skip as a segment that failed to fsync.
+                guard await storeFinal(transcript) else { continue }
+                let after = await store?.syncedFinalCount ?? before
+                await emit(await verifier.observeEngine(stamped, track: track, atMs: at, storedCount: before))
+                await emit(await verifier.observeStored(count: after, atMs: at))
+                uiContinuation.yield(.transcript(transcript))
+                continue
+            }
             let stored = await store?.syncedFinalCount ?? 0
             await emit(await verifier.observeEngine(stamped, track: track, atMs: at, storedCount: stored))
-            guard sessionOpen, !ended else { continue }
             if case .transcript(let transcript) = stamped {
                 uiContinuation.yield(.transcript(transcript))
-                if transcript.kind == .final {
-                    await storeFinal(transcript, atMs: at)
-                }
             }
         }
     }
@@ -282,9 +294,11 @@ public actor Pipeline {
         }
     }
 
-    private func storeFinal(_ transcript: TranscriptEvent, atMs: Int) async {
+    /// `conf` stays off the segment row. Grok usually has no segment score, and a
+    /// stub `conf` makes P5's key set differ. Word scores still live on `words[].c`.
+    private func storeFinal(_ transcript: TranscriptEvent) async -> Bool {
         do {
-            try await store?.appendSegment(SegmentRow(
+            return try await store?.appendSegment(SegmentRow(
                 seq: transcript.seq,
                 track: transcript.track.rawValue,
                 startMs: transcript.startMs,
@@ -292,13 +306,12 @@ public actor Pipeline {
                 final: true,
                 text: transcript.text,
                 speaker: transcript.speaker,
-                conf: transcript.confidence,
+                conf: nil,
                 words: transcript.words.map { WordStamp(w: $0.w, s: $0.startMs, e: $0.endMs, c: $0.conf) }
-            ))
-            let count = await store?.syncedFinalCount ?? 0
-            await emit(await verifier.observeStored(count: count, atMs: atMs))
+            )) ?? false
         } catch {
             await failClosed("store write failed: \(error)")
+            return false
         }
     }
 

@@ -65,6 +65,7 @@ import TranscriptionEngine
     await pipeline.stop()
     let events = try String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)
     #expect(!events.contains("\"text\":\"partial\""))
+    #expect(!events.contains("\"conf\""))
     #expect(events.contains("\"t\":\"end\""))
     let transcript = try String(contentsOf: SessionPaths.transcriptFile(in: directory), encoding: .utf8)
     #expect(transcript.contains("[them] S1"))

@@ -64,7 +64,11 @@ public actor GrokEngine: TranscriptionEngine {
     private var pumping = false
     private var finishRequested = false
     private var seq = 0
-    private var emittedFinal = false
+    /// Chunk finals (`is_final && !speech_final`) for the current utterance were stored.
+    /// The following `speech_final` is that same utterance stitched again — not new text.
+    private var utteranceHadChunk = false
+    /// This socket already stored a final. `transcript.done` repeats the whole socket.
+    private var socketEmittedFinal = false
     private var backoff = BackoffSchedule()
     private var gap = GapAccount()
     private var handshakeFailure: EngineError?
@@ -221,18 +225,47 @@ public actor GrokEngine: TranscriptionEngine {
             socketOriginMs = PCMClock.milliseconds(bytesSent: bytesSent)
             ready = true
             hasBeenReady = true
+            utteranceHadChunk = false
+            socketEmittedFinal = false
         case .partial(let transcript):
-            emit(transcript, forceFinal: false)
+            commit(transcript, fromDone: false)
         case .done(let transcript):
-            if !emittedFinal && !transcript.text.isEmpty {
-                emit(transcript, forceFinal: true)
-            }
+            commit(transcript, fromDone: true)
         case .error(let message):
             continuation.yield(.error(.protocol(message)))
             continuation.yield(.state(.degraded(reason: message)))
         case .unknown:
             break
         }
+    }
+
+    /// xAI sends three transcript states. Interim (`is_final=false`) is UI-only.
+    /// A chunk final locks ~3s and must be stored. `speech_final` is the chunks
+    /// stitched into one utterance — storing it again doubles the passage.
+    /// `transcript.done` is the same text for the whole socket after `audio.done`.
+    /// Empty finals are silence endpoint spam, not speech, and are not stored.
+    private func commit(_ transcript: GrokTranscript, fromDone: Bool) {
+        let spoken = !transcript.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if fromDone {
+            guard spoken, !socketEmittedFinal else { return }
+            emit(transcript, forceFinal: true)
+            return
+        }
+        if !transcript.isFinal {
+            guard spoken else { return }
+            emit(transcript, forceFinal: false)
+            return
+        }
+        if transcript.speechFinal {
+            let hadChunk = utteranceHadChunk
+            utteranceHadChunk = false
+            guard spoken, !hadChunk else { return }
+            emit(transcript, forceFinal: true)
+            return
+        }
+        guard spoken else { return }
+        utteranceHadChunk = true
+        emit(transcript, forceFinal: true)
     }
 
     private func emit(_ transcript: GrokTranscript, forceFinal: Bool) {
@@ -252,7 +285,7 @@ public actor GrokEngine: TranscriptionEngine {
         let confidences = words.compactMap(\.conf)
         let confidence = confidences.isEmpty ? nil : confidences.reduce(0, +) / Double(confidences.count)
         seq += 1
-        if final { emittedFinal = true }
+        if final { socketEmittedFinal = true }
         continuation.yield(.transcript(TranscriptEvent(
             track: track,
             kind: final ? .final : .partial,

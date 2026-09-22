@@ -13,6 +13,7 @@ public struct AudioFlowCheck: Sendable {
     private var seen: Set<String> = []
     private var quietSince: [String: Int] = [:]
     private var silent: Set<String> = []
+    private var everLoud: Set<String> = []
     private var recordingStartedMs: Int?
     private var trippedAtMs: Int?
 
@@ -25,6 +26,7 @@ public struct AudioFlowCheck: Sendable {
         seen = []
         quietSince = [:]
         silent = []
+        everLoud = []
         recordingStartedMs = nil
         trippedAtMs = nil
     }
@@ -39,11 +41,15 @@ public struct AudioFlowCheck: Sendable {
         let key = track.rawValue
         seen.insert(key)
         if rms > Self.rmsEpsilon {
+            everLoud.insert(key)
             quietSince[key] = nil
             silent.remove(key)
         } else {
             if quietSince[key] == nil {
-                quietSince[key] = atMs
+                // Never-loud audio is quiet from the session start. The first frame
+                // often arrives only after the engine handshake, and dating silence
+                // from that frame pushes noAudio past the 10s gate.
+                quietSince[key] = everLoud.contains(key) ? atMs : (recordingStartedMs ?? atMs)
             }
             if let since = quietSince[key], atMs - since >= Self.silenceLimitMs {
                 silent.insert(key)
