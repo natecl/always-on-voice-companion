@@ -516,7 +516,7 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, CaptureDiagnosti
     private var accepting = false
     private var reportedExtractionFailure = false
     private let counterBox = CaptureCounterBox()
-    private var displayID: UInt32 = 0
+    private let displayID = OSAllocatedUnfairLock(initialState: UInt32(0))
 
     public override init() {
         let frames = AsyncStream<PCMFrame>.makeStream()
@@ -529,9 +529,7 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, CaptureDiagnosti
     }
 
     public func counters() -> CaptureCounters {
-        lock.lock()
-        let display = displayID
-        lock.unlock()
+        let display = displayID.withLock { $0 }
         var snapshot = counterBox.snapshot(displayID: display)
         let fallback = SampleBufferPCM.lastFallbackError()
         if snapshot.firstOSStatus == 0, fallback.status != 0 {
@@ -571,9 +569,7 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, CaptureDiagnosti
               let display = content.displays.first(where: { $0.displayID == chosen }) else {
             throw CaptureError.tccDenied("no display available for whole-display capture")
         }
-        lock.lock()
-        displayID = chosen
-        lock.unlock()
+        displayID.withLock { $0 = chosen }
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
         let streamConfig = SCStreamConfiguration()
         config.apply(to: streamConfig)
