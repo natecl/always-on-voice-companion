@@ -50,11 +50,106 @@ import AppKit
 import AVFoundation
 import CoreGraphics
 import CoreMedia
+import Darwin
 import ScreenCaptureKit
+import Security
 import os
 
 enum SCKPermissionProbe {
     private static let microphoneLog = Logger(subsystem: "com.catcher.app", category: "microphone")
+    private static let authorityLock = NSLock()
+    nonisolated(unsafe) private static var lastLoggedAuthority: String?
+
+    /// Signing does not change while the process runs. Read once.
+    private static let signingFacts: (hardened: Bool?, audioInput: Bool?) = readSigningFacts()
+
+    /// Attribution does not change while the process runs either.
+    private static let responsibleProcess: (pid: Int32?, name: String?) = readResponsibleProcess()
+
+    /// Everything macOS uses to decide the microphone, in one struct. Logged as
+    /// `Catcher mic authority` whenever the verdict changes, and always when `force` is set.
+    static func readAuthority(force: Bool = true) -> MicrophoneAuthority {
+        let status = AVCaptureDevice.authorizationStatus(for: .audio)
+        let record: String
+        if #available(macOS 14.0, *) {
+            switch AVAudioApplication.shared.recordPermission {
+            case .granted: record = "granted"
+            case .denied: record = "denied"
+            case .undetermined: record = "undetermined"
+            @unknown default: record = "unknown"
+            }
+        } else {
+            record = "unavailable"
+        }
+        let bundle = Bundle.main
+        let authority = MicrophoneAuthority(
+            authorizationStatus: describe(status),
+            recordPermission: record,
+            hardenedRuntime: signingFacts.hardened,
+            audioInputEntitlement: signingFacts.audioInput,
+            pid: getpid(),
+            parentPID: getppid(),
+            responsiblePID: responsibleProcess.pid,
+            responsibleName: responsibleProcess.name,
+            bundleIdentifier: bundle.bundleIdentifier,
+            bundlePath: bundle.bundleURL.pathExtension == "app" ? bundle.bundleURL.path : bundle.executableURL?.path
+        )
+        let line = authority.consoleLine
+        authorityLock.lock()
+        let changed = lastLoggedAuthority != line
+        lastLoggedAuthority = line
+        authorityLock.unlock()
+        if force || changed {
+            microphoneLog.notice("\(line, privacy: .public)")
+            NSLog("%@", line as NSString)
+        }
+        return authority
+    }
+
+    private static func readSigningFacts() -> (hardened: Bool?, audioInput: Bool?) {
+        var hardened: Bool?
+        var code: SecCode?
+        if SecCodeCopySelf(SecCSFlags(), &code) == errSecSuccess, let code {
+            var staticCode: SecStaticCode?
+            if SecCodeCopyStaticCode(code, SecCSFlags(), &staticCode) == errSecSuccess, let staticCode {
+                var info: CFDictionary?
+                let flags = SecCSFlags(rawValue: UInt32(kSecCSSigningInformation))
+                if SecCodeCopySigningInformation(staticCode, flags, &info) == errSecSuccess,
+                   let dictionary = info as? [String: Any] {
+                    let raw = (dictionary[kSecCodeInfoFlags as String] as? NSNumber)?.uint32Value ?? 0
+                    hardened = (raw & SecCodeSignatureFlags.runtime.rawValue) != 0
+                }
+            }
+        }
+        var audioInput: Bool?
+        if let task = SecTaskCreateFromSelf(nil) {
+            var error: Unmanaged<CFError>?
+            let value = SecTaskCopyValueForEntitlement(task, "com.apple.security.device.audio-input" as CFString, &error)
+            if error == nil {
+                audioInput = (value as? Bool) ?? (value as? NSNumber)?.boolValue ?? false
+            }
+        }
+        return (hardened, audioInput)
+    }
+
+    /// `responsibility_get_pid_responsible_for_pid` is what tccd itself consults.
+    /// It is exported from libSystem without a public header; resolve it at runtime.
+    private static func readResponsibleProcess() -> (pid: Int32?, name: String?) {
+        typealias Lookup = @convention(c) (pid_t) -> pid_t
+        guard let handle = dlopen(nil, RTLD_NOW),
+              let symbol = dlsym(handle, "responsibility_get_pid_responsible_for_pid") else {
+            return (nil, nil)
+        }
+        let lookup = unsafeBitCast(symbol, to: Lookup.self)
+        let responsible = lookup(getpid())
+        guard responsible > 0 else { return (nil, nil) }
+        if responsible == getpid() {
+            return (responsible, Bundle.main.bundleIdentifier ?? "Catcher")
+        }
+        let app = NSRunningApplication(processIdentifier: responsible)
+        let name = app?.localizedName ?? app?.bundleIdentifier ?? "pid \(responsible)"
+        return (responsible, name)
+    }
 
     /// One launch probe at a time. A second `requestAccess` while the first dialog
     /// is up returns false and TCC records `.denied` with no Allow button.
@@ -83,12 +178,21 @@ enum SCKPermissionProbe {
         let screenGranted = await resolveScreenCapture()
         let afterScreen = AVCaptureDevice.authorizationStatus(for: .audio)
         logStatus("after screen capture before microphone prompt", afterScreen)
+        // Signing and attribution decide before any dialog. A prompt in either
+        // state is a silent deny or a prompt for the wrong app.
+        let preflight = readAuthority()
+        if preflight.recovery == .rebuildWithEntitlement || preflight.recovery == .relaunchUnderOwnIdentity,
+           let reason = preflight.blockReason {
+            return .blocked(reason: reason)
+        }
         let report = await MicrophonePromptGate.shared.run(statusAtLaunch: describe(atLaunch))
-        switch report.attempt {
-        case .granted:
-            break
-        case .denied, .notDetermined, .restricted:
-            return .blocked(reason: MicrophoneRegrant.blockReason(for: report.attempt))
+        // The verdict is the readback after the prompt, not the prompt's own label.
+        let authority = readAuthority()
+        if let reason = authority.blockReason {
+            return .blocked(reason: reason)
+        }
+        if report.attempt != .granted {
+            NSLog("Catcher mic prompt reported \(report.attempt.rawValue) but the readback is \(authority.authorizationStatus); the readback wins")
         }
         if !screenGranted && !CGPreflightScreenCaptureAccess() {
             return .blocked(reason: "screen recording access denied")
@@ -99,7 +203,8 @@ enum SCKPermissionProbe {
             await session.stop()
             return .granted
         } catch {
-            return .blocked(reason: error.localizedDescription)
+            let ns = error as NSError
+            return .blocked(reason: "startCapture failed: \(ns.localizedDescription) (\(ns.domain) \(ns.code))")
         }
     }
 
@@ -107,16 +212,10 @@ enum SCKPermissionProbe {
         if !CGPreflightScreenCaptureAccess() {
             return .blocked(reason: "screen recording access denied")
         }
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized:
-            return .granted
-        case .denied, .restricted:
-            return .blocked(reason: "microphone access denied")
-        case .notDetermined:
-            return .blocked(reason: "microphone access not determined")
-        @unknown default:
-            return .blocked(reason: "microphone access unavailable")
+        if let reason = readAuthority(force: false).blockReason {
+            return .blocked(reason: reason)
         }
+        return .granted
     }
 
     /// Allow dialog only. Does not request screen capture and does not open Settings.
@@ -126,6 +225,19 @@ enum SCKPermissionProbe {
     /// the main actor so it can present Allow before `requestAccess` is called.
     /// `requestAccess` itself is always invoked on the main actor after that.
     fileprivate static func promptBody(statusAtLaunch: String) async -> MicrophonePromptReport {
+        let authority = readAuthority()
+        if authority.recovery == .rebuildWithEntitlement || authority.recovery == .relaunchUnderOwnIdentity {
+            // requestAccess here is either refused with no dialog (signing) or
+            // shows Allow for Terminal/Cursor instead of Catcher (attribution).
+            NSLog("Catcher mic prompt skipped: \(authority.blockReason ?? "blocked")")
+            let current = AVCaptureDevice.authorizationStatus(for: .audio)
+            return MicrophonePromptReport(
+                attempt: attempt(for: current),
+                statusAtLaunch: statusAtLaunch,
+                statusBeforeRequestAccess: describe(current),
+                statusAfterRequestAccess: describe(current)
+            )
+        }
         await MainActor.run {
             NSRunningApplication.current.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
             NSApp.windows.first { $0.canBecomeKey }?.makeKeyAndOrderFront(nil)

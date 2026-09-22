@@ -6,6 +6,7 @@ struct VerifierStatusView: View {
     var banner: String?
     var updatedAt: Date
     var isRecording: Bool
+    var microphoneButtonTitle: String = "Request microphone"
     var regrant: () -> Void
     var requestMicrophone: () -> Void
 
@@ -26,7 +27,7 @@ struct VerifierStatusView: View {
                     .foregroundStyle(color)
                     .clipShape(Capsule())
                     .accessibilityIdentifier("verifierPill")
-                Button("Request microphone", action: requestMicrophone)
+                Button(microphoneButtonTitle, action: requestMicrophone)
                     .accessibilityIdentifier("requestMicrophoneButton")
                 if status.isBlocked {
                     Button("Re-grant", action: regrant)

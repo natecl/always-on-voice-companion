@@ -265,20 +265,41 @@ import Testing
     #expect(screen?.contains("Privacy_ScreenCapture") == true)
     #expect(microphone?.contains("ScreenCapture") != true)
 
+    // No authority readback: Settings stays closed for a microphone block.
     #expect(PrivacySettingsPane.settingsPane(
         blockReason: "microphone access denied",
         microphonePromptGranted: false,
         followUp: .blocked(reason: "microphone access denied")
     ) == nil)
-    #expect(MicrophoneRegrant.opensMicrophoneSettings(after: .denied) == false)
-    #expect(MicrophoneRegrant.opensMicrophoneSettings(after: .notDetermined) == false)
+    // A denied row for Catcher's own identity is the one case the pane can fix.
+    #expect(PrivacySettingsPane.settingsPane(
+        blockReason: "microphone access denied",
+        microphonePromptGranted: false,
+        followUp: .blocked(reason: "microphone access denied"),
+        authority: authority(status: "denied")
+    ) == .microphone)
+    // Signing and attribution blocks are not fixable in Settings.
+    #expect(PrivacySettingsPane.settingsPane(
+        blockReason: "microphone permission is judged for Terminal, not Catcher",
+        microphonePromptGranted: false,
+        followUp: .blocked(reason: "microphone permission is judged for Terminal, not Catcher"),
+        authority: authority(status: "authorized", responsiblePID: 77, responsibleName: "Terminal")
+    ) == nil)
+    #expect(PrivacySettingsPane.settingsPane(
+        blockReason: "microphone blocked by signing: hardened runtime without the audio-input entitlement",
+        microphonePromptGranted: false,
+        followUp: .blocked(reason: "microphone blocked by signing"),
+        authority: authority(status: "denied", entitlement: false)
+    ) == nil)
+    #expect(MicrophoneRegrant.opensMicrophoneSettings(for: authority(status: "denied")))
+    #expect(!MicrophoneRegrant.opensMicrophoneSettings(for: authority(status: "notDetermined")))
     let silentDeny = MicrophoneRegrant.dialogFailedCopy(atLaunch: "notDetermined", before: "notDetermined", after: "denied")
     #expect(silentDeny.contains("requestAccess changed notDetermined to denied"))
     #expect(silentDeny.contains("no +"))
-    #expect(silentDeny.contains("System Settings was not opened"))
     #expect(silentDeny.contains("Request microphone"))
     let alreadyDenied = MicrophoneRegrant.dialogFailedCopy(atLaunch: "denied", before: "denied", after: "denied")
     #expect(alreadyDenied.contains("already denied"))
+    #expect(alreadyDenied.contains("Re-grant opens the Microphone pane"))
     #expect(LaunchPermissionOrder.steps == [.resolveScreenCapture, .promptMicrophone])
     #expect(PrivacySettingsPane.settingsPane(
         blockReason: "screen recording access denied",
@@ -295,6 +316,95 @@ import Testing
         microphonePromptGranted: true,
         followUp: .blocked(reason: "screen recording access denied")
     ) == .screenCapture)
+}
+
+private func authority(
+    status: String,
+    record: String = "granted",
+    hardened: Bool? = true,
+    entitlement: Bool? = true,
+    pid: Int32 = 500,
+    responsiblePID: Int32? = 500,
+    responsibleName: String? = "com.catcher.app"
+) -> MicrophoneAuthority {
+    MicrophoneAuthority(
+        authorizationStatus: status,
+        recordPermission: record,
+        hardenedRuntime: hardened,
+        audioInputEntitlement: entitlement,
+        pid: pid,
+        parentPID: 1,
+        responsiblePID: responsiblePID,
+        responsibleName: responsibleName,
+        bundleIdentifier: "com.catcher.app",
+        bundlePath: "/Applications/Catcher.app"
+    )
+}
+
+@Test func authorizedReadbackIsNeverLabelledDenied() {
+    let ok = authority(status: "authorized")
+    #expect(ok.blockReason == nil)
+    #expect(ok.recovery == .none)
+    #expect(ok.explanation == nil)
+    #expect(ok.consoleLine.contains("verdict=microphone ok"))
+    #expect(ok.consoleLine.hasPrefix("Catcher mic authority "))
+    #expect(!ok.consoleLine.contains("denied"))
+}
+
+@Test func hardenedRuntimeWithoutEntitlementBlocksWhateverTCCSays() {
+    for status in ["authorized", "denied", "notDetermined"] {
+        let unsigned = authority(status: status, entitlement: false)
+        #expect(unsigned.signingBlocksMicrophone)
+        #expect(unsigned.recovery == .rebuildWithEntitlement)
+        #expect(unsigned.blockReason?.contains("hardened runtime") == true)
+        #expect(unsigned.blockReason?.contains("denied") != true)
+        #expect(unsigned.explanation?.contains("com.apple.security.device.audio-input") == true)
+        #expect(unsigned.explanation?.contains("build-app.sh") == true)
+        #expect(unsigned.explanation?.contains("it read \(status)") == true)
+    }
+    // Not hardened: the entitlement is not required.
+    let plain = authority(status: "authorized", hardened: false, entitlement: false)
+    #expect(!plain.signingBlocksMicrophone)
+    #expect(plain.blockReason == nil)
+    // Unknown signing facts never block on their own.
+    let unknown = authority(status: "authorized", hardened: nil, entitlement: nil)
+    #expect(unknown.blockReason == nil)
+}
+
+@Test func launchedFromAShellIsJudgedForTheShellApp() {
+    let inherited = authority(status: "authorized", pid: 500, responsiblePID: 77, responsibleName: "Terminal")
+    #expect(!inherited.ownsTCCIdentity)
+    #expect(inherited.recovery == .relaunchUnderOwnIdentity)
+    #expect(inherited.blockReason == "microphone permission is judged for Terminal, not Catcher")
+    #expect(inherited.explanation?.contains("started by Terminal (pid 77)") == true)
+    #expect(inherited.explanation?.contains("not on the Microphone list") == true)
+    #expect(inherited.explanation?.contains("relaunch") == true)
+    #expect(inherited.recovery.buttonTitle == "Relaunch Catcher for microphone")
+    #expect(PrivacySettingsPane.forBlockReason(inherited.blockReason ?? "") == .microphone)
+    // Signing wins over attribution: nothing else matters until the entitlement is there.
+    let both = authority(status: "authorized", entitlement: false, responsiblePID: 77, responsibleName: "Terminal")
+    #expect(both.recovery == .rebuildWithEntitlement)
+    // Lookup unavailable: assume own identity rather than invent a block.
+    let unknown = authority(status: "authorized", responsiblePID: nil, responsibleName: nil)
+    #expect(unknown.ownsTCCIdentity)
+    #expect(unknown.blockReason == nil)
+}
+
+@Test func ownIdentityStatusesMapToPromptSettingsOrNothing() {
+    let undetermined = authority(status: "notDetermined")
+    #expect(undetermined.recovery == .prompt)
+    #expect(undetermined.blockReason == "microphone access not determined")
+    #expect(undetermined.recovery.buttonTitle == "Request microphone")
+    let denied = authority(status: "denied")
+    #expect(denied.recovery == .openMicrophoneSettings)
+    #expect(denied.blockReason == "microphone access denied")
+    #expect(denied.explanation?.contains("Re-grant opens that pane") == true)
+    #expect(denied.recovery.buttonTitle == "Open Microphone settings")
+    let restricted = authority(status: "restricted")
+    #expect(restricted.recovery == .none)
+    #expect(restricted.blockReason == "microphone access unavailable")
+    #expect(MicrophoneAuthority.unavailable.blockReason == "microphone status unavailable on this platform")
+    #expect(MicrophoneAuthority.unavailable.recovery == .none)
 }
 
 @Test func permissionProbeIsBlockedWithoutScreenCaptureKit() async {

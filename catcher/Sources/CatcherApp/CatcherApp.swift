@@ -37,6 +37,7 @@ final class CatcherModel {
     var statusUpdatedAt = Date.distantPast
     var lines: [TranscriptLine] = []
     var permissionAlert: String?
+    var microphoneRecovery: MicrophoneRecovery = .none
     var sessions: [SessionSummary] = []
     var selectedID: String?
     var selectedTranscript = ""
@@ -118,9 +119,11 @@ final class CatcherModel {
         Task { await self.performRegrant(reason: reason) }
     }
 
-    /// Allow dialog only. Does not open System Settings.
+    /// Reads the microphone authority first, then does the one thing that
+    /// readback calls for. It always re-reads and republishes, so a banner that
+    /// disagrees with `AVCaptureDevice` cannot survive a press.
     func requestMicrophone() {
-        Task { await self.finishMicrophonePrompt(openScreenSettingsIfNeeded: false) }
+        Task { await self.recoverMicrophone(openScreenSettingsIfNeeded: false) }
     }
 
     private var blockReason: String {
@@ -128,46 +131,119 @@ final class CatcherModel {
         return ""
     }
 
-    /// Microphone blocks prompt for Allow. They do not open the Microphone pane:
-    /// it has no +, and Catcher is missing there until that dialog completes.
-    /// Screen blocks still open Screen & System Audio.
     private func performRegrant(reason: String) async {
-        if PrivacySettingsPane.forBlockReason(reason) == .microphone {
-            await finishMicrophonePrompt(openScreenSettingsIfNeeded: true)
+        if PrivacySettingsPane.forBlockReason(reason) == .microphone || reason.hasPrefix("startCapture failed") {
+            await recoverMicrophone(openScreenSettingsIfNeeded: true)
             return
         }
         openSettings(.screenCapture)
     }
 
-    private func finishMicrophonePrompt(openScreenSettingsIfNeeded: Bool) async {
+    private func recoverMicrophone(openScreenSettingsIfNeeded: Bool) async {
+        let authority = PermissionGate.readMicrophoneAuthority()
+        microphoneRecovery = authority.recovery
+        switch authority.recovery {
+        case .rebuildWithEntitlement:
+            publish(authority, prompt: nil)
+            return
+        case .relaunchUnderOwnIdentity:
+            publish(authority, prompt: nil)
+            relaunchUnderOwnIdentity(authority)
+            return
+        case .prompt, .openMicrophoneSettings, .none:
+            break
+        }
+        // Authorized returns at once with no dialog; notDetermined shows Allow;
+        // a stored denial comes straight back and is then routed to Settings.
         let report = await PermissionGate.promptMicrophone()
-        switch report.attempt {
-        case .granted:
-            permissionAlert = nil
-            let followUp = PermissionGate.recheck()
-            applyPermission(followUp)
-            guard openScreenSettingsIfNeeded,
-                  case .blocked(let reason) = followUp,
-                  PrivacySettingsPane.forBlockReason(reason) == .screenCapture else { return }
-            openSettings(.screenCapture)
-        case .denied, .notDetermined, .restricted:
-            applyPermission(.blocked(reason: MicrophoneRegrant.blockReason(for: report.attempt)))
-            permissionAlert = report.loudFailure
+        let after = PermissionGate.readMicrophoneAuthority()
+        microphoneRecovery = after.recovery
+        if after.blockReason != nil {
+            publish(after, prompt: report)
+            if after.recovery == .openMicrophoneSettings {
+                openSettings(.microphone)
+            }
+            return
+        }
+        permissionAlert = nil
+        // Not blocked on the microphone. Re-prove capture instead of trusting
+        // whatever the banner said before. A live session keeps the verifier as
+        // the owner of status and only gets the light recheck.
+        if isRecording {
+            let live = PermissionGate.recheck()
+            if case .blocked = live {
+                applyPermission(live)
+            }
+            return
+        }
+        let followUp = await PermissionGate.startCaptureProbe()
+        applyPermission(followUp)
+        guard openScreenSettingsIfNeeded,
+              case .blocked(let reason) = followUp,
+              PrivacySettingsPane.forBlockReason(reason) == .screenCapture else { return }
+        openSettings(.screenCapture)
+    }
+
+    private func publish(_ authority: MicrophoneAuthority, prompt: MicrophonePromptReport?) {
+        guard let reason = authority.blockReason else { return }
+        applyPermission(.blocked(reason: reason))
+        if authority.recovery == .prompt, let failure = prompt?.loudFailure {
+            permissionAlert = failure
+        } else {
+            permissionAlert = authority.explanation
+        }
+    }
+
+    /// TCC bills the responsible process. Started from a shell, that is Terminal
+    /// or Cursor, and no dialog can ever name Catcher. LaunchServices spawns a
+    /// copy that is responsible for itself, with the same arguments and env.
+    private func relaunchUnderOwnIdentity(_ authority: MicrophoneAuthority) {
+        let url = Bundle.main.bundleURL
+        guard url.pathExtension == "app" else {
+            permissionAlert = (authority.explanation ?? "") + " This binary is not inside a .app bundle, so it cannot relaunch itself. Build with scripts/build-app.sh and start it with open."
+            return
+        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.createsNewApplicationInstance = true
+        configuration.activates = true
+        configuration.arguments = Array(CommandLine.arguments.dropFirst())
+        configuration.environment = ProcessInfo.processInfo.environment.filter {
+            $0.key.hasPrefix("CATCHER_") || $0.key == "XAI_API_KEY"
+        }
+        NSLog("Catcher relaunching \(url.path) through LaunchServices so com.catcher.app is its own TCC identity")
+        NSWorkspace.shared.openApplication(at: url, configuration: configuration) { app, error in
+            let launchedPID = app?.processIdentifier ?? 0
+            let failure = error?.localizedDescription
+            Task { @MainActor in
+                if let failure {
+                    NSLog("Catcher relaunch failed: \(failure)")
+                    self.permissionAlert = (authority.explanation ?? "") + " Relaunch failed: \(failure). Quit Catcher and run: open -n \"\(url.path)\""
+                    return
+                }
+                NSLog("Catcher relaunched as pid \(launchedPID); pid \(authority.pid) exits")
+                NSApp.terminate(nil)
+            }
         }
     }
 
     private func applyLaunchProbe(_ probe: PermissionState) async {
         guard case .blocked(let reason) = probe else {
             permissionAlert = nil
+            microphoneRecovery = .none
             return
         }
         applyPermission(.blocked(reason: reason))
-        guard PrivacySettingsPane.forBlockReason(reason) == .microphone,
-              let report = await PermissionGate.latestMicrophonePrompt() else {
-            permissionAlert = nil
+        guard PrivacySettingsPane.forBlockReason(reason) == .microphone else {
+            permissionAlert = reason.hasPrefix("startCapture failed") ? reason : nil
             return
         }
-        permissionAlert = report.loudFailure
+        let authority = PermissionGate.readMicrophoneAuthority()
+        microphoneRecovery = authority.recovery
+        if authority.recovery == .prompt, let report = await PermissionGate.latestMicrophonePrompt() {
+            permissionAlert = report.loudFailure
+        } else {
+            permissionAlert = authority.explanation
+        }
     }
 
     private func openSettings(_ pane: PrivacySettingsPane) {
@@ -222,11 +298,17 @@ final class CatcherModel {
             }
             rebuildLines()
         case .snapshot(let snapshot):
+            let previous = status
             status = snapshot.status
             banner = snapshot.banner
             statusUpdatedAt = snapshot.updatedAt
-            if snapshot.status.isBlocked {
+            if case .blocked(let reason) = snapshot.status {
                 isRecording = false
+                if previous != snapshot.status, PrivacySettingsPane.forBlockReason(reason) == .microphone {
+                    let authority = PermissionGate.readMicrophoneAuthority()
+                    microphoneRecovery = authority.recovery
+                    permissionAlert = authority.explanation
+                }
             } else {
                 permissionAlert = nil
             }
@@ -282,6 +364,7 @@ struct ContentView: View {
                     banner: model.banner,
                     updatedAt: model.statusUpdatedAt,
                     isRecording: model.isRecording,
+                    microphoneButtonTitle: model.microphoneRecovery.buttonTitle,
                     regrant: { model.regrant() },
                     requestMicrophone: { model.requestMicrophone() }
                 )
