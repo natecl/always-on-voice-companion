@@ -26,6 +26,7 @@ API reference: https://docs.typesafe.ai/api
 """
 
 import argparse
+import http.client
 import json
 import os
 import sys
@@ -117,6 +118,12 @@ def call_jev(body, api_key, retries=4):
             with urllib.request.urlopen(req, timeout=30) as resp:
                 payload = json.loads(resp.read())
             return payload, (time.time() - t0) * 1000
+        except (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected) as e:
+            # Transient network/edge drop (not an API verdict): back off and retry.
+            if attempt < retries:
+                time.sleep(2 ** attempt)
+                continue
+            raise SystemExit(f"Network error after {retries + 1} attempts: {e}")
         except urllib.error.HTTPError as e:
             if e.code in (429, 529) and attempt < retries:
                 time.sleep(2 ** attempt)
