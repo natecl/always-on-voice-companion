@@ -1,0 +1,227 @@
+import Foundation
+
+public protocol AudioCapturing: Sendable {
+    nonisolated var frames: AsyncStream<PCMFrame> { get }
+    nonisolated var failures: AsyncStream<CaptureError> { get }
+    func start() async throws
+    func stop() async
+}
+
+public enum AudioCaptureBackend {
+    public static func make() -> any AudioCapturing {
+        #if canImport(ScreenCaptureKit)
+        return SCKCaptureSession()
+        #else
+        return UnavailableCapture()
+        #endif
+    }
+}
+
+/// Used where ScreenCaptureKit cannot run. `start` fails loud.
+public final class UnavailableCapture: AudioCapturing, @unchecked Sendable {
+    public let frames: AsyncStream<PCMFrame>
+    public let failures: AsyncStream<CaptureError>
+    private let frameContinuation: AsyncStream<PCMFrame>.Continuation
+    private let failureContinuation: AsyncStream<CaptureError>.Continuation
+
+    public init() {
+        let frames = AsyncStream<PCMFrame>.makeStream()
+        let failures = AsyncStream<CaptureError>.makeStream()
+        self.frames = frames.stream
+        self.frameContinuation = frames.continuation
+        self.failures = failures.stream
+        self.failureContinuation = failures.continuation
+    }
+
+    public func start() async throws {
+        let error = CaptureError.unavailable("ScreenCaptureKit is unavailable on this platform")
+        failureContinuation.yield(error)
+        throw error
+    }
+
+    public func stop() async {
+        frameContinuation.finish()
+        failureContinuation.finish()
+    }
+}
+
+#if canImport(ScreenCaptureKit)
+import AVFoundation
+import CoreGraphics
+import CoreMedia
+import ScreenCaptureKit
+
+enum SCKPermissionProbe {
+    static func run() async -> PermissionState {
+        if !CGPreflightScreenCaptureAccess() {
+            _ = CGRequestScreenCaptureAccess()
+        }
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            break
+        case .notDetermined:
+            let granted = await withCheckedContinuation { continuation in
+                AVCaptureDevice.requestAccess(for: .audio) { continuation.resume(returning: $0) }
+            }
+            if !granted {
+                return .blocked(reason: "microphone access denied")
+            }
+        case .denied, .restricted:
+            return .blocked(reason: "microphone access denied")
+        @unknown default:
+            return .blocked(reason: "microphone access unavailable")
+        }
+        if !CGPreflightScreenCaptureAccess() {
+            return .blocked(reason: "screen recording access denied")
+        }
+        let session = SCKCaptureSession()
+        do {
+            try await session.start()
+            await session.stop()
+            return .granted
+        } catch {
+            return .blocked(reason: error.localizedDescription)
+        }
+    }
+
+    static func recheck() -> PermissionState {
+        if !CGPreflightScreenCaptureAccess() {
+            return .blocked(reason: "screen recording access denied")
+        }
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            return .granted
+        case .denied, .restricted:
+            return .blocked(reason: "microphone access denied")
+        case .notDetermined:
+            return .blocked(reason: "microphone access not determined")
+        @unknown default:
+            return .blocked(reason: "microphone access unavailable")
+        }
+    }
+}
+
+public final class SCKCaptureSession: NSObject, AudioCapturing, SCStreamDelegate, @unchecked Sendable {
+    public let frames: AsyncStream<PCMFrame>
+    public let failures: AsyncStream<CaptureError>
+    private let frameContinuation: AsyncStream<PCMFrame>.Continuation
+    private let failureContinuation: AsyncStream<CaptureError>.Continuation
+    private let queue = DispatchQueue(label: "com.catcher.sck", qos: .userInteractive)
+    private let lock = NSLock()
+    private var stream: SCStream?
+    private var outputs: [PCMOutput] = []
+    private var accepting = false
+
+    public override init() {
+        let frames = AsyncStream<PCMFrame>.makeStream()
+        let failures = AsyncStream<CaptureError>.makeStream()
+        self.frames = frames.stream
+        self.frameContinuation = frames.continuation
+        self.failures = failures.stream
+        self.failureContinuation = failures.continuation
+        super.init()
+    }
+
+    public func start() async throws {
+        let config = CaptureConfig.make()
+        guard config.wholeDisplay else {
+            throw CaptureError.streamStopped("capture config is not whole-display")
+        }
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        guard let display = content.displays.first else {
+            throw CaptureError.tccDenied("no display available for whole-display capture")
+        }
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let streamConfig = SCStreamConfiguration()
+        config.apply(to: streamConfig)
+        let stream = SCStream(filter: filter, configuration: streamConfig, delegate: self)
+        let audio = PCMOutput(track: .system) { [weak self] frame in
+            self?.emit(frame)
+        }
+        let microphone = PCMOutput(track: .microphone) { [weak self] frame in
+            self?.emit(frame)
+        }
+        try stream.addStreamOutput(audio, type: .audio, sampleHandlerQueue: queue)
+        try stream.addStreamOutput(microphone, type: .microphone, sampleHandlerQueue: queue)
+        try await stream.startCapture()
+        remember(stream: stream, outputs: [audio, microphone])
+    }
+
+    private func remember(stream: SCStream, outputs: [PCMOutput]) {
+        lock.lock()
+        self.stream = stream
+        self.outputs = outputs
+        self.accepting = true
+        lock.unlock()
+    }
+
+    public func stop() async {
+        let stream = takeStream()
+        if let stream {
+            try? await stream.stopCapture()
+        }
+        frameContinuation.finish()
+        failureContinuation.finish()
+    }
+
+    public func stream(_ stream: SCStream, didStopWithError error: Error) {
+        failureContinuation.yield(Self.classify(error))
+    }
+
+    private func takeStream() -> SCStream? {
+        lock.lock()
+        accepting = false
+        let stream = self.stream
+        self.stream = nil
+        self.outputs = []
+        lock.unlock()
+        return stream
+    }
+
+    private func emit(_ frame: PCMFrame) {
+        lock.lock()
+        let open = accepting
+        lock.unlock()
+        guard open else { return }
+        frameContinuation.yield(frame)
+    }
+
+    static func classify(_ error: Error) -> CaptureError {
+        let ns = error as NSError
+        let blob = (ns.domain + " " + ns.localizedDescription).lowercased()
+        if blob.contains("tcc") || blob.contains("permission") || blob.contains("not authorized") || blob.contains("denied") {
+            return .tccRevokedMidSession
+        }
+        return .streamStopped(ns.localizedDescription)
+    }
+}
+
+private final class PCMOutput: NSObject, SCStreamOutput {
+    let track: AudioTrack
+    let onFrame: (PCMFrame) -> Void
+
+    init(track: AudioTrack, onFrame: @escaping (PCMFrame) -> Void) {
+        self.track = track
+        self.onFrame = onFrame
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .audio || type == .microphone else { return }
+        guard CMSampleBufferGetNumSamples(sampleBuffer) > 0 else { return }
+        do {
+            let data = try SampleBufferPCM.extract(from: sampleBuffer)
+            let frame = PCMFrame(
+                track: track,
+                data: data,
+                hostTime: HostClock.now(),
+                sampleCount: data.count / AudioFormat.bytesPerSample
+            )
+            onFrame(frame)
+        } catch let error as CaptureError {
+            _ = error
+        } catch {
+            _ = error
+        }
+    }
+}
+#endif

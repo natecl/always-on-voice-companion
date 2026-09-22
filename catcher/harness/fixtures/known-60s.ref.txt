@@ -1,0 +1,5 @@
+the quick brown fox jumps over the lazy dog
+this is the catcher reference passage for the sixty second known audio gate
+system audio is the them track and it must come back as words on the system track
+we expect a word error rate at or below fifteen percent with no silent gap over two seconds
+repeat the passage slowly until the minute is finished and then stop

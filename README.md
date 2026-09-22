@@ -22,6 +22,7 @@ Jevons-paradox unlock that makes always-on judgment squanderable at consumer pri
 
 ## Repo map
 
+- `catcher/` — v0 Mac catcher (system audio + mic → verified transcript). QA: `docs/qa/v0-grading.md`
 - `docs/product-vision.md` — overarching product vision spec
 - `docs/proven-better-new.md` — the PBN framework, plus our PBN applied
 - `docs/knowledge/jev.md` — Jev model facts, pricing, access

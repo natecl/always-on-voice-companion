@@ -1,0 +1,22 @@
+name: catcher
+
+on:
+  push:
+    paths:
+      - "catcher/**"
+      - ".github/workflows/catcher-ci.yml"
+  pull_request:
+    paths:
+      - "catcher/**"
+      - ".github/workflows/catcher-ci.yml"
+
+jobs:
+  library:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test library targets
+        working-directory: catcher
+        run: |
+          swift build
+          swift test
