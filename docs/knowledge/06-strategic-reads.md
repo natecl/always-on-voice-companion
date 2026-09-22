@@ -36,6 +36,16 @@ The track-5 research changed the bet's edges, not its shape:
 - **Death of ego:** judge the new by testing variants, not by defending it.
 - **Distribution:** there is no proven consumer distribution path — the viral hook has to live inside the product. (Prosumer / 20M-developer wedge under consideration.)
 
+## The v0 slice (2026-09-22)
+
+The proven base is being built narrow-slice, not as a Granola clone:
+
+- **v0 = audio in → transcript out, plus a verifier.** Capture (ScreenCaptureKit) → Grok 2.0 behind a swappable `TranscriptionEngine` interface → verified transcript on disk. Nothing above it (notes, Jev, interjection, graph) builds until v0 is green.
+- **The verifier is the product of v0** — capture health checks, loud failures, binary pass/fail. It exists because silent capture failure is the category's most-hated property.
+- **Build order:** capture layer first (the hard part), verifier second, Grok wiring third.
+- **Engine is a commodity input, not the moat** — Grok is xAI, same dependency class as Meta. The moat is the context graph + Jev judgment; the interface keeps the engine swappable so no lab is a landlord.
+- v0 brief drafted at `~/workspace/briefs/v0-transcript-foundation/brief.md` — six binary gates (P1–P6). **Awaiting Nathan's approval before Cap builds.**
+
 ## Related
 
 - [00-product-one-liner.md](00-product-one-liner.md) · [01-consumer-wedge.md](01-consumer-wedge.md) · [02-granola.md](02-granola.md) · [03-jev.md](03-jev.md) · [04-always-on-space.md](04-always-on-space.md) · [05-wispr-flow-notetaker.md](05-wispr-flow-notetaker.md)
