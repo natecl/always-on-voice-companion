@@ -1,0 +1,4 @@
+{
+  "name": "Always-On Voice Companion — Jev spike",
+  "install": "python3 --version && python3 -m py_compile spike/jev_spike.py"
+}
