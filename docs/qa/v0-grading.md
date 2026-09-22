@@ -20,7 +20,14 @@ v0 stays red until `grade.json` from a Mac run has P1–P6 all `pass`.
 
    If the window shows a red line under `BLOCKED`, read it: it is the same text as the Console line `Catcher mic authority …` and names the one fix. `audioInputEntitlement=false` with `hardenedRuntime=true` means the bundle was signed without `com.apple.security.device.audio-input`; rebuild with `build-app.sh` (it now fails a build like that). `ownsTCCIdentity=false responsible=Terminal` means it was started from a shell; press **Relaunch Catcher for microphone** or quit and use `open -n`. `status=notDetermined` means Allow can still appear; press **Request microphone** with Catcher in front. `status=denied` means Catcher has a denied row; Re-grant opens Privacy → Microphone where the toggle is. `status=authorized ownsTCCIdentity=true audioInputEntitlement=true` with any denied banner is a bug — copy the Console line and the banner into the report. Quit Zoom before retrying; a call can suppress Allow.
 4. `export XAI_API_KEY=...` for any gate that uses Grok (`P1`, `P3`, `P6`). `CATCHER_ENGINE=grok` is the default. `CATCHER_ENGINE=stub` forces the deterministic engine.
-5. Replace `catcher/harness/fixtures/known-60s.wav` with a clear ~60 s reading of `known-60s.ref.txt` before scoring P1. The file in git is a 16 kHz mono PCM16 carrier so the script has something to play. It is not that reading. WER against the reference will fail until you replace it.
+5. Run preflight before P1. Do not start P1 on a FAIL line; the fix on that line is the next action.
+
+   ```bash
+   ./catcher/harness/run.sh preflight /tmp/catcher-pre
+   ```
+
+   The command exits 0 only when `/tmp/catcher-pre/preflight.txt` ends in `PREFLIGHT RESULT PASS`. Checks, the sample stage log, and how to read a failure are in [`v0-diagnostics.md`](v0-diagnostics.md).
+6. Replace `catcher/harness/fixtures/known-60s.wav` with a clear ~60 s reading of `known-60s.ref.txt` before scoring P1. The file in git is a 16 kHz mono PCM16 carrier so the script has something to play. It is not that reading. WER against the reference will fail until you replace it.
 
 ## How a run is laid out
 
@@ -37,6 +44,7 @@ The path you pass is `CATCHER_SESSION_ROOT`. The app creates one directory per r
   session.json          clean, recovered, segmentCount, engine
   system.pcm            raw PCM16, only because the harness sets CATCHER_HARNESS=1
   microphone.pcm
+  stages.log            stage checkpoints; grade.py does not read this
   grade.json            written by harness/grade.py
   ../catcher.pid        pid of the app binary, next to the uuid directory
   ../live_session       absolute path of the first recording (harness only)
@@ -46,7 +54,7 @@ The path you pass is `CATCHER_SESSION_ROOT`. The app creates one directory per r
 
 `run.sh` resolves the newest child that contains `events.jsonl` and grades that directory, except P2. P2 grades `revoke_session` (the recording that was live at the reset), not a later session whose only `blocked` ann is at `atMs=0` from a failed `startCapture`. Default sessions outside the harness go to `~/Library/Application Support/Catcher/sessions/<uuid>/` with the same file names and no PCM unless `CATCHER_HARNESS=1`.
 
-The harness starts `Catcher.app` through LaunchServices (bundle id `com.catcher.app`, not an ad-hoc side binary, and verified to carry the `com.apple.security.device.audio-input` entitlement). Stock `open` has no `--env`, so the harness compiles `launch_services.swift` and calls `NSWorkspace.openApplication`, passing the shell environment through (`CATCHER_SESSION_ROOT`, `CATCHER_HARNESS`, `CATCHER_ENGINE`, `CATCHER_AUTO_RECORD`, `XAI_API_KEY`) and the same switches as `--session-root`, `--harness`, `--engine`, and `--auto-record`. It does not exec the binary from the shell: that would bill microphone access to Terminal. The app writes `catcher.pid` itself once it is up, and `lib.sh` waits for that file.
+The harness starts `Catcher.app` through LaunchServices (bundle id `com.catcher.app`, not an ad-hoc side binary, and verified to carry the `com.apple.security.device.audio-input` entitlement). Stock `open` has no `--env`, so the harness compiles `launch_services.swift` and calls `NSWorkspace.openApplication`, passing the shell environment through (`CATCHER_SESSION_ROOT`, `CATCHER_HARNESS`, `CATCHER_ENGINE`, `CATCHER_AUTO_RECORD`, `XAI_API_KEY`) and the same switches as `--session-root`, `--harness`, `--engine`, and `--auto-record`. It does not exec the binary from the shell: that would bill microphone access to Terminal. The app writes `catcher.pid` itself once it is up, and `lib.sh` waits for that file. A non-zero gate prints two `TRACE` lines from that session's `stages.log` and then exits with the gate's status. `stages.log` does not grade anything: `grade.py` never reads it, and a `STAGE` line cannot pass or fail P1–P6.
 
 After a P1 run, `system.pcm` in the session directory is the capture proof. It is absent when no `PCMFrame` was emitted. A file of the right length that is all zeros is still a failed capture: `afplay` of the fixture must show a non-zero peak and RMS, and system `seg` rows must have text. A `noAudio` annotation at 10s also fires when zero frames arrived, so P4 passing does not show that system audio was captured. The microphone track can look healthy at the same time; that does not prove the system track.
 

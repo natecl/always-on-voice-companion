@@ -11,6 +11,7 @@ export XAI_API_KEY=...          # P1, P3, P6
 ./harness/run.sh p4 /tmp/catcher-p4
 ./harness/run.sh p5 /tmp/catcher-p5 /tmp/catcher-p1
 ./harness/run.sh p6 /tmp/catcher-p6
+./harness/run.sh preflight /tmp/catcher-pre   # before P1; see docs/qa/v0-diagnostics.md
 ```
 
 `grade.json` is written into the session directory the app created under the path you passed (`<path>/<uuid>/grade.json`).

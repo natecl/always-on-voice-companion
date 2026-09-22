@@ -8,17 +8,20 @@ public struct LaunchConfiguration: Sendable, Equatable {
     public var harness: Bool
     public var engine: String?
     public var autoRecord: Bool
+    public var preflight: Bool
 
     public init(
         sessionRoot: String? = nil,
         harness: Bool = false,
         engine: String? = nil,
-        autoRecord: Bool = false
+        autoRecord: Bool = false,
+        preflight: Bool = false
     ) {
         self.sessionRoot = sessionRoot
         self.harness = harness
         self.engine = engine
         self.autoRecord = autoRecord
+        self.preflight = preflight
     }
 
     public static func resolve(
@@ -29,7 +32,8 @@ public struct LaunchConfiguration: Sendable, Equatable {
             sessionRoot: nonempty(environment["CATCHER_SESSION_ROOT"]),
             harness: environment["CATCHER_HARNESS"] == "1",
             engine: nonempty(environment["CATCHER_ENGINE"]),
-            autoRecord: environment["CATCHER_AUTO_RECORD"] == "1"
+            autoRecord: environment["CATCHER_AUTO_RECORD"] == "1",
+            preflight: environment["CATCHER_PREFLIGHT"] == "1"
         )
         var index = 0
         while index < arguments.count {
@@ -48,6 +52,8 @@ public struct LaunchConfiguration: Sendable, Equatable {
                 index += 1
             } else if let value = value(after: "--engine=", in: argument) {
                 config.engine = value
+            } else if argument == "--preflight" {
+                config.preflight = true
             }
             index += 1
         }
@@ -68,6 +74,9 @@ public struct LaunchConfiguration: Sendable, Equatable {
         }
         if autoRecord {
             environment["CATCHER_AUTO_RECORD"] = "1"
+        }
+        if preflight {
+            environment["CATCHER_PREFLIGHT"] = "1"
         }
         return environment
     }

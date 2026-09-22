@@ -169,6 +169,14 @@ import Testing
     ))
 }
 
+@Test func preflightFlagComesFromArgumentOrEnvironment() {
+    let fromArg = LaunchConfiguration.resolve(arguments: ["Catcher", "--preflight"], environment: [:])
+    #expect(fromArg.preflight)
+    #expect(fromArg.mergedEnvironment()["CATCHER_PREFLIGHT"] == "1")
+    let fromEnv = LaunchConfiguration.resolve(arguments: ["Catcher"], environment: ["CATCHER_PREFLIGHT": "1"])
+    #expect(fromEnv.preflight)
+}
+
 private func segment(_ text: String, start: Int, end: Int) -> SegmentRow {
     SegmentRow(
         seq: 0,

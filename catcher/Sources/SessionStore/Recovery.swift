@@ -1,3 +1,4 @@
+import Diagnostics
 import Foundation
 
 public struct RecoveryReport: Sendable, Equatable {
@@ -25,7 +26,13 @@ public enum Recovery {
         )
         var reports: [RecoveryReport] = []
         for directory in children {
-            let isDirectory = (try? directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            let isDirectory: Bool
+            do {
+                isDirectory = try directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true
+            } catch {
+                StageMirror.note("recovery resource \(ErrorDetail.sentence(error))")
+                continue
+            }
             guard isDirectory else { continue }
             let events = SessionPaths.eventsFile(in: directory)
             guard manager.fileExists(atPath: events.path) else { continue }
@@ -55,7 +62,38 @@ public enum Recovery {
             )
             try writer.append(.end(EndRow(atMs: atMs, clean: false, recovered: true)), fsync: true)
             let updated = try JSONLReader.read(url: events)
-            try Assembler.write(directory: directory, rows: updated.rows, recovered: true)
+            let segmentCount = updated.rows.reduce(0) { count, row in
+                if case .seg = row { return count + 1 }
+                return count
+            }
+            do {
+                try Assembler.write(directory: directory, rows: updated.rows, recovered: true)
+            } catch {
+                let sentence = ErrorDetail.sentence(error)
+                StageMirror.note("recovery assemble \(sentence)")
+                let sink = FileStageSink(directory: directory, fileName: "stages.log")
+                sink.write(StageLine.stage(.transcriptWrite, .fail, [
+                    Field("bytes", "0"),
+                    Field("segments", String(segmentCount)),
+                    Field("recovered", "true"),
+                    Field("error", sentence),
+                ]), fsync: true)
+                throw error
+            }
+            let transcriptURL = SessionPaths.transcriptFile(in: directory)
+            let bytes: Int
+            do {
+                bytes = try Data(contentsOf: transcriptURL).count
+            } catch {
+                StageMirror.note("recovery transcript \(ErrorDetail.sentence(error))")
+                bytes = 0
+            }
+            let sink = FileStageSink(directory: directory, fileName: "stages.log")
+            sink.write(StageLine.stage(.transcriptWrite, bytes > 0 ? .ok : .fail, [
+                Field("bytes", String(bytes)),
+                Field("segments", String(segmentCount)),
+                Field("recovered", "true"),
+            ]), fsync: true)
             let id: String
             if case .session(let header) = contents.rows.first {
                 id = header.id

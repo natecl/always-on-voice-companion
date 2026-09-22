@@ -1,3 +1,4 @@
+import Diagnostics
 import Foundation
 #if canImport(OSLog)
 import OSLog
@@ -49,7 +50,11 @@ public enum Loud {
 
     public static func prepare() {
         #if os(macOS)
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, error in
+            if let error {
+                StageMirror.note("notification authorization \(ErrorDetail.sentence(error))")
+            }
+        }
         #endif
     }
 

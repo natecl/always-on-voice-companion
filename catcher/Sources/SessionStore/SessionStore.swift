@@ -1,3 +1,4 @@
+import Diagnostics
 import Foundation
 
 public actor SessionStore {
@@ -64,13 +65,23 @@ public actor SessionStore {
         var summaries: [SessionSummary] = []
         for directory in children {
             let summaryURL = SessionPaths.summaryFile(in: directory)
-            if let data = try? Data(contentsOf: summaryURL),
-               let summary = try? JSONDecoder().decode(SessionSummary.self, from: data) {
-                summaries.append(summary)
-                continue
+            if let data = try? Data(contentsOf: summaryURL) {
+                do {
+                    summaries.append(try JSONDecoder().decode(SessionSummary.self, from: data))
+                    continue
+                } catch {
+                    StageMirror.note("session summary \(directory.lastPathComponent) \(ErrorDetail.sentence(error))")
+                }
             }
             let events = SessionPaths.eventsFile(in: directory)
-            guard let contents = try? JSONLReader.read(url: events) else { continue }
+            guard manager.fileExists(atPath: events.path) else { continue }
+            let contents: JSONLReader.Contents
+            do {
+                contents = try JSONLReader.read(url: events)
+            } catch {
+                StageMirror.note("session list \(directory.lastPathComponent) \(ErrorDetail.sentence(error))")
+                continue
+            }
             summaries.append(Assembler.summary(rows: contents.rows, recovered: false))
         }
         return summaries.sorted { $0.startedAt > $1.startedAt }

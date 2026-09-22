@@ -1,5 +1,6 @@
 import AppKit
 import AudioCapture
+import Diagnostics
 import GrokEngine
 import Observation
 import Pipeline
@@ -49,20 +50,35 @@ final class CatcherModel {
     private let autoRecord: Bool
     private let harness: Bool
     private var launchStarted = false
+    private let preflight: Bool
+    private let launchEnvironment: [String: String]
 
     init() {
         GrokEngineBootstrap.install()
-        Loud.prepare()
         let launch = LaunchConfiguration.resolve()
         let environment = launch.mergedEnvironment(ProcessInfo.processInfo.environment)
+        launchEnvironment = environment
+        preflight = launch.preflight
+        if !launch.preflight {
+            Loud.prepare()
+        }
         let root = SessionPaths.root(environment: environment)
         sessionRoot = root
         autoRecord = launch.autoRecord
         harness = launch.harness
         if launch.harness {
-            try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-            let pid = String(ProcessInfo.processInfo.processIdentifier)
-            try? pid.write(to: root.appendingPathComponent("catcher.pid"), atomically: true, encoding: .utf8)
+            do {
+                try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+                let pid = String(ProcessInfo.processInfo.processIdentifier)
+                try pid.write(to: root.appendingPathComponent("catcher.pid"), atomically: true, encoding: .utf8)
+            } catch {
+                let sentence = ErrorDetail.sentence(error)
+                StageMirror.note("catcher.pid \(sentence)")
+                let sink = FileStageSink(directory: root, fileName: "launch-stages.log")
+                for line in FailureTrace.report(lines: [], fallbackError: "catcher.pid \(sentence)").lines {
+                    sink.write(line, fsync: true)
+                }
+            }
         }
         pipeline = Pipeline(
             sessionRoot: root,
@@ -75,12 +91,22 @@ final class CatcherModel {
     }
 
     func onAppear() async {
+        if preflight {
+            await runPreflightAndQuit()
+            return
+        }
         // A second pass (SwiftUI re-creates the task when Screen Recording is
         // toggled) used to call toggle() on the live session and write a clean
         // end with no blocked ann, then start a new session that failed at 0.
         if launchStarted { return }
         launchStarted = true
-        let reports = (try? Recovery.scan(root: sessionRoot)) ?? []
+        let reports: [RecoveryReport]
+        do {
+            reports = try Recovery.scan(root: sessionRoot)
+        } catch {
+            StageMirror.note("recovery scan \(ErrorDetail.sentence(error))")
+            reports = []
+        }
         if !reports.isEmpty {
             let annotation = Annotation(
                 atMs: 0,
@@ -225,9 +251,13 @@ final class CatcherModel {
         NSWorkspace.shared.openApplication(at: url, configuration: configuration) { app, error in
             let launchedPID = app?.processIdentifier ?? 0
             let failure = error?.localizedDescription
+            let sentence = error.map { ErrorDetail.sentence($0) }
             Task { @MainActor in
                 if let failure {
                     NSLog("Catcher relaunch failed: \(failure)")
+                    if let sentence {
+                        self.noteLaunchFailure(sentence)
+                    }
                     self.permissionAlert = (authority.explanation ?? "") + " Relaunch failed: \(failure). Quit Catcher and run: open -n \"\(url.path)\""
                     return
                 }
@@ -285,7 +315,12 @@ final class CatcherModel {
             return
         }
         let directory = sessionRoot.appendingPathComponent(id, isDirectory: true)
-        selectedTranscript = (try? String(contentsOf: SessionPaths.transcriptFile(in: directory), encoding: .utf8)) ?? ""
+        do {
+            selectedTranscript = try String(contentsOf: SessionPaths.transcriptFile(in: directory), encoding: .utf8)
+        } catch {
+            selectedTranscript = ""
+            StageMirror.note("transcript read \(ErrorDetail.sentence(error))")
+        }
     }
 
     private func listen() {
@@ -355,11 +390,56 @@ final class CatcherModel {
         guard let directory = await pipeline.sessionDirectory else { return }
         let pointer = sessionRoot.appendingPathComponent("live_session")
         guard !FileManager.default.fileExists(atPath: pointer.path) else { return }
-        try? directory.path.write(to: pointer, atomically: true, encoding: .utf8)
+        do {
+            try directory.path.write(to: pointer, atomically: true, encoding: .utf8)
+        } catch {
+            StageMirror.note("live_session \(ErrorDetail.sentence(error))")
+        }
+    }
+
+    private func runPreflightAndQuit() async {
+        do {
+            try FileManager.default.createDirectory(at: sessionRoot, withIntermediateDirectories: true)
+        } catch {
+            StageMirror.note("preflight mkdir \(ErrorDetail.sentence(error))")
+        }
+        let reportURL = sessionRoot.appendingPathComponent("preflight.txt")
+        let prior: String
+        if FileManager.default.fileExists(atPath: reportURL.path) {
+            do {
+                prior = try String(contentsOf: reportURL, encoding: .utf8)
+            } catch {
+                StageMirror.note("preflight read \(ErrorDetail.sentence(error))")
+                prior = ""
+            }
+        } else {
+            prior = ""
+        }
+        let lines = await Preflight.run(environment: launchEnvironment, dependencies: PreflightHost.dependencies())
+        let result = Preflight.result(checks: lines, priorFails: Preflight.failCount(in: prior))
+        let preflightSink = FileStageSink(directory: sessionRoot, fileName: "preflight.txt")
+        let launchSink = FileStageSink(directory: sessionRoot, fileName: "launch-stages.log")
+        for line in lines + [result] {
+            preflightSink.write(line, fsync: true)
+            launchSink.write(line, fsync: line.verdict == PreflightVerdict.fail.rawValue || line.name == "RESULT")
+        }
+        NSApp.terminate(nil)
+    }
+
+    private func noteLaunchFailure(_ sentence: String) {
+        let sink = FileStageSink(directory: sessionRoot, fileName: "launch-stages.log")
+        for line in FailureTrace.report(lines: [], fallbackError: "relaunch \(sentence)").lines {
+            sink.write(line, fsync: true)
+        }
     }
 
     private func refreshSessions() async {
-        sessions = (try? SessionStore.list(root: sessionRoot)) ?? []
+        do {
+            sessions = try SessionStore.list(root: sessionRoot)
+        } catch {
+            sessions = []
+            StageMirror.note("session list \(ErrorDetail.sentence(error))")
+        }
         if let selectedID {
             select(selectedID)
         }

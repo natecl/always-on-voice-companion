@@ -1,3 +1,4 @@
+import Diagnostics
 import Foundation
 
 protocol ByteSink: AnyObject {
@@ -28,7 +29,11 @@ final class FileByteSink: ByteSink {
     }
 
     deinit {
-        try? handle.close()
+        do {
+            try handle.close()
+        } catch {
+            StageMirror.note("jsonl close \(ErrorDetail.sentence(error))")
+        }
     }
 }
 

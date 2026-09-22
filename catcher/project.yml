@@ -29,6 +29,8 @@ targets:
         product: TranscriptionEngine
       - package: Catcher
         product: GrokEngine
+      - package: Catcher
+        product: Diagnostics
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.catcher.app
