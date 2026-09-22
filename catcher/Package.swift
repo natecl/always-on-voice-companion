@@ -27,7 +27,7 @@ let package = Package(
         ),
         .target(
             name: "GrokEngine",
-            dependencies: ["TranscriptionEngine", "AudioCapture"]
+            dependencies: ["TranscriptionEngine", "AudioCapture", "Diagnostics"]
         ),
         .target(
             name: "Verifier",

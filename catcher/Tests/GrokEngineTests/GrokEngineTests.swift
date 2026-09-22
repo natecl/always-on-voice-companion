@@ -278,6 +278,62 @@ import TranscriptionEngine
     }
 }
 
+@Test func errorFrameKeepsMessageAndCode() {
+    let coded = GrokMessages.decode(#"{"type":"error","message":"nope","code":401}"#)
+    #expect(coded == .error("nope code=401"))
+    let named = GrokMessages.decode(#"{"type":"error","message":"bad key","error":"invalid_api_key"}"#)
+    #expect(named == .error("bad key invalid_api_key"))
+}
+
+@Test func closedBeforeCreatedKeepsCloseAndHTTPProbe() async throws {
+    let transport = ScriptedTransport()
+    let probed = ProbeFlag()
+    let engine = GrokEngine(track: .system, configuration: GrokEngineConfiguration(
+        apiKey: "bad",
+        url: GrokWebSocket.url(),
+        makeTransport: { transport },
+        handshakeTimeout: .seconds(2),
+        authProbe: { _ in
+            probed.value = true
+            return AuthProbeResult(http: 401, body: "{\"code\":\"invalid\"}")
+        }
+    ))
+    let connecting = Task { try await engine.connect(track: .system) }
+    transport.push(.closed(code: 1006, reason: "upgrade failed"))
+    do {
+        try await connecting.value
+        Issue.record("connect should fail before transcript.created")
+    } catch {
+        #expect(String(describing: error).contains("1006"))
+    }
+    let snap = await engine.snapshot()
+    #expect(snap.lastCloseCode == 1006)
+    #expect(snap.lastCloseReason?.contains("upgrade failed") == true)
+    #expect(snap.httpStatus == 401)
+    #expect(snap.httpBody?.contains("invalid") == true)
+    #expect(probed.value)
+}
+
+@Test func undecodableServerFrameIsKeptOnTheSnapshot() async throws {
+    let transport = ScriptedTransport()
+    let engine = GrokEngine(track: .system, configuration: testConfig(transport))
+    let connecting = Task { try await engine.connect(track: .system) }
+    transport.push(.text(#"{"type":"transcript.created"}"#))
+    try await connecting.value
+    transport.push(.text("not-json{"))
+    var saw = false
+    for _ in 0..<25 {
+        let snap = await engine.snapshot()
+        if snap.unknownMessages.contains(where: { $0.contains("not-json") }) {
+            saw = true
+            break
+        }
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(saw)
+    await engine.finish()
+}
+
 @Test func registeredGrokBuilderIsWhatTheFactoryReturns() throws {
     GrokEngineBootstrap.install()
     let engine = try EngineFactory.make(track: .microphone, environment: ["CATCHER_ENGINE": "grok"])
@@ -308,6 +364,10 @@ private func waitUntil(_ predicate: @Sendable () -> Bool) async throws {
         try await Task.sleep(for: .milliseconds(20))
     }
     Issue.record("timed out waiting")
+}
+
+private final class ProbeFlag: @unchecked Sendable {
+    var value = false
 }
 
 private final class ManualClock: @unchecked Sendable {

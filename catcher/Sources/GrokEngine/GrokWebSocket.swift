@@ -1,3 +1,4 @@
+import Diagnostics
 import Foundation
 import TranscriptionEngine
 
@@ -82,12 +83,18 @@ public final class URLSessionGrokTransport: GrokTransport, @unchecked Sendable {
             case .data(let data):
                 return .binary(data)
             @unknown default:
+                StageMirror.note("websocket message type unknown")
                 return .text("")
             }
         } catch {
             let task = currentOptional()
             let code = task?.closeCode.rawValue ?? 1006
-            return .closed(code: code, reason: String(describing: error))
+            let ns = error as NSError
+            var reason = "\(ns.domain) \(ns.code) \(ns.localizedDescription)"
+            if let http = (task?.response as? HTTPURLResponse)?.statusCode {
+                reason = "http=\(http) \(reason)"
+            }
+            return .closed(code: code, reason: reason)
         }
     }
 

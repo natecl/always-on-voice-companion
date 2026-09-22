@@ -1,4 +1,5 @@
 import AudioCapture
+import Diagnostics
 import Foundation
 import TranscriptionEngine
 
@@ -13,6 +14,7 @@ public struct GrokEngineConfiguration: Sendable {
     /// No server message for this long while audio is still being written means
     /// the socket is black-holed. `pf` drop does not close a WebSocket.
     public var inboundStall: Duration
+    public var authProbe: @Sendable (String) async -> AuthProbeResult
 
     public init(
         apiKey: String,
@@ -22,7 +24,10 @@ public struct GrokEngineConfiguration: Sendable {
         nowMs: (@Sendable () -> Int)? = nil,
         handshakeTimeout: Duration = .seconds(5),
         chunkBytes: Int = AudioFormat.chunkBytes,
-        inboundStall: Duration = .seconds(5)
+        inboundStall: Duration = .seconds(5),
+        authProbe: @escaping @Sendable (String) async -> AuthProbeResult = { key in
+            await GrokProbe.fetchAuthStatus(apiKey: key)
+        }
     ) {
         self.apiKey = apiKey
         self.url = url
@@ -32,6 +37,7 @@ public struct GrokEngineConfiguration: Sendable {
         self.handshakeTimeout = handshakeTimeout
         self.chunkBytes = chunkBytes
         self.inboundStall = inboundStall
+        self.authProbe = authProbe
     }
 
     public static func live(environment: [String: String] = ProcessInfo.processInfo.environment) -> GrokEngineConfiguration {
@@ -54,7 +60,7 @@ public enum GrokEngineBootstrap {
 
 /// Streaming STT against `wss://api.x.ai/v1/stt`. No audio leaves until
 /// `transcript.created`. Word times are re-based onto session audio time.
-public actor GrokEngine: TranscriptionEngine {
+public actor GrokEngine: TranscriptionEngine, EngineDiagnostics {
     public nonisolated let events: AsyncStream<EngineEvent>
     private let continuation: AsyncStream<EngineEvent>.Continuation
     private let configuration: GrokEngineConfiguration
@@ -83,6 +89,17 @@ public actor GrokEngine: TranscriptionEngine {
     private var bytesAtLastInbound = 0
     private var lastInbound = Date()
     private var lastSocketOrigin = 0
+    private var handshakeStarted: ContinuousClock.Instant?
+    private var handshakeMs: Int?
+    private var lastCloseCode: Int?
+    private var lastCloseReason: String?
+    private var lastError: String?
+    private var httpStatus: Int?
+    private var httpBody: String?
+    private var unknownMessages: [String] = []
+    private var sendErrors = 0
+    private var binaryFrames = 0
+    private var authProbed = false
 
     public init(track: AudioTrack, configuration: GrokEngineConfiguration = .live()) {
         self.track = track
@@ -92,21 +109,41 @@ public actor GrokEngine: TranscriptionEngine {
         self.continuation = pair.continuation
     }
 
+    public func snapshot() async -> EngineDiagnosticsSnapshot {
+        EngineDiagnosticsSnapshot(
+            bytesSent: bytesSent,
+            pendingCount: pending.count,
+            handshakeMs: handshakeMs,
+            lastCloseCode: lastCloseCode,
+            lastCloseReason: lastCloseReason,
+            lastError: lastError,
+            httpStatus: httpStatus,
+            httpBody: httpBody,
+            unknownMessages: unknownMessages,
+            sendErrors: sendErrors,
+            binaryFrames: binaryFrames
+        )
+    }
+
     public func connect(track: AudioTrack) async throws {
         self.track = track
         continuation.yield(.state(.connecting))
         guard !configuration.apiKey.isEmpty else {
+            lastError = "missing XAI_API_KEY"
             continuation.yield(.state(.failed(reason: "missing XAI_API_KEY")))
             continuation.yield(.error(.missingAPIKey))
             throw EngineError.missingAPIKey
         }
         let transport = configuration.makeTransport()
         self.transport = transport
+        handshakeStarted = ContinuousClock.now
         do {
             try await transport.connect(url: configuration.url, authorizationBearer: configuration.apiKey)
         } catch {
+            lastError = ErrorDetail.sentence(error)
             continuation.yield(.state(.failed(reason: String(describing: error))))
             continuation.yield(.error(.socket(String(describing: error))))
+            await attachAuthProbe()
             throw EngineError.socket(String(describing: error))
         }
         reader = Task { await self.readLoop() }
@@ -140,12 +177,16 @@ public actor GrokEngine: TranscriptionEngine {
         while !ready {
             if let handshakeFailure {
                 reader?.cancel()
+                if lastError == nil { lastError = String(describing: handshakeFailure) }
+                await attachAuthProbe()
                 throw handshakeFailure
             }
             if Date() >= deadline {
                 reader?.cancel()
+                lastError = "handshakeTimeout"
                 continuation.yield(.state(.failed(reason: "no transcript.created")))
                 continuation.yield(.error(.handshakeTimeout))
+                await attachAuthProbe()
                 throw EngineError.handshakeTimeout
             }
             try await Task.sleep(for: .milliseconds(5))
@@ -163,6 +204,7 @@ public actor GrokEngine: TranscriptionEngine {
                 return
             } catch {
                 if finishRequested || Task.isCancelled { return }
+                lastError = ErrorDetail.sentence(error)
                 await handle(.closed(code: 1006, reason: String(describing: error)))
             }
         }
@@ -175,11 +217,15 @@ public actor GrokEngine: TranscriptionEngine {
             lastInbound = Date()
             apply(GrokMessages.decode(text))
         case .binary:
+            binaryFrames += 1
             break
         case .closed(let code, let reason):
             guard !finishRequested else { return }
+            lastCloseCode = code
+            lastCloseReason = reason
             if !hasBeenReady {
                 handshakeFailure = .socket("closed \(code) \(reason)")
+                if lastError == nil { lastError = "closed \(code) \(reason)" }
                 return
             }
             await reconnect(code: code, reason: reason)
@@ -263,6 +309,9 @@ public actor GrokEngine: TranscriptionEngine {
                 socketOriginMs = audioMs
             }
             lastSocketOrigin = socketOriginMs
+            if handshakeMs == nil, let handshakeStarted {
+                handshakeMs = Self.elapsedMilliseconds(since: handshakeStarted)
+            }
             ready = true
             hasBeenReady = true
             utteranceHadChunk = false
@@ -274,10 +323,13 @@ public actor GrokEngine: TranscriptionEngine {
             replay.removeAll(keepingCapacity: true)
             commit(transcript, fromDone: true)
         case .error(let message):
+            if lastError == nil { lastError = message }
             continuation.yield(.error(.protocol(message)))
             continuation.yield(.state(.degraded(reason: message)))
-        case .unknown:
-            break
+        case .unknown(let text):
+            if unknownMessages.count < 3 {
+                unknownMessages.append(String(text.prefix(512)))
+            }
         }
     }
 
@@ -370,6 +422,8 @@ public actor GrokEngine: TranscriptionEngine {
             } catch {
                 pending.insert(contentsOf: chunk, at: 0)
                 ready = false
+                sendErrors += 1
+                if lastError == nil { lastError = ErrorDetail.sentence(error) }
                 continuation.yield(.error(.socket(String(describing: error))))
                 await transport.close()
                 return
@@ -393,12 +447,16 @@ public actor GrokEngine: TranscriptionEngine {
                 try await transport.sendBinary(tail)
                 bytesSent += tail.count
             } catch {
+                sendErrors += 1
+                if lastError == nil { lastError = ErrorDetail.sentence(error) }
                 continuation.yield(.error(.socket(String(describing: error))))
             }
         }
         do {
             try await transport.sendText(GrokMessages.audioDone)
         } catch {
+            sendErrors += 1
+            if lastError == nil { lastError = ErrorDetail.sentence(error) }
             continuation.yield(.error(.socket(String(describing: error))))
         }
     }
@@ -477,6 +535,22 @@ public actor GrokEngine: TranscriptionEngine {
                 throw EngineError.handshakeTimeout
             }
         }
+    }
+
+    private func attachAuthProbe() async {
+        guard !authProbed, !hasBeenReady else { return }
+        authProbed = true
+        let result = await configuration.authProbe(configuration.apiKey)
+        httpStatus = result.http
+        if !result.body.isEmpty {
+            httpBody = result.body
+        }
+    }
+
+    private static func elapsedMilliseconds(since start: ContinuousClock.Instant) -> Int {
+        let duration = start.duration(to: .now)
+        let parts = duration.components
+        return Int(parts.seconds) * 1000 + Int(parts.attoseconds / 1_000_000_000_000_000)
     }
 
     private static func seconds(_ duration: Duration) -> Double {

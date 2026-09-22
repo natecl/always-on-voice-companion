@@ -1,3 +1,4 @@
+import Diagnostics
 import Foundation
 
 public struct GrokTranscript: Sendable, Equatable {
@@ -57,7 +58,11 @@ public enum GrokMessages {
             return .unknown(text)
         }
         let decoder = JSONDecoder()
-        guard let raw = try? decoder.decode(RawMessage.self, from: data) else {
+        let raw: RawMessage
+        do {
+            raw = try decoder.decode(RawMessage.self, from: data)
+        } catch {
+            noteDecode(error)
             return .unknown(text)
         }
         switch raw.type {
@@ -68,10 +73,31 @@ public enum GrokMessages {
         case "transcript.done":
             return .done(raw.transcript(isFinalDefault: true))
         case "error":
-            return .error(raw.message ?? "unknown error")
+            return .error(errorText(raw))
         default:
-            return .unknown(raw.type)
+            return .unknown(text)
         }
+    }
+
+    private static let decodeLogLock = NSLock()
+    nonisolated(unsafe) private static var decodeLogs = 0
+
+    private static func noteDecode(_ error: Error) {
+        decodeLogLock.lock()
+        let shouldLog = decodeLogs < 3
+        if shouldLog { decodeLogs += 1 }
+        decodeLogLock.unlock()
+        if shouldLog {
+            StageMirror.note("grok decode \(ErrorDetail.sentence(error))")
+        }
+    }
+
+    private static func errorText(_ raw: RawMessage) -> String {
+        var parts: [String] = []
+        if let message = raw.message, !message.isEmpty { parts.append(message) }
+        if let error = raw.error, !error.isEmpty, error != raw.message { parts.append(error) }
+        if let code = raw.code?.value, !code.isEmpty { parts.append("code=\(code)") }
+        return parts.isEmpty ? "unknown error" : parts.joined(separator: " ")
     }
 }
 
@@ -84,6 +110,8 @@ private struct RawMessage: Decodable {
     var start: Double?
     var duration: Double?
     var message: String?
+    var error: String?
+    var code: LooseString?
 
     func transcript(isFinalDefault: Bool) -> GrokTranscript {
         GrokTranscript(
@@ -94,6 +122,23 @@ private struct RawMessage: Decodable {
             start: start ?? 0,
             duration: duration ?? 0
         )
+    }
+}
+
+private struct LooseString: Decodable {
+    var value: String
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let text = try? container.decode(String.self) {
+            value = text
+            return
+        }
+        if let number = try? container.decode(Int.self) {
+            value = String(number)
+            return
+        }
+        value = ""
     }
 }
 
