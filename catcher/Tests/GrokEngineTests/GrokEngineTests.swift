@@ -669,10 +669,14 @@ private final class ScriptedTransport: GrokTransport, @unchecked Sendable {
 
     func receive() async throws -> GrokSocketEvent {
         let event = try await receiveOnce()
+        noteReceiveReturn()
+        return event
+    }
+
+    private func noteReceiveReturn() {
         lock.lock()
         receiveReturns += 1
         lock.unlock()
-        return event
     }
 
     private func receiveOnce() async throws -> GrokSocketEvent {

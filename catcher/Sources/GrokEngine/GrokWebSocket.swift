@@ -1,6 +1,9 @@
 import Diagnostics
 import Foundation
 import TranscriptionEngine
+#if os(macOS)
+import Synchronization
+#endif
 
 public enum GrokSocketEvent: Sendable, Equatable {
     case text(String)
@@ -44,10 +47,16 @@ public enum GrokWebSocket {
 
 public final class URLSessionGrokTransport: GrokTransport, @unchecked Sendable {
     #if os(macOS)
+    private struct State: @unchecked Sendable {
+        var task: URLSessionWebSocketTask?
+        var closed = false
+    }
+
     private let session: URLSession
-    private let lock = NSLock()
-    private var task: URLSessionWebSocketTask?
-    private var closed = false
+    /// `NSLock.lock`/`unlock` are unavailable in `close()`, which is `async`.
+    /// Task and closed live in this lock. `withLock` is synchronous, so the
+    /// critical section cannot span an `await`.
+    private let state = OSAllocatedUnfairLock(initialState: State())
 
     public init(session: URLSession = URLSession(configuration: .default)) {
         self.session = session
@@ -62,9 +71,7 @@ public final class URLSessionGrokTransport: GrokTransport, @unchecked Sendable {
     }
 
     private func store(_ task: URLSessionWebSocketTask) {
-        lock.lock()
-        self.task = task
-        lock.unlock()
+        state.withLock { $0.task = task }
     }
 
     public func sendText(_ text: String) async throws {
@@ -123,27 +130,27 @@ public final class URLSessionGrokTransport: GrokTransport, @unchecked Sendable {
     /// the task locally and invalidate this socket's session so those calls fail
     /// without a network round trip.
     public func close() async {
-        let taskToCancel: URLSessionWebSocketTask?
-        lock.lock()
-        if closed {
-            lock.unlock()
-            return
+        let handoff: (task: URLSessionWebSocketTask?, alreadyClosed: Bool) = state.withLock { state in
+            if state.closed {
+                return (nil, true)
+            }
+            state.closed = true
+            let task = state.task
+            state.task = nil
+            return (task, false)
         }
-        closed = true
-        taskToCancel = task
-        task = nil
-        lock.unlock()
-        taskToCancel?.cancel()
+        if handoff.alreadyClosed { return }
+        handoff.task?.cancel()
         session.invalidateAndCancel()
     }
 
     private func current() throws -> URLSessionWebSocketTask {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let task, !closed else {
-            throw EngineError.socket("websocket is not connected")
+        try state.withLock { state in
+            guard let task = state.task, !state.closed else {
+                throw EngineError.socket("websocket is not connected")
+            }
+            return task
         }
-        return task
     }
     #else
     public init() {}
