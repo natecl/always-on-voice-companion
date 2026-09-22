@@ -4,8 +4,10 @@ import Testing
 
 @Test func captureConfigMatchesLockedFields() {
     let config = CaptureConfig.make()
-    #expect(config.sampleRate == 16_000)
-    #expect(config.channelCount == 1)
+    #expect(config.sampleRate == 48_000)
+    #expect(config.channelCount == 2)
+    #expect(AudioFormat.sampleRate == 16_000)
+    #expect(AudioFormat.channels == 1)
     #expect(config.width == 2)
     #expect(config.height == 2)
     #expect(config.minimumFrameIntervalSeconds == 1)
@@ -104,7 +106,7 @@ import Testing
     #expect(int16Samples(pcm) == [32_767, -32_767])
 }
 
-@Test func planarOppositePolarityDownmixesToSilence() throws {
+@Test func planarOppositePolarityKeepsTheLoudChannel() throws {
     let format = SourcePCMFormat(
         sampleRate: 16_000,
         channels: 2,
@@ -118,10 +120,10 @@ import Testing
         format: format,
         frameCount: 2
     )
-    #expect(int16Samples(pcm) == [0, 0])
+    #expect(int16Samples(pcm) == [32_767, 32_767])
 }
 
-@Test func interleavedOppositePolarityDownmixesToSilence() throws {
+@Test func interleavedOppositePolarityKeepsTheLoudChannel() throws {
     let format = SourcePCMFormat(
         sampleRate: 16_000,
         channels: 2,
@@ -135,7 +137,55 @@ import Testing
         format: format,
         frameCount: 2
     )
-    #expect(int16Samples(pcm) == [0, 0])
+    #expect(int16Samples(pcm) == [32_767, 16_384])
+}
+
+@Test func correlatedStereoStillAverages() throws {
+    let format = SourcePCMFormat(
+        sampleRate: 16_000,
+        channels: 2,
+        bitsPerChannel: 32,
+        isFloat: true,
+        isNonInterleaved: true,
+        isBigEndian: false
+    )
+    let pcm = try SampleBufferPCM.convertToPCM16Mono(
+        buffers: [leFloat32([0.5, 0]), leFloat32([0.5, 0])],
+        format: format,
+        frameCount: 2
+    )
+    #expect(int16Samples(pcm) == [16_384, 0])
+}
+
+@Test func oneSilentChannelStillAverages() throws {
+    let format = SourcePCMFormat(
+        sampleRate: 16_000,
+        channels: 2,
+        bitsPerChannel: 32,
+        isFloat: true,
+        isNonInterleaved: true,
+        isBigEndian: false
+    )
+    let pcm = try SampleBufferPCM.convertToPCM16Mono(
+        buffers: [leFloat32([1, 0]), leFloat32([0, 0])],
+        format: format,
+        frameCount: 2
+    )
+    #expect(int16Samples(pcm) == [16_384, 0])
+}
+
+@Test func prefersMainAwakeDisplayOverAnInactiveBuiltIn() {
+    let displays = [
+        SystemAudioDisplay(id: 1, active: false, asleep: true, isMain: true),
+        SystemAudioDisplay(id: 2, active: true, asleep: false, isMain: false),
+    ]
+    #expect(SystemAudioDisplayChoice.preferred(displays) == 2)
+    let main = [
+        SystemAudioDisplay(id: 9, active: true, asleep: false, isMain: false),
+        SystemAudioDisplay(id: 3, active: true, asleep: false, isMain: true),
+    ]
+    #expect(SystemAudioDisplayChoice.preferred(main) == 3)
+    #expect(SystemAudioDisplayChoice.preferred([]) == nil)
 }
 
 @Test func fortyEightKilohertzFloatResamplesToSixteen() throws {

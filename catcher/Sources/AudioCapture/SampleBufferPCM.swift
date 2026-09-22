@@ -90,10 +90,16 @@ public enum SampleBufferPCM {
         return output
     }
 
-    /// Float or integer SCK packets → 16 kHz mono PCM16. Planar buffers are
-    /// averaged per frame; a rate other than 16 kHz is linearly resampled.
-    /// Already-16 kHz little-endian PCM16 stays on the integer path so samples
-    /// are not rounded through float.
+/// Float or integer SCK packets → 16 kHz mono PCM16. Planar buffers are
+/// mixed per frame; a rate other than 16 kHz is linearly resampled.
+/// Already-16 kHz little-endian PCM16 stays on the integer path so samples
+/// are not rounded through float.
+///
+/// A straight average of opposite-polarity channels is digital silence.
+/// ScreenCaptureKit's system track delivers that layout (non-interleaved
+/// float, second channel an inverted copy). The microphone track is one
+/// channel and never hits the mix. When the average cancels and a channel
+/// still has energy, the loud channel is kept.
     public static func convertToPCM16Mono(buffers: [Data], format: SourcePCMFormat, frameCount: Int) throws -> Data {
         guard format.channels > 0 else { throw Failure.invalidChannelCount }
         guard frameCount > 0 else { throw Failure.empty }
@@ -188,19 +194,111 @@ public enum SampleBufferPCM {
             frameCount: Int32(frames),
             into: list
         )
+        var copiedPCM: Data?
+        if status == noErr {
+            var copiedBuffers: [Data] = []
+            copiedBuffers.reserveCapacity(bufferCount)
+            var copyIntact = true
+            for index in 0..<bufferCount {
+                guard let data = abl[index].mData else {
+                    copyIntact = false
+                    break
+                }
+                let copied = Int(abl[index].mDataByteSize)
+                guard copied >= bytesPerBuffer else {
+                    copyIntact = false
+                    break
+                }
+                copiedBuffers.append(Data(bytes: data, count: bytesPerBuffer))
+            }
+            if copyIntact {
+                let pcm = try convertToPCM16Mono(buffers: copiedBuffers, format: format, frameCount: frames)
+                if hasEnergy(pcm) {
+                    return pcm
+                }
+                copiedPCM = pcm
+            }
+        }
+
+        if let recovered = pcmFromContiguousBlock(sampleBuffer, format: format, frameCount: frames),
+           hasEnergy(recovered) {
+            return recovered
+        }
+        if let copiedPCM {
+            return copiedPCM
+        }
         guard status == noErr else {
             throw CaptureError.pcmExtractionFailed(status: status, detail: "CMSampleBufferCopyPCMDataIntoAudioBufferList")
         }
+        throw Failure.bufferTooSmall
+    }
 
-        var buffers: [Data] = []
-        buffers.reserveCapacity(bufferCount)
-        for index in 0..<bufferCount {
-            guard let data = abl[index].mData else { throw Failure.bufferTooSmall }
-            let copied = Int(abl[index].mDataByteSize)
-            guard copied >= bytesPerBuffer else { throw Failure.bufferTooSmall }
-            buffers.append(Data(bytes: data, count: bytesPerBuffer))
+    /// SCK packs non-interleaved float as one contiguous block: channel `c`
+    /// starts at sample `c * frameCount`. `CMSampleBufferCopyPCMDataIntoAudioBufferList`
+    /// can return `noErr` and a zero-filled list for that layout. The block
+    /// still holds the samples.
+    private static func pcmFromContiguousBlock(
+        _ sampleBuffer: CMSampleBuffer,
+        format: SourcePCMFormat,
+        frameCount: Int
+    ) -> Data? {
+        guard format.isFloat, format.bitsPerChannel == 32, !format.isBigEndian else { return nil }
+        guard let block = CMSampleBufferGetDataBuffer(sampleBuffer) else { return nil }
+        var totalLength = 0
+        var dataPointer: UnsafeMutablePointer<Int8>?
+        let status = CMBlockBufferGetDataPointer(
+            block,
+            atOffset: 0,
+            lengthAtOffsetOut: nil,
+            totalLengthOut: &totalLength,
+            dataPointerOut: &dataPointer
+        )
+        guard status == noErr, let dataPointer, totalLength > 0 else { return nil }
+        let sampleBytes = 4
+        var interpret = format
+        if format.channels > 1 && Int(format.bytesPerFramePerBuffer) == sampleBytes {
+            interpret.isNonInterleaved = true
         }
-        return try convertToPCM16Mono(buffers: buffers, format: format, frameCount: frames)
+        let channelCount = interpret.channels
+        let needed = frameCount * sampleBytes * channelCount
+        guard totalLength >= needed, channelCount > 0 else { return nil }
+        var channelBuffers: [Data] = []
+        channelBuffers.reserveCapacity(interpret.bufferCount)
+        if interpret.isNonInterleaved {
+            let channelBytes = frameCount * sampleBytes
+            for channel in 0..<channelCount {
+                let start = channel * channelBytes
+                channelBuffers.append(Data(bytes: dataPointer.advanced(by: start), count: channelBytes))
+            }
+        } else {
+            channelBuffers.append(Data(bytes: dataPointer, count: needed))
+        }
+        guard let pcm = try? convertToPCM16Mono(buffers: channelBuffers, format: interpret, frameCount: frameCount) else {
+            return nil
+        }
+        guard saneFloatBlock(channelBuffers, format: interpret, frameCount: frameCount) else { return nil }
+        return pcm
+    }
+
+    /// Reject a mis-read block. Real SCK float samples sit near [-1, 1].
+    /// Silence is finite and is not treated as recovered audio.
+    private static func saneFloatBlock(_ buffers: [Data], format: SourcePCMFormat, frameCount: Int) -> Bool {
+        let channels = format.channels
+        var seen = 0
+        for channel in 0..<min(channels, buffers.count) {
+            for frame in 0..<frameCount {
+                let sample = readSample(buffers[format.isNonInterleaved ? channel : 0], index: format.isNonInterleaved ? frame : frame * channels + channel, format: format)
+                if !sample.isFinite || abs(sample) > 4 { return false }
+                seen += 1
+            }
+        }
+        return seen > 0
+    }
+
+    private static func hasEnergy(_ pcm: Data) -> Bool {
+        pcm.withUnsafeBytes { raw in
+            raw.bindMemory(to: Int16.self).contains { $0 != 0 }
+        }
     }
     #endif
 
@@ -227,30 +325,52 @@ public enum SampleBufferPCM {
     }
 
     private static func decodeMonoFloat(buffers: [Data], format: SourcePCMFormat, frameCount: Int) -> [Float] {
-        var mono = [Float](repeating: 0, count: frameCount)
         let channels = format.channels
-        if format.isNonInterleaved {
-            for channel in 0..<channels {
-                for frame in 0..<frameCount {
-                    mono[frame] += readSample(buffers[channel], index: frame, format: format)
-                }
-            }
-        } else {
+        var perChannel = [[Float]]()
+        perChannel.reserveCapacity(channels)
+        for channel in 0..<channels {
+            var samples = [Float](repeating: 0, count: frameCount)
             for frame in 0..<frameCount {
-                var sum: Float = 0
-                for channel in 0..<channels {
-                    sum += readSample(buffers[0], index: frame * channels + channel, format: format)
-                }
-                mono[frame] = sum
+                let index = format.isNonInterleaved ? frame : frame * channels + channel
+                let buffer = format.isNonInterleaved ? buffers[channel] : buffers[0]
+                samples[frame] = readSample(buffer, index: index, format: format)
             }
+            perChannel.append(samples)
         }
-        if channels > 1 {
-            let scale = 1 / Float(channels)
-            for index in 0..<frameCount {
-                mono[index] *= scale
+        return mixDown(perChannel)
+    }
+
+    /// Average channels. If that average cancels (opposite polarity) and one
+    /// channel still has energy, keep the loud channel instead of silence.
+    private static func mixDown(_ channels: [[Float]]) -> [Float] {
+        guard let first = channels.first else { return [] }
+        if channels.count == 1 { return first }
+        let frames = first.count
+        var mixed = [Float](repeating: 0, count: frames)
+        var energies = [Float](repeating: 0, count: channels.count)
+        for (channel, samples) in channels.enumerated() {
+            var energy: Float = 0
+            let count = min(frames, samples.count)
+            for frame in 0..<count {
+                let sample = samples[frame]
+                mixed[frame] += sample
+                energy += sample * sample
             }
+            energies[channel] = energy
         }
-        return mono
+        let scale = 1 / Float(channels.count)
+        var mixedEnergy: Float = 0
+        for frame in 0..<frames {
+            mixed[frame] *= scale
+            mixedEnergy += mixed[frame] * mixed[frame]
+        }
+        let loudestEnergy = energies.max() ?? 0
+        // Amplitude of the average under ~10% of the loud channel.
+        if loudestEnergy > 1e-12 && mixedEnergy * 100 < loudestEnergy {
+            let index = energies.enumerated().max(by: { $0.element < $1.element })?.offset ?? 0
+            return channels[index]
+        }
+        return mixed
     }
 
     private static func readSample(_ data: Data, index: Int, format: SourcePCMFormat) -> Float {

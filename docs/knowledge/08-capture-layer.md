@@ -18,12 +18,14 @@ ScreenCaptureKit (system audio + mic, two tracks)
 config.capturesAudio = true
 config.captureMicrophone = true           // macOS 15+, separate .microphone track
 config.excludesCurrentProcessAudio = true  // mandatory — no feedback loop
-config.sampleRate = 16000                  // SCK resamples rate and channel count
-config.channelCount = 1                    // samples stay float32; convert to PCM16 after the copy
+config.sampleRate = 48000                  // SCK default. 16 kHz mono on the system track is silence
+config.channelCount = 2                    // stereo float; downmix after the copy. Do not ask SCK for mono
 config.width = 2; config.height = 2        // collapse the video stub
 config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 ```
 - **Two tracks, always:** `.audio` (system — "them") + `.microphone` (mic — "me"). Kept separate end to end; "me vs. them" attribution comes free. Never mix in the pipeline.
+- **System mix is the whole display, not `excludingWindows`.** `SCContentFilter(display:excludingWindows:)` only carries audio from apps that have windows on that display, so `afplay` (no window) is silence while the mic still hears the room. Use `excludingApplications: []` on the main awake display. `displays.first` can be a closed-lid built-in whose `.audio` mix is zeros.
+- **Do not average opposite-polarity system channels.** SCK system float is often non-interleaved stereo where channel 1 is the inverse of channel 0. The mic buffer is one channel. An average of the system pair is digital silence (`system.pcm` the right length, peak 0). Keep the loud channel when the average cancels. Pipeline frames are still 16 kHz mono PCM16.
 - **Audio-only is undocumented but works** — validated across macOS 14/15/26 in shipping apps. The video pipeline still runs internally; the 2×2 @ 1 fps stub keeps it cheap. Console noise ("stream output NOT found. Dropping frame") is cosmetic.
 - macOS 13+ for audio capture; 15+ for in-stream mic.
 
@@ -41,7 +43,7 @@ config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 - Limits: 100 concurrent streaming sessions/team — fine for v0.
 
 ## Gotchas for Cap
-1. Extract SCK audio with `CMSampleBufferCopyPCMDataIntoAudioBufferList` into a list sized from the buffer's own format (float32, one `AudioBuffer` per channel when non-interleaved), then convert to 16 kHz mono PCM16. The retained-block-buffer API fails with `-12737` on SCK buffers. A destination sized for PCM16 fails the copy too; discarding that error yields zero frames and no `system.pcm`.
+1. Extract SCK audio with `CMSampleBufferCopyPCMDataIntoAudioBufferList` into a list sized from the buffer's own format (float32, one `AudioBuffer` per channel when non-interleaved), then convert to 16 kHz mono PCM16. `-12737` is `kCMSampleBufferError_ArrayTooSmall`: the list had one buffer and the system track is non-interleaved multi-channel. A PCM16-sized destination fails the copy too; discarding that error yields zero frames and no `system.pcm`. A copy that succeeds can still be all zeros if the channels are then averaged. If that copy is silent, read the contiguous planar float block (channel `c` at sample `c * frameCount`) before accepting silence.
 2. `updateConfiguration` **replaces**, never merges — always pass the complete config or sample rate/channels/audio flags silently reset.
 3. Write segments continuously, assemble on clean stop (crash-safe recording).
 

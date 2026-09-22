@@ -44,7 +44,7 @@ The path you pass is `CATCHER_SESSION_ROOT`. The app creates one directory per r
 
 The harness starts `Catcher.app/Contents/MacOS/CatcherApp` (bundle id `com.catcher.app`, not an ad-hoc side binary) so `CATCHER_SESSION_ROOT`, `CATCHER_HARNESS`, `CATCHER_ENGINE`, and `XAI_API_KEY` reach the process. The same switches are also passed as `--session-root`, `--harness`, `--engine`, and `--auto-record`. `open(1)` would drop the environment, including the API key.
 
-After a P1 run, `system.pcm` in the session directory is the capture proof. It is absent when no `PCMFrame` was emitted. A `noAudio` annotation at 10s also fires when zero frames arrived, so P4 passing does not show that system audio was captured.
+After a P1 run, `system.pcm` in the session directory is the capture proof. It is absent when no `PCMFrame` was emitted. A file of the right length that is all zeros is still a failed capture: `afplay` of the fixture must show a non-zero peak and RMS, and system `seg` rows must have text. A `noAudio` annotation at 10s also fires when zero frames arrived, so P4 passing does not show that system audio was captured. The microphone track can look healthy at the same time; that does not prove the system track.
 
 Library CI (`.github/workflows/catcher-ci.yml` on `macos-15`) runs `swift build` and `swift test` only. It does not produce `grade.json`.
 

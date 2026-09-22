@@ -133,11 +133,26 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, SCStreamDelegate
         guard config.wholeDisplay else {
             throw CaptureError.streamStopped("capture config is not whole-display")
         }
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        guard let display = content.displays.first else {
+        // onScreenWindowsOnly would hide windowless players such as afplay.
+        // excludingWindows only attaches audio to apps that have windows on the
+        // chosen display, so that fixture never enters the .audio mix. An empty
+        // excludingApplications list is the whole-display mix, including processes
+        // that start after the stream (the harness plays afplay two seconds in).
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        let ranked = content.displays.map { display -> SystemAudioDisplay in
+            let id = display.displayID
+            return SystemAudioDisplay(
+                id: id,
+                active: CGDisplayIsActive(id) != 0,
+                asleep: CGDisplayIsAsleep(id) != 0,
+                isMain: id == CGMainDisplayID()
+            )
+        }
+        guard let chosen = SystemAudioDisplayChoice.preferred(ranked),
+              let display = content.displays.first(where: { $0.displayID == chosen }) else {
             throw CaptureError.tccDenied("no display available for whole-display capture")
         }
-        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
         let streamConfig = SCStreamConfiguration()
         config.apply(to: streamConfig)
         let stream = SCStream(filter: filter, configuration: streamConfig, delegate: self)
