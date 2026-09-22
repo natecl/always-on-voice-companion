@@ -1,6 +1,6 @@
 # P1–P6 harness
 
-Run on a physical Mac after `catcher/scripts/build-app.sh`. The harness rejects an ad-hoc `Catcher.app`. The full checklist, artifact paths, and the meaning of each gate are in [`docs/qa/v0-grading.md`](../../docs/qa/v0-grading.md). A P1 session with no `system.pcm` means no system frames were emitted.
+Run on a physical Mac after `catcher/scripts/build-app.sh`. The harness rejects an ad-hoc `Catcher.app` and a hardened one without `com.apple.security.device.audio-input`. It launches the app with `open -n --env … --args …` so `com.catcher.app` is its own TCC responsible process; a direct exec from the shell would bill the microphone to Terminal and Catcher would never appear in the Microphone pane. The full checklist, artifact paths, and the meaning of each gate are in [`docs/qa/v0-grading.md`](../../docs/qa/v0-grading.md). A P1 session with no `system.pcm` means no system frames were emitted.
 
 ```bash
 export CATCHER_APP=/path/to/Catcher.app
