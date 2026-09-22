@@ -117,11 +117,54 @@ final class CatcherModel {
     }
 
     func regrant() {
+        let reason = blockReason
+        Task { await self.performRegrant(reason: reason) }
+    }
+
+    private var blockReason: String {
+        if case .blocked(let reason) = status { return reason }
+        return ""
+    }
+
+    /// Mic blocks open Microphone. Screen blocks open Screen & System Audio
+    /// (`Privacy_ScreenCapture`). A still-undetermined mic also gets
+    /// `AVCaptureDevice.requestAccess` so the system dialog can put Catcher
+    /// on the Microphone list without a manual +.
+    private func performRegrant(reason: String) async {
+        let asksForMicrophone = PrivacySettingsPane.forBlockReason(reason) == .microphone
+        let promptGranted: Bool
+        if asksForMicrophone {
+            promptGranted = await PermissionGate.requestMicrophoneAccessIfNotDetermined()
+        } else {
+            promptGranted = false
+        }
+        let followUp: PermissionState = promptGranted ? PermissionGate.recheck() : .blocked(reason: reason)
+        if promptGranted {
+            applyPermission(followUp)
+        }
+        guard let pane = PrivacySettingsPane.settingsPane(
+            blockReason: reason,
+            microphonePromptGranted: promptGranted,
+            followUp: followUp
+        ) else { return }
         #if os(macOS)
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+        if let url = pane.systemSettingsURL {
             NSWorkspace.shared.open(url)
         }
         #endif
+    }
+
+    private func applyPermission(_ state: PermissionState) {
+        switch state {
+        case .granted:
+            status = .ok
+            banner = nil
+            statusUpdatedAt = Date()
+        case .blocked(let reason):
+            status = .blocked(reason)
+            banner = "BLOCKED: \(reason)"
+            statusUpdatedAt = Date()
+        }
     }
 
     func select(_ id: String?) {

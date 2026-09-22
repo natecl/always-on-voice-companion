@@ -250,6 +250,43 @@ import Testing
     #expect(HostClock.milliseconds(from: start, to: end) >= 0)
 }
 
+@Test func regrantOpensMicrophoneForMicBlocksAndScreenForScreenBlocks() {
+    #expect(PrivacySettingsPane.forBlockReason("microphone access denied") == .microphone)
+    #expect(PrivacySettingsPane.forBlockReason("microphone access not determined") == .microphone)
+    #expect(PrivacySettingsPane.forBlockReason("microphone access unavailable") == .microphone)
+    #expect(PrivacySettingsPane.forBlockReason("silent buffers and permission re-probe failed: microphone access denied") == .microphone)
+    #expect(PrivacySettingsPane.forBlockReason("screen recording access denied") == .screenCapture)
+    #expect(PrivacySettingsPane.forBlockReason("screen recording permission revoked") == .screenCapture)
+    #expect(PrivacySettingsPane.forBlockReason("ScreenCaptureKit is unavailable on this platform") == .screenCapture)
+
+    let microphone = PrivacySettingsPane.microphone.systemSettingsURL?.absoluteString
+    let screen = PrivacySettingsPane.screenCapture.systemSettingsURL?.absoluteString
+    #expect(microphone?.contains("Privacy_Microphone") == true)
+    #expect(screen?.contains("Privacy_ScreenCapture") == true)
+    #expect(microphone?.contains("ScreenCapture") != true)
+
+    #expect(PrivacySettingsPane.settingsPane(
+        blockReason: "microphone access denied",
+        microphonePromptGranted: false,
+        followUp: .blocked(reason: "microphone access denied")
+    ) == .microphone)
+    #expect(PrivacySettingsPane.settingsPane(
+        blockReason: "screen recording access denied",
+        microphonePromptGranted: false,
+        followUp: .blocked(reason: "screen recording access denied")
+    ) == .screenCapture)
+    #expect(PrivacySettingsPane.settingsPane(
+        blockReason: "microphone access not determined",
+        microphonePromptGranted: true,
+        followUp: .granted
+    ) == nil)
+    #expect(PrivacySettingsPane.settingsPane(
+        blockReason: "microphone access not determined",
+        microphonePromptGranted: true,
+        followUp: .blocked(reason: "screen recording access denied")
+    ) == .screenCapture)
+}
+
 @Test func permissionProbeIsBlockedWithoutScreenCaptureKit() async {
     let state = await PermissionGate.startCaptureProbe()
     #if canImport(ScreenCaptureKit)

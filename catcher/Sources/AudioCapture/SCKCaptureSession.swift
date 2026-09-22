@@ -99,6 +99,15 @@ enum SCKPermissionProbe {
             return .blocked(reason: "microphone access unavailable")
         }
     }
+
+    static func requestMicrophoneAccessIfNotDetermined() async -> Bool {
+        guard AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined else {
+            return false
+        }
+        return await withCheckedContinuation { continuation in
+            AVCaptureDevice.requestAccess(for: .audio) { continuation.resume(returning: $0) }
+        }
+    }
 }
 
 public final class SCKCaptureSession: NSObject, AudioCapturing, SCStreamDelegate, @unchecked Sendable {
