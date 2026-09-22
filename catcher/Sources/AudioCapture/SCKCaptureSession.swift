@@ -51,8 +51,10 @@ import AVFoundation
 import CoreGraphics
 import CoreMedia
 import Darwin
+import Diagnostics
 import ScreenCaptureKit
 import Security
+import Synchronization
 import os
 
 enum SCKPermissionProbe {
@@ -203,6 +205,7 @@ enum SCKPermissionProbe {
             await session.stop()
             return .granted
         } catch {
+            StageMirror.note("launch probe startCapture \(ErrorDetail.sentence(error))")
             let ns = error as NSError
             return .blocked(reason: "startCapture failed: \(ns.localizedDescription) (\(ns.domain) \(ns.code))")
         }
@@ -499,7 +502,7 @@ private actor MicrophonePromptGate {
     }
 }
 
-public final class SCKCaptureSession: NSObject, AudioCapturing, SCStreamDelegate, @unchecked Sendable {
+public final class SCKCaptureSession: NSObject, AudioCapturing, CaptureDiagnostics, SCStreamDelegate, @unchecked Sendable {
     public let frames: AsyncStream<PCMFrame>
     public let failures: AsyncStream<CaptureError>
     private let frameContinuation: AsyncStream<PCMFrame>.Continuation
@@ -512,6 +515,8 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, SCStreamDelegate
     private var outputs: [NSObject] = []
     private var accepting = false
     private var reportedExtractionFailure = false
+    private let counterBox = CaptureCounterBox()
+    private var displayID: UInt32 = 0
 
     public override init() {
         let frames = AsyncStream<PCMFrame>.makeStream()
@@ -523,7 +528,23 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, SCStreamDelegate
         super.init()
     }
 
+    public func counters() -> CaptureCounters {
+        lock.lock()
+        let display = displayID
+        lock.unlock()
+        var snapshot = counterBox.snapshot(displayID: display)
+        let fallback = SampleBufferPCM.lastFallbackError()
+        if snapshot.firstOSStatus == 0, fallback.status != 0 {
+            snapshot.firstOSStatus = fallback.status
+        }
+        if snapshot.firstFailureDetail.isEmpty {
+            snapshot.firstFailureDetail = fallback.detail
+        }
+        return snapshot
+    }
+
     public func start() async throws {
+        SampleBufferPCM.resetFallbackError()
         var config = CaptureConfig.make()
         if config.microphoneDeviceID == nil {
             config.microphoneDeviceID = AVCaptureDevice.default(for: .audio)?.uniqueID
@@ -550,16 +571,19 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, SCStreamDelegate
               let display = content.displays.first(where: { $0.displayID == chosen }) else {
             throw CaptureError.tccDenied("no display available for whole-display capture")
         }
+        lock.lock()
+        displayID = chosen
+        lock.unlock()
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
         let streamConfig = SCStreamConfiguration()
         config.apply(to: streamConfig)
         let stream = SCStream(filter: filter, configuration: streamConfig, delegate: self)
-        let audio = PCMOutput(track: .system, onFrame: { [weak self] frame in
+        let audio = PCMOutput(track: .system, counters: counterBox, onFrame: { [weak self] frame in
             self?.emit(frame)
         }, onFailure: { [weak self] error in
             self?.emitFailure(error)
         })
-        let microphone = PCMOutput(track: .microphone, onFrame: { [weak self] frame in
+        let microphone = PCMOutput(track: .microphone, counters: counterBox, onFrame: { [weak self] frame in
             self?.emit(frame)
         }, onFailure: { [weak self] error in
             self?.emitFailure(error)
@@ -567,7 +591,11 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, SCStreamDelegate
         // Video still runs inside an audio capture. A screen consumer keeps those
         // frames off the audio queue. Audio-only still delivers buffers if this add fails.
         let screen = DiscardingScreenOutput()
-        try? stream.addStreamOutput(screen, type: .screen, sampleHandlerQueue: screenQueue)
+        do {
+            try stream.addStreamOutput(screen, type: .screen, sampleHandlerQueue: screenQueue)
+        } catch {
+            StageMirror.note("addStreamOutput screen \(ErrorDetail.sentence(error))")
+        }
         try stream.addStreamOutput(audio, type: .audio, sampleHandlerQueue: audioQueue)
         try stream.addStreamOutput(microphone, type: .microphone, sampleHandlerQueue: microphoneQueue)
         // Accept before startCapture. Buffers can arrive before startCapture returns,
@@ -576,6 +604,7 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, SCStreamDelegate
         do {
             try await stream.startCapture()
         } catch {
+            StageMirror.note("startCapture \(ErrorDetail.sentence(error))")
             _ = takeStream()
             throw error
         }
@@ -593,7 +622,11 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, SCStreamDelegate
     public func stop() async {
         let stream = takeStream()
         if let stream {
-            try? await stream.stopCapture()
+            do {
+                try await stream.stopCapture()
+            } catch {
+                StageMirror.note("stopCapture \(ErrorDetail.sentence(error))")
+            }
         }
         frameContinuation.finish()
         failureContinuation.finish()
@@ -622,6 +655,9 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, SCStreamDelegate
     }
 
     private func emitFailure(_ error: CaptureError) {
+        if case .pcmExtractionFailed(let status, let detail) = error {
+            counterBox.noteExtraction(status: status, detail: detail)
+        }
         lock.lock()
         let open = accepting
         let report: Bool
@@ -733,23 +769,33 @@ private final class DiscardingScreenOutput: NSObject, SCStreamOutput {
 
 private final class PCMOutput: NSObject, SCStreamOutput {
     let track: AudioTrack
+    let counters: CaptureCounterBox
     let onFrame: (PCMFrame) -> Void
     let onFailure: (CaptureError) -> Void
 
     init(
         track: AudioTrack,
+        counters: CaptureCounterBox,
         onFrame: @escaping (PCMFrame) -> Void,
         onFailure: @escaping (CaptureError) -> Void
     ) {
         self.track = track
+        self.counters = counters
         self.onFrame = onFrame
         self.onFailure = onFailure
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        counters.noteRaw(track)
         guard type == .audio || type == .microphone else { return }
-        guard CMSampleBufferIsValid(sampleBuffer) else { return }
-        guard CMSampleBufferGetNumSamples(sampleBuffer) > 0 else { return }
+        guard CMSampleBufferIsValid(sampleBuffer) else {
+            counters.noteInvalid()
+            return
+        }
+        guard CMSampleBufferGetNumSamples(sampleBuffer) > 0 else {
+            counters.noteEmpty()
+            return
+        }
         do {
             let data = try SampleBufferPCM.extract(from: sampleBuffer)
             let frame = PCMFrame(
@@ -762,10 +808,67 @@ private final class PCMOutput: NSObject, SCStreamOutput {
         } catch let error as CaptureError {
             onFailure(error)
         } catch let failure as SampleBufferPCM.Failure {
-            onFailure(.pcmExtractionFailed(status: -1, detail: String(describing: failure)))
+            let fallback = SampleBufferPCM.lastFallbackError()
+            let status = fallback.status != 0 ? fallback.status : 0
+            onFailure(.pcmExtractionFailed(status: status, detail: String(describing: failure)))
         } catch {
-            onFailure(.pcmExtractionFailed(status: -1, detail: String(describing: error)))
+            let ns = error as NSError
+            onFailure(.pcmExtractionFailed(status: Int32(truncatingIfNeeded: ns.code), detail: ErrorDetail.sentence(error)))
         }
+    }
+}
+
+final class CaptureCounterBox: @unchecked Sendable {
+    private let system = ManagedAtomic<Int>(0)
+    private let microphone = ManagedAtomic<Int>(0)
+    private let invalid = ManagedAtomic<Int>(0)
+    private let empty = ManagedAtomic<Int>(0)
+    private let extractFailed = ManagedAtomic<Int>(0)
+    private let firstStatus = ManagedAtomic<Int32>(0)
+    private let detailLock = NSLock()
+    private var firstDetail = ""
+
+    func noteRaw(_ track: AudioTrack) {
+        switch track {
+        case .system:
+            system.wrappingIncrement(by: 1, ordering: .relaxed)
+        case .microphone:
+            microphone.wrappingIncrement(by: 1, ordering: .relaxed)
+        }
+    }
+
+    func noteInvalid() {
+        invalid.wrappingIncrement(by: 1, ordering: .relaxed)
+    }
+
+    func noteEmpty() {
+        empty.wrappingIncrement(by: 1, ordering: .relaxed)
+    }
+
+    func noteExtraction(status: Int32, detail: String) {
+        extractFailed.wrappingIncrement(by: 1, ordering: .relaxed)
+        if status != 0 {
+            _ = firstStatus.compareExchange(expected: 0, desired: status, ordering: .relaxed)
+        }
+        detailLock.lock()
+        if firstDetail.isEmpty { firstDetail = detail }
+        detailLock.unlock()
+    }
+
+    func snapshot(displayID: UInt32) -> CaptureCounters {
+        detailLock.lock()
+        let detail = firstDetail
+        detailLock.unlock()
+        return CaptureCounters(
+            system: system.load(ordering: .relaxed),
+            microphone: microphone.load(ordering: .relaxed),
+            invalid: invalid.load(ordering: .relaxed),
+            empty: empty.load(ordering: .relaxed),
+            extractFailed: extractFailed.load(ordering: .relaxed),
+            firstOSStatus: firstStatus.load(ordering: .relaxed),
+            firstFailureDetail: detail,
+            displayID: displayID
+        )
     }
 }
 #endif

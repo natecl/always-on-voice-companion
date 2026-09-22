@@ -62,6 +62,44 @@ public enum SampleBufferPCM {
         case unsupportedFormat(String)
     }
 
+    /// First swallowed copy/convert failure in this process. `start` resets it
+    /// so a recovered fallback does not look like a clean extract.
+    public struct FallbackFailure: Sendable, Equatable {
+        public var status: Int32
+        public var detail: String
+
+        public init(status: Int32, detail: String) {
+            self.status = status
+            self.detail = detail
+        }
+    }
+
+    private static let fallbackLock = NSLock()
+    nonisolated(unsafe) private static var storedFallback = FallbackFailure(status: 0, detail: "")
+
+    public static func lastFallbackError() -> FallbackFailure {
+        fallbackLock.lock()
+        defer { fallbackLock.unlock() }
+        return storedFallback
+    }
+
+    public static func resetFallbackError() {
+        fallbackLock.lock()
+        storedFallback = FallbackFailure(status: 0, detail: "")
+        fallbackLock.unlock()
+    }
+
+    static func recordFallback(status: Int32, detail: String) {
+        fallbackLock.lock()
+        defer { fallbackLock.unlock() }
+        if storedFallback.status == 0, status != 0 {
+            storedFallback.status = status
+        }
+        if storedFallback.detail.isEmpty, !detail.isEmpty {
+            storedFallback.detail = detail
+        }
+    }
+
     /// Downmix interleaved little-endian PCM16 to mono by averaging channels.
     /// ScreenCaptureKit is configured for mono; this still refuses to drop a channel
     /// if a buffer arrives wider than the config.
@@ -194,6 +232,9 @@ public enum SampleBufferPCM {
             frameCount: Int32(frames),
             into: list
         )
+        if status != noErr {
+            recordFallback(status: status, detail: "CMSampleBufferCopyPCMDataIntoAudioBufferList")
+        }
         var copiedPCM: Data?
         if status == noErr {
             var copiedBuffers: [Data] = []
@@ -253,7 +294,12 @@ public enum SampleBufferPCM {
             totalLengthOut: &totalLength,
             dataPointerOut: &dataPointer
         )
-        guard status == noErr, let dataPointer, totalLength > 0 else { return nil }
+        guard status == noErr, let dataPointer, totalLength > 0 else {
+            if status != noErr {
+                recordFallback(status: status, detail: "CMBlockBufferGetDataPointer")
+            }
+            return nil
+        }
         let sampleBytes = 4
         var interpret = format
         if format.channels > 1 && Int(format.bytesPerFramePerBuffer) == sampleBytes {
@@ -273,7 +319,11 @@ public enum SampleBufferPCM {
         } else {
             channelBuffers.append(Data(bytes: dataPointer, count: needed))
         }
-        guard let pcm = try? convertToPCM16Mono(buffers: channelBuffers, format: interpret, frameCount: frameCount) else {
+        let pcm: Data
+        do {
+            pcm = try convertToPCM16Mono(buffers: channelBuffers, format: interpret, frameCount: frameCount)
+        } catch {
+            recordFallback(status: 0, detail: String(describing: error))
             return nil
         }
         guard saneFloatBlock(channelBuffers, format: interpret, frameCount: frameCount) else { return nil }

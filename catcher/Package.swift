@@ -17,7 +17,10 @@ let package = Package(
     ],
     targets: [
         .target(name: "Diagnostics"),
-        .target(name: "AudioCapture"),
+        .target(
+            name: "AudioCapture",
+            dependencies: ["Diagnostics"]
+        ),
         .target(
             name: "TranscriptionEngine",
             dependencies: ["AudioCapture"]
