@@ -819,34 +819,34 @@ private final class PCMOutput: NSObject, SCStreamOutput {
 }
 
 final class CaptureCounterBox: @unchecked Sendable {
-    private let system = ManagedAtomic<Int>(0)
-    private let microphone = ManagedAtomic<Int>(0)
-    private let invalid = ManagedAtomic<Int>(0)
-    private let empty = ManagedAtomic<Int>(0)
-    private let extractFailed = ManagedAtomic<Int>(0)
-    private let firstStatus = ManagedAtomic<Int32>(0)
+    private let system = Atomic<Int>(0)
+    private let microphone = Atomic<Int>(0)
+    private let invalid = Atomic<Int>(0)
+    private let empty = Atomic<Int>(0)
+    private let extractFailed = Atomic<Int>(0)
+    private let firstStatus = Atomic<Int32>(0)
     private let detailLock = NSLock()
     private var firstDetail = ""
 
     func noteRaw(_ track: AudioTrack) {
         switch track {
         case .system:
-            system.wrappingIncrement(by: 1, ordering: .relaxed)
+            system.wrappingAdd(1, ordering: .relaxed)
         case .microphone:
-            microphone.wrappingIncrement(by: 1, ordering: .relaxed)
+            microphone.wrappingAdd(1, ordering: .relaxed)
         }
     }
 
     func noteInvalid() {
-        invalid.wrappingIncrement(by: 1, ordering: .relaxed)
+        invalid.wrappingAdd(1, ordering: .relaxed)
     }
 
     func noteEmpty() {
-        empty.wrappingIncrement(by: 1, ordering: .relaxed)
+        empty.wrappingAdd(1, ordering: .relaxed)
     }
 
     func noteExtraction(status: Int32, detail: String) {
-        extractFailed.wrappingIncrement(by: 1, ordering: .relaxed)
+        extractFailed.wrappingAdd(1, ordering: .relaxed)
         if status != 0 {
             _ = firstStatus.compareExchange(expected: 0, desired: status, ordering: .relaxed)
         }
