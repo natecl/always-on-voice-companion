@@ -11,8 +11,9 @@ public struct GrokEngineConfiguration: Sendable {
     public var nowMs: (@Sendable () -> Int)?
     public var handshakeTimeout: Duration
     public var chunkBytes: Int
-    /// No server message for this long while audio is still being written means
-    /// the socket is black-holed. `pf` drop does not close a WebSocket.
+    /// No server message for this long, while a send is still in flight or bytes
+    /// have been written since the last message, means the socket is black-holed.
+    /// A `pf` drop does not FIN/RST the WebSocket.
     public var inboundStall: Duration
     public var authProbe: @Sendable (String) async -> AuthProbeResult
 
@@ -71,7 +72,6 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics {
     private var socketOriginMs = 0
     private var ready = false
     private var hasBeenReady = false
-    private var pumping = false
     private var finishRequested = false
     private var seq = 0
     /// Chunk finals (`is_final && !speech_final`) for the current utterance were stored.
@@ -84,6 +84,14 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics {
     private var handshakeFailure: EngineError?
     private var reader: Task<Void, Never>?
     private var watchdog: Task<Void, Never>?
+    /// Owns reconnect. Independent of the reader: a dropped close frame never wakes `receive`.
+    private var recovery: Task<Void, Never>?
+    private var socketGeneration = 0
+    /// Socket generation that currently owns `pump`. A hung send keeps its task; a new socket must still pump.
+    private var pumpOwner: Int?
+    /// Chunk removed from `pending` and not yet accepted by `send`. A blocked send is not in `replay`.
+    private var inFlight = Data()
+    private var inFlightGeneration: Int?
     /// Bytes sent on this socket since the last server message. Replayed after a stall.
     private var replay = Data()
     private var bytesAtLastInbound = 0
@@ -167,7 +175,10 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics {
         watchdog = nil
         await flushTail()
         reader?.cancel()
+        recovery?.cancel()
+        let pendingRecovery = recovery
         await transport?.close()
+        await pendingRecovery?.value
         continuation.yield(.state(.closed))
         continuation.finish()
     }
@@ -194,23 +205,25 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics {
     }
 
     private func readLoop() async {
-        while !finishRequested {
+        let generation = socketGeneration
+        while !finishRequested && !Task.isCancelled && generation == socketGeneration {
             guard let transport else { return }
             do {
                 let event = try await transport.receive()
-                if finishRequested || Task.isCancelled { return }
-                await handle(event)
+                if finishRequested || Task.isCancelled || generation != socketGeneration { return }
+                await handle(event, generation: generation)
             } catch is CancellationError {
                 return
             } catch {
-                if finishRequested || Task.isCancelled { return }
+                if finishRequested || Task.isCancelled || generation != socketGeneration { return }
                 lastError = ErrorDetail.sentence(error)
-                await handle(.closed(code: 1006, reason: String(describing: error)))
+                await handle(.closed(code: 1006, reason: ErrorDetail.sentence(error)), generation: generation)
             }
         }
     }
 
-    private func handle(_ event: GrokSocketEvent) async {
+    private func handle(_ event: GrokSocketEvent, generation: Int) async {
+        guard generation == socketGeneration else { return }
         switch event {
         case .text(let text):
             bytesAtLastInbound = bytesSent
@@ -228,13 +241,35 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics {
                 if lastError == nil { lastError = "closed \(code) \(reason)" }
                 return
             }
-            await reconnect(code: code, reason: reason)
+            socketDied(code: code, reason: reason)
         }
     }
 
-    private func reconnect(code: Int, reason: String) async {
+    /// Start the one reconnect task. `reconnect` is what yields `gap` and then
+    /// `streaming` (the verifier writes `resumed`). Waiting for `receive` to
+    /// observe the close never happens under a `pf` drop: the close frame is
+    /// outbound and is discarded, so the reader stays parked.
+    private func socketDied(code: Int, reason: String) {
+        guard hasBeenReady, !finishRequested, recovery == nil else { return }
+        ready = false
+        socketGeneration += 1
+        pumpOwner = nil
+        let dead = transport
+        transport = nil
+        // Detached so cancelling the stalled reader or the watchdog does not
+        // cancel the reconnect that those two tasks just asked for.
+        recovery = Task.detached {
+            await dead?.close()
+            await self.reconnect(code: code, reason: reason)
+        }
         watchdog?.cancel()
         watchdog = nil
+        reader?.cancel()
+        reader = nil
+    }
+
+    private func reconnect(code: Int, reason: String) async {
+        defer { recovery = nil }
         var prepared = false
         while !finishRequested {
             ready = false
@@ -252,9 +287,21 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics {
             if finishRequested { return }
             let next = configuration.makeTransport()
             do {
-                try await next.connect(url: configuration.url, authorizationBearer: configuration.apiKey)
+                // A connect started while `pf` is still dropping SYNs will not
+                // fail on its own until TCP gives up. Bound it so the backoff
+                // loop can open a fresh socket after the rule clears.
+                try await open(next)
                 transport = next
                 try await readUntilCreated(next)
+                await pump()
+                if finishRequested { return }
+                if !ready {
+                    reader?.cancel()
+                    reader = nil
+                    await next.close()
+                    transport = nil
+                    continue
+                }
                 // End the hole on the new socket's origin so the resumed ann and
                 // the next seg share one session time.
                 if let span = gap.end(atMs: lastSocketOrigin) {
@@ -262,12 +309,35 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics {
                 }
                 backoff = BackoffSchedule()
                 continuation.yield(.state(.streaming))
-                await pump()
+                reader = Task { await self.readLoop() }
                 armWatchdog()
                 return
             } catch {
                 continuation.yield(.error(.socket(String(describing: error))))
                 await next.close()
+                transport = nil
+            }
+        }
+    }
+
+    /// `connect` has no deadline. The handshake timeout is the same budget the
+    /// engine already uses for `transcript.created`.
+    private func open(_ transport: any GrokTransport) async throws {
+        let url = configuration.url
+        let key = configuration.apiKey
+        let timeout = configuration.handshakeTimeout
+        try await withThrowingTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                try await transport.connect(url: url, authorizationBearer: key)
+                return true
+            }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                return false
+            }
+            defer { group.cancelAll() }
+            guard try await group.next() ?? false else {
+                throw EngineError.handshakeTimeout
             }
         }
     }
@@ -405,27 +475,47 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics {
     }
 
     private func pump() async {
-        guard !pumping, ready, let transport else { return }
-        pumping = true
-        defer { pumping = false }
-        while pending.count >= configuration.chunkBytes {
+        guard pumpOwner == nil, ready, let transport else { return }
+        let generation = socketGeneration
+        pumpOwner = generation
+        defer {
+            if pumpOwner == generation {
+                pumpOwner = nil
+            }
+        }
+        while pending.count >= configuration.chunkBytes && generation == socketGeneration {
             let size = configuration.chunkBytes
             let chunk = Data(pending.prefix(size))
             pending.removeFirst(size)
+            inFlight = chunk
+            inFlightGeneration = generation
             do {
                 try await transport.sendBinary(chunk)
+                if generation != socketGeneration {
+                    restoreInFlight(chunk, generation: generation)
+                    return
+                }
+                inFlight.removeAll(keepingCapacity: false)
+                inFlightGeneration = nil
                 bytesSent += chunk.count
                 replay.append(chunk)
                 if replay.count > Self.replayCap {
                     replay.removeFirst(replay.count - Self.replayCap)
                 }
             } catch {
+                if generation != socketGeneration {
+                    restoreInFlight(chunk, generation: generation)
+                    return
+                }
+                inFlight.removeAll(keepingCapacity: false)
+                inFlightGeneration = nil
                 pending.insert(contentsOf: chunk, at: 0)
                 ready = false
                 sendErrors += 1
                 if lastError == nil { lastError = ErrorDetail.sentence(error) }
                 continuation.yield(.error(.socket(String(describing: error))))
                 await transport.close()
+                socketDied(code: 1006, reason: ErrorDetail.sentence(error))
                 return
             }
         }
@@ -471,7 +561,19 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics {
     /// 30s of PCM16 mono at 16 kHz. Older than that is outside one network kill.
     private static let replayCap = 16_000 * 2 * 30
 
+    private func restoreInFlight(_ chunk: Data, generation: Int) {
+        guard inFlightGeneration == generation, inFlight == chunk else { return }
+        pending.insert(contentsOf: chunk, at: 0)
+        inFlight.removeAll(keepingCapacity: false)
+        inFlightGeneration = nil
+    }
+
     private func reclaimReplay() {
+        if !inFlight.isEmpty {
+            pending.insert(contentsOf: inFlight, at: 0)
+            inFlight.removeAll(keepingCapacity: false)
+            inFlightGeneration = nil
+        }
         guard !replay.isEmpty else { return }
         pending.insert(contentsOf: replay, at: 0)
         bytesSent = max(0, bytesSent - replay.count)
@@ -487,24 +589,25 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics {
         watchdog = Task { await self.watchInbound(stall) }
     }
 
-    /// `send` succeeds while packets are dropped: the bytes sit in the kernel
-    /// and `receive` never returns. Close the socket so the reader reconnects.
-    /// The timer resets on every server message, so a live transcript does not
-    /// look like a stall.
+    /// `send` can return while the packets sit in the kernel, or it can sit
+    /// forever on the one in-flight chunk. Either way `receive` does not return.
+    /// A server message sets the watermark to every byte `send` has already
+    /// accepted, so a blocked next send has `bytesSent == bytesAtLastInbound`
+    /// and must still count. The timer resets on every server message.
     private func watchInbound(_ stall: Duration) async {
         let limit = Self.seconds(stall)
-        while !Task.isCancelled && !finishRequested {
+        let generation = socketGeneration
+        while !Task.isCancelled && !finishRequested && generation == socketGeneration {
             do {
                 try await Task.sleep(for: .milliseconds(200))
             } catch {
                 return
             }
-            if Task.isCancelled || finishRequested || !ready { return }
-            guard bytesSent > bytesAtLastInbound else { continue }
+            if Task.isCancelled || finishRequested || !ready || generation != socketGeneration { return }
+            let outstanding = bytesSent > bytesAtLastInbound || !inFlight.isEmpty
+            if !outstanding { continue }
             if Date().timeIntervalSince(lastInbound) >= limit {
-                ready = false
-                let dead = transport
-                await dead?.close()
+                socketDied(code: 1006, reason: "inbound stall")
                 return
             }
         }

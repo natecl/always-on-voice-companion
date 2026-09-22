@@ -47,6 +47,7 @@ public final class URLSessionGrokTransport: GrokTransport, @unchecked Sendable {
     private let session: URLSession
     private let lock = NSLock()
     private var task: URLSessionWebSocketTask?
+    private var closed = false
 
     public init(session: URLSession = URLSession(configuration: .default)) {
         self.session = session
@@ -67,61 +68,81 @@ public final class URLSessionGrokTransport: GrokTransport, @unchecked Sendable {
     }
 
     public func sendText(_ text: String) async throws {
-        try await current().send(.string(text))
-    }
-
-    public func sendBinary(_ data: Data) async throws {
-        try await current().send(.data(data))
-    }
-
-    public func receive() async throws -> GrokSocketEvent {
-        do {
-            let message = try await current().receive()
-            switch message {
-            case .string(let text):
-                return .text(text)
-            case .data(let data):
-                return .binary(data)
-            @unknown default:
-                StageMirror.note("websocket message type unknown")
-                return .text("")
-            }
-        } catch {
-            let task = currentOptional()
-            let code = task?.closeCode.rawValue ?? 1006
-            let ns = error as NSError
-            var reason = "\(ns.domain) \(ns.code) \(ns.localizedDescription)"
-            if let http = (task?.response as? HTTPURLResponse)?.statusCode {
-                reason = "http=\(http) \(reason)"
-            }
-            return .closed(code: code, reason: reason)
+        let task = try current()
+        try await withTaskCancellationHandler {
+            try await task.send(.string(text))
+        } onCancel: {
+            task.cancel()
         }
     }
 
-    public func close() async {
-        takeTask()?.cancel(with: .normalClosure, reason: nil)
+    public func sendBinary(_ data: Data) async throws {
+        let task = try current()
+        try await withTaskCancellationHandler {
+            try await task.send(.data(data))
+        } onCancel: {
+            task.cancel()
+        }
     }
 
-    private func takeTask() -> URLSessionWebSocketTask? {
+    public func receive() async throws -> GrokSocketEvent {
+        let task: URLSessionWebSocketTask
+        do {
+            task = try current()
+        } catch {
+            return .closed(code: 1006, reason: "websocket is not connected")
+        }
+        return await withTaskCancellationHandler {
+            do {
+                let message = try await task.receive()
+                switch message {
+                case .string(let text):
+                    return .text(text)
+                case .data(let data):
+                    return .binary(data)
+                @unknown default:
+                    StageMirror.note("websocket message type unknown")
+                    return .text("")
+                }
+            } catch {
+                let code = task.closeCode.rawValue
+                let ns = error as NSError
+                var reason = "\(ns.domain) \(ns.code) \(ns.localizedDescription)"
+                if let http = (task.response as? HTTPURLResponse)?.statusCode {
+                    reason = "http=\(http) \(reason)"
+                }
+                return .closed(code: code == 0 ? 1006 : code, reason: reason)
+            }
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    /// `cancel(with: .normalClosure)` waits to write a close frame. Under a `pf`
+    /// drop that frame never leaves, and `receive`/`send` stay parked. Cancel
+    /// the task locally and invalidate this socket's session so those calls fail
+    /// without a network round trip.
+    public func close() async {
+        let taskToCancel: URLSessionWebSocketTask?
         lock.lock()
-        let task = self.task
-        self.task = nil
+        if closed {
+            lock.unlock()
+            return
+        }
+        closed = true
+        taskToCancel = task
+        task = nil
         lock.unlock()
-        return task
+        taskToCancel?.cancel()
+        session.invalidateAndCancel()
     }
 
     private func current() throws -> URLSessionWebSocketTask {
         lock.lock()
         defer { lock.unlock() }
-        guard let task else {
+        guard let task, !closed else {
             throw EngineError.socket("websocket is not connected")
         }
-        return task
-    }
-
-    private func currentOptional() -> URLSessionWebSocketTask? {
-        lock.lock()
-        defer { lock.unlock() }
         return task
     }
     #else

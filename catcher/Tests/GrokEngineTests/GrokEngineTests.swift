@@ -197,6 +197,118 @@ import TranscriptionEngine
     await engine.finish()
 }
 
+@Test func bufferedSendReconnectsWhenCloseDoesNotWakeReceive() async throws {
+    let clock = ManualClock()
+    let supply = SocketSupply()
+    supply.configure = { index, socket in
+        if index == 0 {
+            socket.wakeReceiveOnClose = false
+            socket.ignoreReceiveCancel = true
+        }
+    }
+    let engine = stalledEngine(supply: supply, clock: clock)
+    defer { supply.socket(0)?.release() }
+    var iterator = engine.events.makeAsyncIterator()
+    let connecting = Task { try await engine.connect(track: .system) }
+    try await waitUntil { supply.count >= 1 }
+    let first = try #require(supply.socket(0))
+    first.push(.text(#"{"type":"transcript.created"}"#))
+    try await connecting.value
+    let frame = Data(repeating: 9, count: 3_200)
+    try await engine.send(PCMFrame(track: .system, data: frame, hostTime: 0))
+    try await waitUntil { first.binaryCount == 1 }
+    let parked = first.receiveReturns
+    try await waitUntil { supply.count >= 2 }
+    let second = try #require(supply.socket(1))
+    second.push(.text(#"{"type":"transcript.created"}"#))
+    var sawGap = false
+    var sawDegraded = false
+    for _ in 0..<16 {
+        guard let event = await iterator.next() else { break }
+        if case .state(.degraded) = event { sawDegraded = true }
+        if case .gap = event { sawGap = true }
+        if case .state(.streaming) = event, sawGap { break }
+    }
+    #expect(sawDegraded)
+    #expect(sawGap)
+    #expect(first.receiveReturns == parked)
+    try await waitUntil { second.binaryCount >= 1 }
+    #expect(second.binary(at: 0) == frame)
+    second.push(.text(#"""
+    {"type":"transcript.partial","text":"back","is_final":true,"speech_final":true,"start":0.0,"duration":0.1,"words":[{"text":"back","start":0.0,"end":0.1}]}
+    """#))
+    var rebased = false
+    for _ in 0..<8 {
+        guard let event = await iterator.next() else { break }
+        if case .transcript(let transcript) = event, transcript.kind == .final {
+            #expect(transcript.startMs == 1_000)
+            rebased = true
+            break
+        }
+    }
+    #expect(rebased)
+    first.release()
+    await engine.finish()
+}
+
+@Test func blockedSendAfterWatermarkStillReconnects() async throws {
+    let clock = ManualClock()
+    let supply = SocketSupply()
+    supply.configure = { index, socket in
+        if index == 0 {
+            socket.wakeReceiveOnClose = false
+            socket.ignoreReceiveCancel = true
+            socket.hangSendsAfter = 1
+        }
+    }
+    // Longer than one watchdog poll so the acking transcript lands before the
+    // stall check. 80ms would race the first poll and reconnect too soon.
+    let engine = stalledEngine(supply: supply, clock: clock, inboundStall: .milliseconds(250))
+    defer { supply.socket(0)?.release() }
+    var iterator = engine.events.makeAsyncIterator()
+    let connecting = Task { try await engine.connect(track: .system) }
+    try await waitUntil { supply.count >= 1 }
+    let first = try #require(supply.socket(0))
+    first.push(.text(#"{"type":"transcript.created"}"#))
+    try await connecting.value
+    let sent = Data(repeating: 3, count: 3_200)
+    let blocked = Data(repeating: 4, count: 3_200)
+    try await engine.send(PCMFrame(track: .system, data: sent, hostTime: 0))
+    try await waitUntil { first.binaryCount == 1 }
+    first.push(.text(#"""
+    {"type":"transcript.partial","text":"heard","is_final":true,"speech_final":true,"start":0.0,"duration":0.1,"words":[{"text":"heard","start":0.0,"end":0.1}]}
+    """#))
+    var heard = false
+    for _ in 0..<8 {
+        guard let event = await iterator.next() else { break }
+        if case .transcript(let transcript) = event, transcript.text == "heard" {
+            heard = true
+            break
+        }
+    }
+    #expect(heard)
+    let parked = first.receiveReturns
+    let hung = Task { try await engine.send(PCMFrame(track: .system, data: blocked, hostTime: 0)) }
+    try await waitUntil { supply.count >= 2 }
+    let second = try #require(supply.socket(1))
+    second.push(.text(#"{"type":"transcript.created"}"#))
+    var sawGap = false
+    for _ in 0..<16 {
+        guard let event = await iterator.next() else { break }
+        if case .gap = event { sawGap = true }
+        if case .state(.streaming) = event, sawGap { break }
+    }
+    #expect(sawGap)
+    #expect(first.receiveReturns == parked)
+    // The transcript acked `sent` and cleared it from the replay buffer.
+    // Only the chunk still blocked in `send` is replayed.
+    try await waitUntil { second.binaryCount >= 1 }
+    #expect(second.binary(at: 0) == blocked)
+    first.release()
+    await engine.finish()
+    _ = await hung.value
+}
+
 @Test func chunkFinalsAreKeptAndTheStitchedSpeechFinalIsDropped() async throws {
     let transport = ScriptedTransport()
     let engine = GrokEngine(track: .system, configuration: testConfig(transport))
@@ -340,6 +452,24 @@ import TranscriptionEngine
     #expect(String(describing: type(of: engine)).contains("GrokEngine"))
 }
 
+private func stalledEngine(
+    supply: SocketSupply,
+    clock: ManualClock,
+    inboundStall: Duration = .milliseconds(80)
+) -> GrokEngine {
+    GrokEngine(track: .system, configuration: GrokEngineConfiguration(
+        apiKey: "test-key",
+        url: GrokWebSocket.url(),
+        makeTransport: { supply.make() },
+        sleep: { duration in
+            clock.advance(ms: Int(seconds(duration) * 1000))
+        },
+        nowMs: { clock.ms },
+        handshakeTimeout: .seconds(2),
+        inboundStall: inboundStall
+    ))
+}
+
 private func testConfig(_ transport: ScriptedTransport) -> GrokEngineConfiguration {
     GrokEngineConfiguration(
         apiKey: "test-key",
@@ -375,13 +505,50 @@ private final class ManualClock: @unchecked Sendable {
     func advance(ms: Int) { self.ms += ms }
 }
 
+private final class SocketSupply: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sockets: [ScriptedTransport] = []
+    var configure: (Int, ScriptedTransport) -> Void = { _, _ in }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return sockets.count
+    }
+
+    func socket(_ index: Int) -> ScriptedTransport? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard sockets.indices.contains(index) else { return nil }
+        return sockets[index]
+    }
+
+    func make() -> ScriptedTransport {
+        let socket = ScriptedTransport()
+        lock.lock()
+        let index = sockets.count
+        configure(index, socket)
+        sockets.append(socket)
+        lock.unlock()
+        return socket
+    }
+}
+
 private final class ScriptedTransport: GrokTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var queue: [Result<GrokSocketEvent, Error>] = []
     private var waiters: [UUID: CheckedContinuation<GrokSocketEvent, Error>] = [:]
+    private var sendWaiters: [CheckedContinuation<Void, Error>] = []
     private var binaries: [Data] = []
     private var texts: [String] = []
     private(set) var connectCount = 0
+    private(set) var receiveReturns = 0
+    /// When false, `close` does not resume `receive` (a `pf` drop never delivers the close).
+    var wakeReceiveOnClose = true
+    /// When true, cancelling the reader does not unblock `receive`.
+    var ignoreReceiveCancel = false
+    /// Hang once this many sends have already completed. `Int.max` never hangs.
+    var hangSendsAfter = Int.max
 
     var binaryCount: Int {
         lock.lock()
@@ -417,7 +584,20 @@ private final class ScriptedTransport: GrokTransport, @unchecked Sendable {
     }
 
     func sendBinary(_ data: Data) async throws {
+        if shouldHang() {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                lock.lock()
+                sendWaiters.append(continuation)
+                lock.unlock()
+            }
+        }
         noteBinary(data)
+    }
+
+    private func shouldHang() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return binaries.count >= hangSendsAfter
     }
 
     private func noteConnect() {
@@ -439,12 +619,33 @@ private final class ScriptedTransport: GrokTransport, @unchecked Sendable {
     }
 
     func close() async {
+        failSends()
+        guard wakeReceiveOnClose else { return }
+        resumeReceives(reason: "stalled")
+    }
+
+    func release() {
+        failSends()
+        resumeReceives(reason: "released")
+    }
+
+    private func failSends() {
+        lock.lock()
+        let pending = sendWaiters
+        sendWaiters.removeAll()
+        lock.unlock()
+        for waiter in pending {
+            waiter.resume(throwing: EngineError.socket("send stalled"))
+        }
+    }
+
+    private func resumeReceives(reason: String) {
         lock.lock()
         let pending = Array(waiters.values)
         waiters.removeAll()
         lock.unlock()
         for waiter in pending {
-            waiter.resume(returning: .closed(code: 1006, reason: "stalled"))
+            waiter.resume(returning: .closed(code: 1006, reason: reason))
         }
     }
 
@@ -467,21 +668,38 @@ private final class ScriptedTransport: GrokTransport, @unchecked Sendable {
     }
 
     func receive() async throws -> GrokSocketEvent {
+        let event = try await receiveOnce()
+        lock.lock()
+        receiveReturns += 1
+        lock.unlock()
+        return event
+    }
+
+    private func receiveOnce() async throws -> GrokSocketEvent {
         let id = UUID()
+        if ignoreReceiveCancel {
+            return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<GrokSocketEvent, Error>) in
+                enqueue(id, continuation)
+            }
+        }
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<GrokSocketEvent, Error>) in
-                lock.lock()
-                if !queue.isEmpty {
-                    let item = queue.removeFirst()
-                    lock.unlock()
-                    continuation.resume(with: item)
-                    return
-                }
-                waiters[id] = continuation
-                lock.unlock()
+                enqueue(id, continuation)
             }
         } onCancel: {
             self.cancel(id)
         }
+    }
+
+    private func enqueue(_ id: UUID, _ continuation: CheckedContinuation<GrokSocketEvent, Error>) {
+        lock.lock()
+        if !queue.isEmpty {
+            let item = queue.removeFirst()
+            lock.unlock()
+            continuation.resume(with: item)
+            return
+        }
+        waiters[id] = continuation
+        lock.unlock()
     }
 }
