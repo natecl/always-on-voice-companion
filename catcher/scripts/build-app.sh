@@ -73,6 +73,7 @@ EOF
 
 IDENTITY="${CATCHER_CODESIGN_IDENTITY:-}"
 SIGN_ARGS=()
+ENTITLEMENTS="Sources/CatcherApp/Catcher.entitlements"
 if [[ -n "${CATCHER_DEVELOPMENT_TEAM:-}" ]]; then
   IDENTITY="${IDENTITY:-Apple Development}"
   SIGN_ARGS=(
@@ -81,6 +82,8 @@ if [[ -n "${CATCHER_DEVELOPMENT_TEAM:-}" ]]; then
     "CODE_SIGN_IDENTITY=${IDENTITY}"
     CODE_SIGNING_REQUIRED=YES
     CODE_SIGN_INJECT_BASE_ENTITLEMENTS=YES
+    ENABLE_HARDENED_RUNTIME=YES
+    "CODE_SIGN_ENTITLEMENTS=${ENTITLEMENTS}"
   )
 else
   IDENTITY="${IDENTITY:-Catcher Development}"
@@ -92,6 +95,7 @@ else
     CODE_SIGNING_ALLOWED=YES
     CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO
     ENABLE_HARDENED_RUNTIME=YES
+    "CODE_SIGN_ENTITLEMENTS=${ENTITLEMENTS}"
     OTHER_CODE_SIGN_FLAGS=--timestamp=none
   )
 fi
@@ -114,6 +118,18 @@ if grep -q "Signature=adhoc" <<<"$INFO"; then
   exit 1
 fi
 codesign --verify --verbose=2 "$APP"
+# A hardened-runtime binary without the audio-input entitlement gets no TCC
+# microphone case at all: no Allow dialog and no row in the Microphone pane.
+if grep -q "flags=.*runtime" <<<"$INFO"; then
+  ENTS="$(codesign -d --entitlements :- "$APP" 2>/dev/null || true)"
+  if ! grep -q "com.apple.security.device.audio-input" <<<"$ENTS"; then
+    echo "Catcher.app is hardened (flags=runtime) but com.apple.security.device.audio-input is not in its entitlements." >&2
+    echo "macOS will never show the microphone Allow dialog for this build. Check CODE_SIGN_ENTITLEMENTS=$ENTITLEMENTS." >&2
+    exit 1
+  fi
+fi
 echo "Signed $APP"
-echo "$INFO" | grep -E "Authority=|Signature=|TeamIdentifier=|Identifier=|CDHash=" || true
+echo "$INFO" | grep -E "Authority=|Signature=|TeamIdentifier=|Identifier=|CDHash=|flags=" || true
+codesign -d --entitlements :- "$APP" 2>/dev/null | grep -E "audio-input" || true
 echo "Export CATCHER_APP=\"$APP\""
+echo "Start it with: open -n \"$APP\"  (a direct exec from a shell bills TCC to the shell's app, not to com.catcher.app)"

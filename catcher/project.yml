@@ -15,6 +15,7 @@ targets:
       - path: Sources/CatcherApp
         excludes:
           - Info.plist
+          - Catcher.entitlements
     dependencies:
       - package: Catcher
         product: Pipeline
@@ -44,6 +45,10 @@ targets:
         CODE_SIGNING_REQUIRED: YES
         CODE_SIGNING_ALLOWED: YES
         CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+        # Hardened runtime without com.apple.security.device.audio-input means
+        # TCC never opens a microphone case for the app: no Allow, no row in the
+        # Microphone pane, and authorizationStatus is not a grant.
         ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_ENTITLEMENTS: Sources/CatcherApp/Catcher.entitlements
         OTHER_CODE_SIGN_FLAGS: "--timestamp=none"
         COMBINE_HIDPI_IMAGES: YES
