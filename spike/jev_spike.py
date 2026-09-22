@@ -178,6 +178,8 @@ def main():
                     help="Seconds to pause between API calls (default 0.5)")
     ap.add_argument("--retries", type=int, default=6,
                     help="Retries per utterance on transient errors (default 6)")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="Judge at most N new utterances, then exit 0 (0 = no limit)")
     args = ap.parse_args()
 
     api_key = os.environ.get("TYPESAFE_API_KEY")
@@ -210,9 +212,14 @@ def main():
                        "total_input_tokens": total_in,
                        "est_cost_usd": round(cost, 4)}, f, indent=2)
 
+    judged_this_run = 0
     for i, u in enumerate(utterances):
         if i in done:
             continue
+        if args.limit and judged_this_run >= args.limit:
+            print(f"  (limit reached: {judged_this_run} new utterances this run)")
+            break
+        judged_this_run += 1
         payload, latency_ms = call_jev(build_request(utterances, i, args.model), api_key,
                                        retries=args.retries)
         answers = payload.get("answers", {})
