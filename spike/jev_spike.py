@@ -172,6 +172,12 @@ def main():
     ap.add_argument("--labels", help="JSON labels file for grading (see module docstring)")
     ap.add_argument("--out", default="results.json", help="Where to write results JSON")
     ap.add_argument("--model", default=DEFAULT_MODEL, help="Jev model (default: pinned jev-1.13.0)")
+    ap.add_argument("--resume", action="store_true",
+                    help="Resume from an existing --out file (skips already-judged utterances)")
+    ap.add_argument("--delay", type=float, default=0.5,
+                    help="Seconds to pause between API calls (default 0.5)")
+    ap.add_argument("--retries", type=int, default=6,
+                    help="Retries per utterance on transient errors (default 6)")
     args = ap.parse_args()
 
     api_key = os.environ.get("TYPESAFE_API_KEY")
@@ -179,29 +185,60 @@ def main():
         raise SystemExit("Set TYPESAFE_API_KEY first (https://typesafe.ai — $5 free on signup).")
 
     utterances = parse_transcript(args.transcript)
+
+    done = {}
+    if args.resume:
+        try:
+            with open(args.out) as f:
+                prev = json.load(f)
+            for r in prev.get("results", []):
+                done[r["i"]] = r
+            print(f"Resuming from {args.out}: {len(done)} judged, "
+                  f"{len(utterances) - len(done)} to go.")
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
+            print(f"No usable prior results at {args.out}; starting fresh.")
+
+    results = [done[i] for i in sorted(done)]
     print(f"Judging {len(utterances)} utterances with {args.model} ...")
 
-    results, total_in, total_lat = [], 0, 0.0
+    def save():
+        total_in = sum(r.get("input_tokens", 0) for r in results)
+        cost = total_in / 1_000_000 * USD_PER_M_INPUT_TOKENS
+        ordered = sorted(results, key=lambda r: r["i"])
+        with open(args.out, "w") as f:
+            json.dump({"model": args.model, "results": ordered,
+                       "total_input_tokens": total_in,
+                       "est_cost_usd": round(cost, 4)}, f, indent=2)
+
     for i, u in enumerate(utterances):
-        payload, latency_ms = call_jev(build_request(utterances, i, args.model), api_key)
+        if i in done:
+            continue
+        payload, latency_ms = call_jev(build_request(utterances, i, args.model), api_key,
+                                       retries=args.retries)
         answers = payload.get("answers", {})
         scores = {qid: float(answers[qid]["noul"]) for qid in QUESTIONS}
         usage = payload.get("usage", {}) or {}
         in_tok = usage.get("input_tokens", usage.get("input", usage.get("prompt_tokens", 0)))
-        total_in += in_tok
-        total_lat += latency_ms
         results.append({
             "i": i,
             "speaker": u["speaker"],
             "text": u["text"][:160],
             "scores": {k: round(v, 3) for k, v in scores.items()},
             "latency_ms": round(latency_ms, 1),
+            "input_tokens": in_tok,
         })
+        save()  # incremental: a crash loses nothing already judged
         flags = " ".join(k for k, v in scores.items() if v >= THRESHOLD)
         print(f"  [{i:3d}] {u['speaker']}: {u['text'][:70]}")
         print(f"         -> {', '.join(f'{k}={v:.2f}' for k, v in scores.items())}"
               + (f"   *** {flags}" if flags else ""))
+        if args.delay > 0:
+            time.sleep(args.delay)
 
+    results = sorted(results, key=lambda r: r["i"])
+    save()
+    total_in = sum(r.get("input_tokens", 0) for r in results)
+    total_lat = sum(r.get("latency_ms", 0) for r in results)
     cost = total_in / 1_000_000 * USD_PER_M_INPUT_TOKENS
     n = len(utterances)
     print(f"\n=== RUN SUMMARY ===")
@@ -209,10 +246,6 @@ def main():
     print(f"  input toks : {total_in}  (~${cost:.4f} this run)")
     print(f"  cost/1k utt: ${cost / n * 1000:.4f}")
     print(f"  mean latency: {total_lat / n:.0f} ms")
-
-    with open(args.out, "w") as f:
-        json.dump({"model": args.model, "results": results,
-                   "total_input_tokens": total_in, "est_cost_usd": round(cost, 4)}, f, indent=2)
     print(f"  wrote {args.out}")
 
     if args.labels:

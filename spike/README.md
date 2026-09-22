@@ -31,7 +31,9 @@ Transcript format: one `SPEAKER: utterance` per line. Labels: JSON list, one
 `{commitment, deadline, decision, interrupt_worthy}` object per utterance, in order.
 
 Flags: `--model` (default pins `jev-1.13.0` for reproducibility), `--out` (default
-`results.json`).
+`results.json`), `--resume` (skip already-judged utterances in an existing `--out`
+file — results are saved incrementally, so a crashed long run loses nothing),
+`--delay SEC` (pause between calls, default 0.5), `--retries N` (default 6).
 
 ## What it reports
 
