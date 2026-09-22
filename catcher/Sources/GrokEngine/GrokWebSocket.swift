@@ -3,6 +3,7 @@ import Foundation
 import TranscriptionEngine
 #if os(macOS)
 import Synchronization
+import os
 #endif
 
 public enum GrokSocketEvent: Sendable, Equatable {
