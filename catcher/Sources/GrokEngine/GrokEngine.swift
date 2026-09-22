@@ -10,6 +10,9 @@ public struct GrokEngineConfiguration: Sendable {
     public var nowMs: (@Sendable () -> Int)?
     public var handshakeTimeout: Duration
     public var chunkBytes: Int
+    /// No server message for this long while audio is still being written means
+    /// the socket is black-holed. `pf` drop does not close a WebSocket.
+    public var inboundStall: Duration
 
     public init(
         apiKey: String,
@@ -18,7 +21,8 @@ public struct GrokEngineConfiguration: Sendable {
         sleep: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) },
         nowMs: (@Sendable () -> Int)? = nil,
         handshakeTimeout: Duration = .seconds(5),
-        chunkBytes: Int = AudioFormat.chunkBytes
+        chunkBytes: Int = AudioFormat.chunkBytes,
+        inboundStall: Duration = .seconds(5)
     ) {
         self.apiKey = apiKey
         self.url = url
@@ -27,6 +31,7 @@ public struct GrokEngineConfiguration: Sendable {
         self.nowMs = nowMs
         self.handshakeTimeout = handshakeTimeout
         self.chunkBytes = chunkBytes
+        self.inboundStall = inboundStall
     }
 
     public static func live(environment: [String: String] = ProcessInfo.processInfo.environment) -> GrokEngineConfiguration {
@@ -53,7 +58,6 @@ public actor GrokEngine: TranscriptionEngine {
     public nonisolated let events: AsyncStream<EngineEvent>
     private let continuation: AsyncStream<EngineEvent>.Continuation
     private let configuration: GrokEngineConfiguration
-    private let startedHost: UInt64
     private var track: AudioTrack
     private var transport: (any GrokTransport)?
     private var pending = Data()
@@ -73,11 +77,16 @@ public actor GrokEngine: TranscriptionEngine {
     private var gap = GapAccount()
     private var handshakeFailure: EngineError?
     private var reader: Task<Void, Never>?
+    private var watchdog: Task<Void, Never>?
+    /// Bytes sent on this socket since the last server message. Replayed after a stall.
+    private var replay = Data()
+    private var bytesAtLastInbound = 0
+    private var lastInbound = Date()
+    private var lastSocketOrigin = 0
 
     public init(track: AudioTrack, configuration: GrokEngineConfiguration = .live()) {
         self.track = track
         self.configuration = configuration
-        self.startedHost = HostClock.now()
         let pair = AsyncStream<EngineEvent>.makeStream()
         self.events = pair.stream
         self.continuation = pair.continuation
@@ -105,6 +114,7 @@ public actor GrokEngine: TranscriptionEngine {
         continuation.yield(.state(.ready))
         continuation.yield(.state(.streaming))
         await pump()
+        armWatchdog()
     }
 
     public func send(_ frame: PCMFrame) async throws {
@@ -116,6 +126,8 @@ public actor GrokEngine: TranscriptionEngine {
     public func finish() async {
         guard !finishRequested else { return }
         finishRequested = true
+        watchdog?.cancel()
+        watchdog = nil
         await flushTail()
         reader?.cancel()
         await transport?.close()
@@ -159,6 +171,8 @@ public actor GrokEngine: TranscriptionEngine {
     private func handle(_ event: GrokSocketEvent) async {
         switch event {
         case .text(let text):
+            bytesAtLastInbound = bytesSent
+            lastInbound = Date()
             apply(GrokMessages.decode(text))
         case .binary:
             break
@@ -173,9 +187,16 @@ public actor GrokEngine: TranscriptionEngine {
     }
 
     private func reconnect(code: Int, reason: String) async {
+        watchdog?.cancel()
+        watchdog = nil
+        var prepared = false
         while !finishRequested {
             ready = false
-            gap.begin(atMs: currentMs())
+            if !prepared {
+                reclaimReplay()
+                gap.begin(atMs: currentMs())
+                prepared = true
+            }
             let delay = backoff.delay
             continuation.yield(.state(.degraded(
                 reason: "ws closed (\(code)); reconnect #\(backoff.attempt + 1) in \(Int(Self.seconds(delay).rounded()))s"
@@ -188,14 +209,19 @@ public actor GrokEngine: TranscriptionEngine {
                 try await next.connect(url: configuration.url, authorizationBearer: configuration.apiKey)
                 transport = next
                 try await readUntilCreated(next)
-                if let span = gap.end(atMs: currentMs()) {
+                // End the hole on the new socket's origin so the resumed ann and
+                // the next seg share one session time.
+                if let span = gap.end(atMs: lastSocketOrigin) {
                     continuation.yield(.gap(fromMs: span.fromMs, toMs: span.toMs))
                 }
+                backoff = BackoffSchedule()
                 continuation.yield(.state(.streaming))
                 await pump()
+                armWatchdog()
                 return
             } catch {
                 continuation.yield(.error(.socket(String(describing: error))))
+                await next.close()
             }
         }
     }
@@ -210,6 +236,12 @@ public actor GrokEngine: TranscriptionEngine {
             let event = try await receiveWithTimeout(transport, timeout: .milliseconds(max(1, Int(remaining * 1000))))
             switch event {
             case .text(let text):
+                // Same as the reader. `created` on a new socket must start the
+                // stall clock; leaving the pre-drop timestamp in place made the
+                // replay look already stalled and the socket was closed again
+                // before a seg could come back.
+                bytesAtLastInbound = bytesSent
+                lastInbound = Date()
                 apply(GrokMessages.decode(text))
             case .binary:
                 break
@@ -222,14 +254,24 @@ public actor GrokEngine: TranscriptionEngine {
     private func apply(_ message: GrokServerMessage) {
         switch message {
         case .created:
-            socketOriginMs = PCMClock.milliseconds(bytesSent: bytesSent)
+            let audioMs = PCMClock.milliseconds(bytesSent: bytesSent)
+            if hasBeenReady {
+                // Wall time moved during the stall; the byte cursor did not.
+                // Landing here keeps the resumed seg at or after the resumed ann.
+                socketOriginMs = max(audioMs, currentMs())
+            } else {
+                socketOriginMs = audioMs
+            }
+            lastSocketOrigin = socketOriginMs
             ready = true
             hasBeenReady = true
             utteranceHadChunk = false
             socketEmittedFinal = false
         case .partial(let transcript):
+            replay.removeAll(keepingCapacity: true)
             commit(transcript, fromDone: false)
         case .done(let transcript):
+            replay.removeAll(keepingCapacity: true)
             commit(transcript, fromDone: true)
         case .error(let message):
             continuation.yield(.error(.protocol(message)))
@@ -321,10 +363,15 @@ public actor GrokEngine: TranscriptionEngine {
             do {
                 try await transport.sendBinary(chunk)
                 bytesSent += chunk.count
+                replay.append(chunk)
+                if replay.count > Self.replayCap {
+                    replay.removeFirst(replay.count - Self.replayCap)
+                }
             } catch {
                 pending.insert(contentsOf: chunk, at: 0)
                 ready = false
                 continuation.yield(.error(.socket(String(describing: error))))
+                await transport.close()
                 return
             }
         }
@@ -360,7 +407,49 @@ public actor GrokEngine: TranscriptionEngine {
         if let nowMs = configuration.nowMs {
             return nowMs()
         }
-        return HostClock.milliseconds(from: startedHost, to: HostClock.now())
+        return SessionClockAnchor.milliseconds()
+    }
+
+    /// 30s of PCM16 mono at 16 kHz. Older than that is outside one network kill.
+    private static let replayCap = 16_000 * 2 * 30
+
+    private func reclaimReplay() {
+        guard !replay.isEmpty else { return }
+        pending.insert(contentsOf: replay, at: 0)
+        bytesSent = max(0, bytesSent - replay.count)
+        replay.removeAll(keepingCapacity: false)
+    }
+
+    private func armWatchdog() {
+        watchdog?.cancel()
+        // The replay send can take longer than the stall budget. Start the
+        // window after those bytes are written, and do not treat them as acked.
+        lastInbound = Date()
+        let stall = configuration.inboundStall
+        watchdog = Task { await self.watchInbound(stall) }
+    }
+
+    /// `send` succeeds while packets are dropped: the bytes sit in the kernel
+    /// and `receive` never returns. Close the socket so the reader reconnects.
+    /// The timer resets on every server message, so a live transcript does not
+    /// look like a stall.
+    private func watchInbound(_ stall: Duration) async {
+        let limit = Self.seconds(stall)
+        while !Task.isCancelled && !finishRequested {
+            do {
+                try await Task.sleep(for: .milliseconds(200))
+            } catch {
+                return
+            }
+            if Task.isCancelled || finishRequested || !ready { return }
+            guard bytesSent > bytesAtLastInbound else { continue }
+            if Date().timeIntervalSince(lastInbound) >= limit {
+                ready = false
+                let dead = transport
+                await dead?.close()
+                return
+            }
+        }
     }
 
     private enum ReceiveRace: Sendable {

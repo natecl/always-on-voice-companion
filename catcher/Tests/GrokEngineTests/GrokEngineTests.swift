@@ -72,7 +72,8 @@ import TranscriptionEngine
         apiKey: "test-key",
         url: GrokWebSocket.url(),
         makeTransport: { transport },
-        handshakeTimeout: .seconds(2)
+        handshakeTimeout: .seconds(2),
+        inboundStall: .seconds(30)
     ))
     var iterator = engine.events.makeAsyncIterator()
     let connecting = Task { try await engine.connect(track: .system) }
@@ -113,7 +114,8 @@ import TranscriptionEngine
             clock.advance(ms: Int(seconds(duration) * 1000))
         },
         nowMs: { clock.ms },
-        handshakeTimeout: .seconds(2)
+        handshakeTimeout: .seconds(2),
+        inboundStall: .seconds(30)
     ))
     let connecting = Task { try await engine.connect(track: .system) }
     transport.push(.text(#"{"type":"transcript.created"}"#))
@@ -146,12 +148,52 @@ import TranscriptionEngine
     for _ in 0..<8 {
         guard let event = await iterator.next() else { break }
         if case .transcript(let transcript) = event, transcript.kind == .final {
-            #expect(transcript.startMs == 100)
+            // Backoff advanced the session clock by 1s. The new socket lands there,
+            // not on the byte cursor from before the drop.
+            #expect(transcript.startMs == 1_000)
             rebased = true
             break
         }
     }
     #expect(rebased)
+    await engine.finish()
+}
+
+@Test func stalledSocketReconnectsReplaysAudioAndEmitsAGap() async throws {
+    let clock = ManualClock()
+    let transport = ScriptedTransport()
+    let engine = GrokEngine(track: .system, configuration: GrokEngineConfiguration(
+        apiKey: "test-key",
+        url: GrokWebSocket.url(),
+        makeTransport: { transport },
+        sleep: { duration in
+            clock.advance(ms: Int(seconds(duration) * 1000))
+        },
+        nowMs: { clock.ms },
+        handshakeTimeout: .seconds(2),
+        inboundStall: .milliseconds(80)
+    ))
+    var iterator = engine.events.makeAsyncIterator()
+    let connecting = Task { try await engine.connect(track: .system) }
+    transport.push(.text(#"{"type":"transcript.created"}"#))
+    try await connecting.value
+    let frame = Data(repeating: 9, count: 3_200)
+    try await engine.send(PCMFrame(track: .system, data: frame, hostTime: 0))
+    try await waitUntil { transport.binaryCount == 1 }
+    try await waitUntil { transport.connectCount >= 2 }
+    transport.push(.text(#"{"type":"transcript.created"}"#))
+    var sawGap = false
+    var sawDegraded = false
+    for _ in 0..<16 {
+        guard let event = await iterator.next() else { break }
+        if case .state(.degraded) = event { sawDegraded = true }
+        if case .gap = event { sawGap = true }
+        if case .state(.streaming) = event, sawGap { break }
+    }
+    #expect(sawDegraded)
+    #expect(sawGap)
+    try await waitUntil { transport.binaryCount >= 2 }
+    #expect(transport.binary(at: 1) == frame)
     await engine.finish()
 }
 
@@ -293,6 +335,13 @@ private final class ScriptedTransport: GrokTransport, @unchecked Sendable {
         return binaries.first?.count ?? 0
     }
 
+    func binary(at index: Int) -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard binaries.indices.contains(index) else { return nil }
+        return binaries[index]
+    }
+
     var sentTexts: [String] {
         lock.lock()
         defer { lock.unlock() }
@@ -329,7 +378,15 @@ private final class ScriptedTransport: GrokTransport, @unchecked Sendable {
         lock.unlock()
     }
 
-    func close() async {}
+    func close() async {
+        lock.lock()
+        let pending = Array(waiters.values)
+        waiters.removeAll()
+        lock.unlock()
+        for waiter in pending {
+            waiter.resume(returning: .closed(code: 1006, reason: "stalled"))
+        }
+    }
 
     func cancel(_ id: UUID) {
         lock.lock()

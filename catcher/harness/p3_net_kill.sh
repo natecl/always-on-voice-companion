@@ -26,7 +26,7 @@ pfctl -a catcher -f "$RULE"
 sleep 15
 pfctl -a catcher -F all || true
 rm -f "$RULE"
-echo "Network restored. Leave the session running for a few seconds, then press enter."
+echo "Network restored. Leave the session running until Catcher reconnects (backoff is 1, 2, 4, then 8s), then press enter."
 read -r _
 kill "$(cat "$SESSION/catcher.pid")" || true
 TARGET="$(resolve_session "$SESSION")"

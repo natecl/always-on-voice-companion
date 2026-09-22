@@ -209,13 +209,55 @@ enum SCKPermissionProbe {
     }
 
     static func recheck() -> PermissionState {
-        if !CGPreflightScreenCaptureAccess() {
+        let denied = !CGPreflightScreenCaptureAccess()
+        let livePreflight = TCCScreenPreflight.current()
+        let liveWindows = windowSample()
+        if ScreenGrantMemory.revoked(
+            preflightDenied: denied,
+            livePreflight: livePreflight,
+            liveWindows: liveWindows
+        ) {
+            NSLog(
+                "Catcher screen recording revoked mid-session preflightDenied=\(denied) livePreflight=\(livePreflight.map(String.init) ?? "nil") titled=\(liveWindows.titledOtherWindows)/\(liveWindows.otherWindows)"
+            )
             return .blocked(reason: "screen recording access denied")
+        }
+        if liveWindows.titledOtherWindows > 0 {
+            ScreenGrantMemory.noteWindows(liveWindows)
         }
         if let reason = readAuthority(force: false).blockReason {
             return .blocked(reason: reason)
         }
         return .granted
+    }
+
+    /// Sampled only after a capture has actually started, while the grant is real.
+    static func noteScreenGrant() {
+        ScreenGrantMemory.noteAtCaptureStart(
+            preflight: TCCScreenPreflight.current(),
+            windows: windowSample()
+        )
+    }
+
+    private static func windowSample() -> WindowTitleSample {
+        let options = CGWindowListOption(arrayLiteral: .optionOnScreenOnly, .excludeDesktopElements)
+        guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+            return WindowTitleSample(otherWindows: 0, titledOtherWindows: 0)
+        }
+        let mine = Int(getpid())
+        var others = 0
+        var titled = 0
+        for window in info {
+            let pid = (window[kCGWindowOwnerPID as String] as? NSNumber)?.intValue ?? 0
+            if pid == 0 || pid == mine { continue }
+            let layer = (window[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0
+            if layer != 0 { continue }
+            others += 1
+            if let name = window[kCGWindowName as String] as? String, !name.isEmpty {
+                titled += 1
+            }
+        }
+        return WindowTitleSample(otherWindows: others, titledOtherWindows: titled)
     }
 
     /// Allow dialog only. Does not request screen capture and does not open Settings.
@@ -537,6 +579,7 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, SCStreamDelegate
             _ = takeStream()
             throw error
         }
+        SCKPermissionProbe.noteScreenGrant()
     }
 
     private func arm(stream: SCStream, outputs: [NSObject]) {
@@ -595,11 +638,92 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, SCStreamDelegate
 
     static func classify(_ error: Error) -> CaptureError {
         let ns = error as NSError
-        let blob = (ns.domain + " " + ns.localizedDescription).lowercased()
-        if blob.contains("tcc") || blob.contains("permission") || blob.contains("not authorized") || blob.contains("denied") {
-            return .tccRevokedMidSession
+        if let code = SCStreamError.Code(rawValue: ns.code) {
+            switch code {
+            case .userDeclined, .systemStoppedStream, .userStopped:
+                let domain = ns.domain.lowercased()
+                if domain.contains("screencapture") || domain.contains("scstream") {
+                    return .tccRevokedMidSession
+                }
+            default:
+                break
+            }
         }
-        return .streamStopped(ns.localizedDescription)
+        return CaptureStop.classify(domain: ns.domain, code: ns.code, description: ns.localizedDescription)
+    }
+}
+
+/// TCC's own preflight, not `CGPreflightScreenCaptureAccess`. The CoreGraphics
+/// call caches the first answer in this process; this one is asked again.
+private enum TCCScreenPreflight {
+    private final class Box: @unchecked Sendable {
+        let lock = NSLock()
+        var resolved = false
+        var function: (@convention(c) (CFString, CFDictionary?) -> Int32)?
+    }
+
+    private static let box = Box()
+
+    static func current() -> Int32? {
+        let function = resolve()
+        return function?("kTCCServiceScreenCapture" as CFString, nil)
+    }
+
+    private static func resolve() -> (@convention(c) (CFString, CFDictionary?) -> Int32)? {
+        box.lock.lock()
+        defer { box.lock.unlock() }
+        if !box.resolved {
+            box.resolved = true
+            if let handle = dlopen("/System/Library/PrivateFrameworks/TCC.framework/TCC", RTLD_LAZY),
+               let symbol = dlsym(handle, "TCCAccessPreflight") {
+                box.function = unsafeBitCast(symbol, to: (@convention(c) (CFString, CFDictionary?) -> Int32).self)
+            }
+        }
+        return box.function
+    }
+}
+
+/// Baseline taken when capture started. A later difference is the revoke.
+private enum ScreenGrantMemory {
+    private final class Box: @unchecked Sendable {
+        let lock = NSLock()
+        var preflight: Int32?
+        var windows = WindowTitleSample(otherWindows: 0, titledOtherWindows: 0)
+    }
+
+    private static let box = Box()
+
+    static func noteAtCaptureStart(preflight: Int32?, windows: WindowTitleSample) {
+        box.lock.lock()
+        if box.preflight == nil {
+            box.preflight = preflight
+        }
+        if box.windows.titledOtherWindows == 0, windows.titledOtherWindows > 0 {
+            box.windows = windows
+        }
+        box.lock.unlock()
+    }
+
+    static func noteWindows(_ windows: WindowTitleSample) {
+        box.lock.lock()
+        if box.windows.titledOtherWindows == 0, windows.titledOtherWindows > 0 {
+            box.windows = windows
+        }
+        box.lock.unlock()
+    }
+
+    static func revoked(preflightDenied: Bool, livePreflight: Int32?, liveWindows: WindowTitleSample) -> Bool {
+        box.lock.lock()
+        let grantedPreflight = box.preflight
+        let grantedWindows = box.windows
+        box.lock.unlock()
+        return ScreenRevokeWatch.isRevoked(
+            preflightDenied: preflightDenied,
+            grantedPreflight: grantedPreflight,
+            livePreflight: livePreflight,
+            grantedWindows: grantedWindows,
+            liveWindows: liveWindows
+        )
     }
 }
 

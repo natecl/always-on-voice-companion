@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Shared helpers. Launch through LaunchServices (`open`). A binary exec'd from a
-# shell keeps the shell's app (Terminal, Cursor, iTerm) as its TCC responsible
-# process: microphone status is read for that app, the Allow dialog names that
-# app, and com.catcher.app never appears in the Microphone pane. `open --env`
-# forwards the CATCHER_* variables and XAI_API_KEY; the same switches also go
-# through `--args`.
+# Shared helpers. Launch through LaunchServices. A binary exec'd from a shell
+# keeps the shell's app (Terminal, Cursor, iTerm, the agent host) as its TCC
+# responsible process: microphone status is read for that app, the Allow dialog
+# names that app, and com.catcher.app never appears in the Microphone pane.
+# Stock `open` has no --env, so the helper calls NSWorkspace and passes the
+# full environment (CATCHER_* and XAI_API_KEY included). The same switches also
+# go through --args. There is no direct-exec fallback.
 set -euo pipefail
 
 catcher_bin() {
@@ -58,6 +59,53 @@ require_stable_signature() {
   fi
 }
 
+# NSWorkspace.openApplication, not a shell exec. The helper inherits this
+# process's environment and hands that dictionary to LaunchServices, so
+# CATCHER_SESSION_ROOT, CATCHER_HARNESS, CATCHER_AUTO_RECORD, CATCHER_ENGINE,
+# and XAI_API_KEY arrive intact. Arguments are the same switches.
+launch_via_workspace() {
+  local app="$1"
+  shift
+  local src="$ROOT/launch_services.swift"
+  local bin="${TMPDIR:-/tmp}/catcher-launch-services"
+  if [[ ! -x "$bin" || "$src" -nt "$bin" ]]; then
+    if ! swiftc -O -framework AppKit -o "$bin" "$src"; then
+      echo "Cannot compile the LaunchServices helper ($src)." >&2
+      echo "Refusing to exec Catcher from the shell: TCC would bill this terminal's app, not com.catcher.app." >&2
+      return 1
+    fi
+  fi
+  "$bin" "$app" "$@"
+}
+
+wait_for_recording() {
+  local root="$1"
+  local waited=0
+  while [[ "$waited" -lt 150 ]]; do
+    if python3 - "$root" <<'PY'
+import os, sys
+root = sys.argv[1]
+live = os.path.join(root, "live_session")
+if os.path.isfile(live) and os.path.getsize(live) > 0:
+    raise SystemExit(0)
+if os.path.isfile(os.path.join(root, "events.jsonl")):
+    raise SystemExit(0)
+if os.path.isdir(root):
+    for name in os.listdir(root):
+        if os.path.isfile(os.path.join(root, name, "events.jsonl")):
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+    then
+      return 0
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  echo "Catcher did not start a recording under $root within 15 s." >&2
+  return 1
+}
+
 # Launch com.catcher.app as its own TCC identity. The app writes its pid to
 # <session>/catcher.pid once it is up (CATCHER_HARNESS=1); wait for that file.
 launch_catcher() {
@@ -90,8 +138,7 @@ launch_catcher() {
   if open --help 2>&1 | grep -q -- '--env'; then
     open -n "$app" "${envs[@]}" --args "${args[@]}"
   else
-    echo "This open(1) has no --env. Falling back to a direct exec: TCC will bill the microphone to this terminal's app, not to com.catcher.app." >&2
-    "$bin" "${args[@]}" &
+    launch_via_workspace "$app" "${args[@]}"
   fi
   local waited=0
   while [[ ! -s "$session/catcher.pid" && "$waited" -lt 150 ]]; do

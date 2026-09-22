@@ -209,6 +209,72 @@ def grade_p1(session: Path, rows: list[dict], ref: Path | None, expect_recovery:
     return result("pass" if ok else "fail", "; ".join(evidence))
 
 
+def launch_failure(session: Path) -> bool:
+    """A later session that died in startCapture at t=0, with no captured audio.
+
+    P2 must not grade that directory. The revoke happened on the session that
+    was already recording.
+    """
+    try:
+        rows, _note = load_rows(session)
+    except SystemExit:
+        return False
+    blocked = [row for row in rows_of(rows, "ann") if row.get("kind") == "blocked"]
+    if not blocked or any(int(row.get("atMs", -1)) != 0 for row in blocked):
+        return False
+    for name in ("system.pcm", "microphone.pcm"):
+        pcm = session / name
+        if pcm.is_file() and pcm.stat().st_size > 0:
+            return False
+    return True
+
+
+def child_sessions(root: Path) -> list[Path]:
+    found: list[Path] = []
+    if (root / "events.jsonl").is_file():
+        found.append(root)
+    if root.is_dir():
+        for child in root.iterdir():
+            if child.is_dir() and (child / "events.jsonl").is_file():
+                found.append(child)
+    return found
+
+
+def pointer_session(root: Path, name: str) -> Path | None:
+    pointer = root / name
+    if not pointer.is_file():
+        return None
+    raw = pointer.read_text(encoding="utf-8").strip()
+    if not raw:
+        return None
+    target = Path(raw)
+    if not target.is_absolute():
+        target = root / raw
+    if (target / "events.jsonl").is_file():
+        return target
+    return None
+
+
+def pick_revoke_session(root: Path) -> Path:
+    """Session that was recording when Screen Recording was revoked.
+
+    `revoke_session` is written before `tccutil`. `live_session` is the first
+    recording the app pinned. A newer directory that is only `blocked` at
+    atMs=0 is a post-regrant startCapture failure and is not the score.
+    """
+    for name in ("revoke_session", "live_session"):
+        pinned = pointer_session(root, name)
+        if pinned is not None:
+            return pinned
+    candidates = child_sessions(root)
+    if not candidates:
+        raise SystemExit(f"no events.jsonl under {root}")
+    recording = [path for path in candidates if not launch_failure(path)]
+    pool = recording or candidates
+    pool.sort(key=lambda path: (path / "events.jsonl").stat().st_mtime)
+    return pool[-1]
+
+
 def grade_p2(rows: list[dict], revoke_at: int | None) -> dict[str, str]:
     blocked = [row for row in rows_of(rows, "ann") if row.get("kind") == "blocked"]
     if not blocked:
@@ -285,7 +351,8 @@ def grade_p6(rows: list[dict]) -> dict[str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Grade a Catcher session directory")
-    parser.add_argument("--session", required=True, type=Path)
+    parser.add_argument("--session", type=Path)
+    parser.add_argument("--pick-revoke-session", type=Path)
     parser.add_argument("--gate", action="append", choices=GATES, dest="gates")
     parser.add_argument("--ref", type=Path)
     parser.add_argument("--revoke-at-ms", type=int)
@@ -294,6 +361,11 @@ def main() -> int:
     parser.add_argument("--expect-recovery", action="store_true")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
+    if args.pick_revoke_session is not None:
+        print(pick_revoke_session(args.pick_revoke_session))
+        return 0
+    if args.session is None:
+        parser.error("--session is required")
     session = args.session
     rows, note = load_rows(session)
     requested = set(args.gates or [])

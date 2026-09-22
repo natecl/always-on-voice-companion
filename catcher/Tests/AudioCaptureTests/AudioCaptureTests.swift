@@ -1,4 +1,4 @@
-import AudioCapture
+@testable import AudioCapture
 import Foundation
 import Testing
 
@@ -407,6 +407,57 @@ private func authority(
     #expect(MicrophoneAuthority.unavailable.recovery == .none)
 }
 
+@Test func screenRevokeWatchSeesTitleLossAndPreflightChangeWithoutTrustingAStaleGrant() {
+    let granted = WindowTitleSample(otherWindows: 4, titledOtherWindows: 2)
+    let stripped = WindowTitleSample(otherWindows: 4, titledOtherWindows: 0)
+    let stillTitled = WindowTitleSample(otherWindows: 3, titledOtherWindows: 1)
+    let noWindows = WindowTitleSample(otherWindows: 0, titledOtherWindows: 0)
+    #expect(ScreenRevokeWatch.isRevoked(
+        preflightDenied: true,
+        grantedPreflight: 2,
+        livePreflight: 2,
+        grantedWindows: granted,
+        liveWindows: stillTitled
+    ))
+    #expect(ScreenRevokeWatch.isRevoked(
+        preflightDenied: false,
+        grantedPreflight: 2,
+        livePreflight: 0,
+        grantedWindows: granted,
+        liveWindows: stillTitled
+    ))
+    #expect(ScreenRevokeWatch.isRevoked(
+        preflightDenied: false,
+        grantedPreflight: 2,
+        livePreflight: 2,
+        grantedWindows: granted,
+        liveWindows: stripped
+    ))
+    // No baseline titles and an unchanged preflight is not a revoke. CGPreflight
+    // staying true is exactly that case, and must not be the only signal.
+    #expect(!ScreenRevokeWatch.isRevoked(
+        preflightDenied: false,
+        grantedPreflight: 2,
+        livePreflight: 2,
+        grantedWindows: noWindows,
+        liveWindows: noWindows
+    ))
+    #expect(!ScreenRevokeWatch.isRevoked(
+        preflightDenied: false,
+        grantedPreflight: nil,
+        livePreflight: nil,
+        grantedWindows: granted,
+        liveWindows: stillTitled
+    ))
+    #expect(CaptureStop.classify(domain: "com.apple.ScreenCaptureKit.SCStreamErrorDomain", code: -3801, description: "The user stopped the stream") == .tccRevokedMidSession)
+    #expect(CaptureStop.classify(domain: "com.apple.ScreenCaptureKit.SCStreamErrorDomain", code: -3821, description: "The system stopped the stream") == .tccRevokedMidSession)
+    #expect(CaptureStop.classify(domain: "Other", code: -3801, description: "unrelated") == .streamStopped("unrelated"))
+    if case .tccRevokedMidSession = CaptureStop.classify(domain: "NSCocoaErrorDomain", code: 1, description: "The user declined TCCs") {
+    } else {
+        Issue.record("declined TCC text must be a mid-session revoke")
+    }
+}
+
 @Test func permissionProbeIsBlockedWithoutScreenCaptureKit() async {
     let state = await PermissionGate.startCaptureProbe()
     #if canImport(ScreenCaptureKit)
@@ -445,6 +496,18 @@ private func int16Samples(_ data: Data) -> [Int16] {
 #if os(macOS)
 import AudioToolbox
 import CoreMedia
+import ScreenCaptureKit
+
+@Test func screenCaptureKitStopCodesAreMidSessionRevokes() {
+    for code in [SCStreamError.Code.userDeclined, .systemStoppedStream, .userStopped] {
+        let error = NSError(
+            domain: "com.apple.ScreenCaptureKit.SCStreamErrorDomain",
+            code: code.rawValue,
+            userInfo: [NSLocalizedDescriptionKey: "stopped"]
+        )
+        #expect(SCKCaptureSession.classify(error) == .tccRevokedMidSession)
+    }
+}
 
 @Test func sampleBufferExtractionUsesCopyPCMPath() throws {
     var asbd = AudioStreamBasicDescription(

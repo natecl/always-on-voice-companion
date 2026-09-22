@@ -99,6 +99,55 @@ import TranscriptionEngine
     #expect(!events.contains("\"t\":\"seg\""))
 }
 
+@Test func midSessionRecheckWritesBlockedOnTheLiveSession() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("catcher-revoke-\(UUID().uuidString)", isDirectory: true)
+    let capture = FakeCapture()
+    let gate = RevokeGate()
+    let pipeline = Pipeline(
+        sessionRoot: root,
+        makeCapture: { capture },
+        makeEngine: { track in StubEngine(track: track) },
+        launchProbe: { .granted },
+        recheckProbe: { gate.state() },
+        engineLabel: "stub",
+        probeInterval: .milliseconds(20)
+    )
+    await pipeline.start()
+    #expect(await pipeline.isRunning)
+    capture.emit(PCMFrame(track: .system, data: Data(repeating: 1, count: 3_200), hostTime: HostClock.now()))
+    gate.block()
+    let directory = try #require(await pipeline.sessionDirectory)
+    try await waitUntil {
+        let text = (try? String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)) ?? ""
+        return text.contains("\"kind\":\"blocked\"")
+    }
+    try await waitUntil { await pipeline.isRunning == false }
+    let events = try String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)
+    #expect(events.contains("\"kind\":\"blocked\""))
+    #expect(!events.contains("\"clean\":true"))
+}
+
+@Test func streamRevokeWritesBlockedAndStops() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("catcher-stop-\(UUID().uuidString)", isDirectory: true)
+    let capture = FakeCapture()
+    let pipeline = Pipeline(
+        sessionRoot: root,
+        makeCapture: { capture },
+        makeEngine: { track in StubEngine(track: track) },
+        launchProbe: { .granted },
+        recheckProbe: { .granted },
+        engineLabel: "stub"
+    )
+    await pipeline.start()
+    capture.fail(.tccRevokedMidSession)
+    let directory = try #require(await pipeline.sessionDirectory)
+    try await waitUntil {
+        let text = (try? String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)) ?? ""
+        return text.contains("\"kind\":\"blocked\"") && text.contains("\"t\":\"end\"")
+    }
+    #expect(await pipeline.isRunning == false)
+}
+
 private func packageRoot() -> URL {
     var url = URL(fileURLWithPath: #filePath)
     for _ in 0..<6 {
@@ -120,6 +169,24 @@ private func waitUntil(_ predicate: @Sendable () async throws -> Bool) async thr
 
 private final class LockedFlag: @unchecked Sendable {
     var value = false
+}
+
+private final class RevokeGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var blocked = false
+
+    func block() {
+        lock.lock()
+        blocked = true
+        lock.unlock()
+    }
+
+    func state() -> PermissionState {
+        lock.lock()
+        let blocked = blocked
+        lock.unlock()
+        return blocked ? .blocked(reason: "screen recording access denied") : .granted
+    }
 }
 
 private final class FakeCapture: AudioCapturing, @unchecked Sendable {
@@ -146,5 +213,9 @@ private final class FakeCapture: AudioCapturing, @unchecked Sendable {
 
     func emit(_ frame: PCMFrame) {
         frameContinuation.yield(frame)
+    }
+
+    func fail(_ error: CaptureError) {
+        failureContinuation.yield(error)
     }
 }

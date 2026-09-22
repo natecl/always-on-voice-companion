@@ -13,7 +13,16 @@ if [[ "${CATCHER_ALLOW_TCC_RESET:-}" != "1" ]]; then
 fi
 export CATCHER_HARNESS=1
 launch_catcher "$SESSION" 1
+wait_for_recording "$SESSION"
+# Mid-session, not at t=0. Pin the directory before tccutil: a later
+# startCapture failure writes a newer events.jsonl that must not be graded.
 sleep 2
+if [[ -s "$SESSION/live_session" ]]; then
+  LIVE="$(cat "$SESSION/live_session")"
+else
+  LIVE="$(resolve_session "$SESSION")"
+fi
+printf '%s\n' "$LIVE" > "$SESSION/revoke_session"
 python3 - <<'PY' > "$SESSION/revoke_wall_ms"
 import time
 print(int(time.time() * 1000))
@@ -23,5 +32,5 @@ echo "TCC reset at wall ms $(cat "$SESSION/revoke_wall_ms")."
 echo "Re-grant Screen & System Audio Recording for ${BUNDLE}, then press enter."
 read -r _
 kill "$(cat "$SESSION/catcher.pid")" || true
-TARGET="$(resolve_session "$SESSION")"
+TARGET="$(python3 "$ROOT/grade.py" --pick-revoke-session "$SESSION")"
 python3 "$ROOT/grade.py" --session "$TARGET" --gate P2 --revoke-at-ms "$(cat "$SESSION/revoke_wall_ms")"

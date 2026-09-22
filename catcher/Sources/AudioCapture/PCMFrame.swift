@@ -89,6 +89,31 @@ public enum HostClock {
     }
 }
 
+/// Pipeline and the engines share this so annotation `atMs` and segment
+/// `startMs` are the same session clock. The pipeline resets it when a
+/// recording starts.
+public enum SessionClockAnchor {
+    private final class Box: @unchecked Sendable {
+        let lock = NSLock()
+        var origin: UInt64 = HostClock.now()
+    }
+
+    private static let box = Box()
+
+    public static func reset(to host: UInt64) {
+        box.lock.lock()
+        box.origin = host
+        box.lock.unlock()
+    }
+
+    public static func milliseconds(until host: UInt64 = HostClock.now()) -> Int {
+        box.lock.lock()
+        let start = box.origin
+        box.lock.unlock()
+        return max(0, HostClock.milliseconds(from: start, to: host))
+    }
+}
+
 #if canImport(Darwin)
 import Darwin
 #else

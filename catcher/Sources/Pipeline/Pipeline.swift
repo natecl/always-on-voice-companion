@@ -35,6 +35,7 @@ public actor Pipeline {
     private let recheckProbe: @Sendable () async -> PermissionState
     private let recordPCM: Bool
     private let engineLabel: String
+    private let probeInterval: Duration
     private let clock: any SessionClock
     private let verifier = Verifier()
 
@@ -53,6 +54,9 @@ public actor Pipeline {
     private var failing = false
     private var origin: UInt64 = 0
     private var pcmHandles: [String: FileHandle] = [:]
+    /// Gap `toMs` is the engine session clock. The following `resumed` ann uses
+    /// it so a post-reconnect seg (same clock) is not stuck before the ann.
+    private var resumeAtMs: [AudioTrack: Int] = [:]
 
     public init(
         sessionRoot: URL = SessionPaths.root(),
@@ -62,6 +66,7 @@ public actor Pipeline {
         recheckProbe: @escaping @Sendable () async -> PermissionState = { PermissionGate.recheck() },
         recordPCM: Bool = false,
         engineLabel: String = EngineFactory.sessionEngineName(),
+        probeInterval: Duration = .seconds(1),
         clock: any SessionClock = HostSessionClock()
     ) {
         self.sessionRoot = sessionRoot
@@ -71,6 +76,7 @@ public actor Pipeline {
         self.recheckProbe = recheckProbe
         self.recordPCM = recordPCM
         self.engineLabel = engineLabel
+        self.probeInterval = probeInterval
         self.clock = clock
         let pair = AsyncStream<PipelineUIEvent>.makeStream()
         self.ui = pair.stream
@@ -85,7 +91,9 @@ public actor Pipeline {
         ended = false
         failing = false
         halting = false
+        resumeAtMs = [:]
         origin = clock.now()
+        SessionClockAnchor.reset(to: origin)
         let id = UUID()
         let directory = SessionPaths.directory(id: id, root: sessionRoot)
         do {
@@ -208,7 +216,7 @@ public actor Pipeline {
         for await event in events {
             if Task.isCancelled { break }
             let stamped = TrackRouter.stamp(event, track: track)
-            let at = nowMs()
+            let at = stampedAt(stamped, track: track)
             if case .transcript(let transcript) = stamped, transcript.kind == .final {
                 guard sessionOpen, !ended else {
                     let stored = await store?.syncedFinalCount ?? 0
@@ -268,7 +276,7 @@ public actor Pipeline {
     private func probeLoop() async {
         while !Task.isCancelled {
             do {
-                try await Task.sleep(for: .seconds(1))
+                try await Task.sleep(for: probeInterval)
             } catch {
                 break
             }
@@ -381,6 +389,21 @@ public actor Pipeline {
             await engine.finish()
         }
         await closeSession(clean: false)
+    }
+
+    private func stampedAt(_ event: EngineEvent, track: AudioTrack) -> Int {
+        switch event {
+        case .gap(fromMs: _, toMs: let to):
+            resumeAtMs[track] = to
+            return nowMs()
+        case .state(.streaming):
+            if let stamp = resumeAtMs.removeValue(forKey: track) {
+                return stamp
+            }
+            return nowMs()
+        default:
+            return nowMs()
+        }
     }
 
     private func nowMs() -> Int {

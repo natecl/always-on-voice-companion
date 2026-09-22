@@ -47,6 +47,8 @@ final class CatcherModel {
     private let pipeline: Pipeline
     private let sessionRoot: URL
     private let autoRecord: Bool
+    private let harness: Bool
+    private var launchStarted = false
 
     init() {
         GrokEngineBootstrap.install()
@@ -56,6 +58,7 @@ final class CatcherModel {
         let root = SessionPaths.root(environment: environment)
         sessionRoot = root
         autoRecord = launch.autoRecord
+        harness = launch.harness
         if launch.harness {
             try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             let pid = String(ProcessInfo.processInfo.processIdentifier)
@@ -72,6 +75,11 @@ final class CatcherModel {
     }
 
     func onAppear() async {
+        // A second pass (SwiftUI re-creates the task when Screen Recording is
+        // toggled) used to call toggle() on the live session and write a clean
+        // end with no blocked ann, then start a new session that failed at 0.
+        if launchStarted { return }
+        launchStarted = true
         let reports = (try? Recovery.scan(root: sessionRoot)) ?? []
         if !reports.isEmpty {
             let annotation = Annotation(
@@ -108,6 +116,9 @@ final class CatcherModel {
             await pipeline.start()
         }
         isRecording = await pipeline.isRunning
+        if harness, isRecording {
+            await pinLiveSession()
+        }
         await refreshSessions()
         if !isRecording {
             await refreshSessions()
@@ -337,6 +348,14 @@ final class CatcherModel {
             ))
         }
         lines = rows.sorted { $0.startMs < $1.startMs }
+    }
+
+    /// First recording only. A later startCapture failure must not replace it.
+    private func pinLiveSession() async {
+        guard let directory = await pipeline.sessionDirectory else { return }
+        let pointer = sessionRoot.appendingPathComponent("live_session")
+        guard !FileManager.default.fileExists(atPath: pointer.path) else { return }
+        try? directory.path.write(to: pointer, atomically: true, encoding: .utf8)
     }
 
     private func refreshSessions() async {

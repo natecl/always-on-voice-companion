@@ -39,12 +39,14 @@ The path you pass is `CATCHER_SESSION_ROOT`. The app creates one directory per r
   microphone.pcm
   grade.json            written by harness/grade.py
   ../catcher.pid        pid of the app binary, next to the uuid directory
+  ../live_session       absolute path of the first recording (harness only)
+  ../revoke_session     P2: that path, copied before tccutil reset
   ../revoke_wall_ms     P2 only, wall-clock milliseconds
 ```
 
-`run.sh` resolves the newest child that contains `events.jsonl` and grades that directory. Default sessions outside the harness go to `~/Library/Application Support/Catcher/sessions/<uuid>/` with the same file names and no PCM unless `CATCHER_HARNESS=1`.
+`run.sh` resolves the newest child that contains `events.jsonl` and grades that directory, except P2. P2 grades `revoke_session` (the recording that was live at the reset), not a later session whose only `blocked` ann is at `atMs=0` from a failed `startCapture`. Default sessions outside the harness go to `~/Library/Application Support/Catcher/sessions/<uuid>/` with the same file names and no PCM unless `CATCHER_HARNESS=1`.
 
-The harness starts `Catcher.app` with `open -n … --env … --args …` (bundle id `com.catcher.app`, not an ad-hoc side binary, and verified to carry the `com.apple.security.device.audio-input` entitlement). `--env` forwards `CATCHER_SESSION_ROOT`, `CATCHER_HARNESS`, `CATCHER_ENGINE`, `CATCHER_AUTO_RECORD`, and `XAI_API_KEY`; the same switches are also passed as `--session-root`, `--harness`, `--engine`, and `--auto-record`. LaunchServices makes Catcher its own TCC responsible process; a direct exec from the shell would bill microphone access to Terminal. The app writes `catcher.pid` itself once it is up, and `lib.sh` waits for that file.
+The harness starts `Catcher.app` through LaunchServices (bundle id `com.catcher.app`, not an ad-hoc side binary, and verified to carry the `com.apple.security.device.audio-input` entitlement). Stock `open` has no `--env`, so the harness compiles `launch_services.swift` and calls `NSWorkspace.openApplication`, passing the shell environment through (`CATCHER_SESSION_ROOT`, `CATCHER_HARNESS`, `CATCHER_ENGINE`, `CATCHER_AUTO_RECORD`, `XAI_API_KEY`) and the same switches as `--session-root`, `--harness`, `--engine`, and `--auto-record`. It does not exec the binary from the shell: that would bill microphone access to Terminal. The app writes `catcher.pid` itself once it is up, and `lib.sh` waits for that file.
 
 After a P1 run, `system.pcm` in the session directory is the capture proof. It is absent when no `PCMFrame` was emitted. A file of the right length that is all zeros is still a failed capture: `afplay` of the fixture must show a non-zero peak and RMS, and system `seg` rows must have text. A `noAudio` annotation at 10s also fires when zero frames arrived, so P4 passing does not show that system audio was captured. The microphone track can look healthy at the same time; that does not prove the system track.
 
@@ -55,8 +57,8 @@ Library CI (`.github/workflows/catcher-ci.yml` on `macos-15`) runs `swift build`
 | Gate | What you do | Pass |
 |---|---|---|
 | **P1** | `run.sh p1 <dir>` plays the fixture, `kill -9`s the app, relaunches so crash recovery runs, then grades. | System-track WER ≤ 15 % against `known-60s.ref.txt`, no >2 s hole in system speech (uses `system.pcm` when present), and a recovered session. |
-| **P2** | `CATCHER_ALLOW_TCC_RESET=1 run.sh p2 <dir>`. The script runs `tccutil reset ScreenCapture com.catcher.app` and waits for you to re-grant. | An `ann` with `kind: blocked` within 2 s of the revoke, and no `seg` after that timestamp. |
-| **P3** | As root, `CATCHER_ALLOW_PF=1 run.sh p3 <dir>`. Blocks `api.x.ai:443` for 15 s, then clears the rule. | `ann` rows `degraded`, then `gap`, then `resumed`, then a `seg` at or after resume. |
+| **P2** | `CATCHER_ALLOW_TCC_RESET=1 run.sh p2 <dir>`. The script runs `tccutil reset ScreenCapture com.catcher.app` and waits for you to re-grant. The score is the session that was recording at the reset. | An `ann` with `kind: blocked` on that live session within 2 s of the revoke, and no `seg` after that timestamp. |
+| **P3** | As root, `CATCHER_ALLOW_PF=1 run.sh p3 <dir>`. Blocks `api.x.ai:443` for 15 s, then clears the rule. After the rule clears, wait for the reconnect backoff (1, 2, 4, 8 s) before pressing enter. | `ann` rows `degraded`, then `gap`, then `resumed`, then a `seg` at or after resume. |
 | **P4** | Mute output, stay quiet, `run.sh p4 <dir>`. | `ann` `kind: noAudio` with `atMs` between 0 and 10000. |
 | **P5** | `run.sh p5 <stub-dir> <grok-session-dir>`. Forces `CATCHER_ENGINE=stub` and replays the fixture. | JSONL row types and keys match the schema and the Grok session's shape. Transcript text is not compared. |
 | **P6** | `run.sh p6 <dir>` while you talk over the fixture. | At least one `seg` on `microphone` and one on `system`, and a non-null `speaker` on a system `seg`. |
