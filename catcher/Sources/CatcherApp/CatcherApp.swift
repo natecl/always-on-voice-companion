@@ -44,15 +44,26 @@ final class CatcherModel {
     private var listenTask: Task<Void, Never>?
     private let pipeline: Pipeline
     private let sessionRoot: URL
+    private let autoRecord: Bool
 
     init() {
         GrokEngineBootstrap.install()
         Loud.prepare()
-        let environment = ProcessInfo.processInfo.environment
+        let launch = LaunchConfiguration.resolve()
+        let environment = launch.mergedEnvironment(ProcessInfo.processInfo.environment)
         let root = SessionPaths.root(environment: environment)
         sessionRoot = root
+        autoRecord = launch.autoRecord
+        if launch.harness {
+            try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let pid = String(ProcessInfo.processInfo.processIdentifier)
+            try? pid.write(to: root.appendingPathComponent("catcher.pid"), atomically: true, encoding: .utf8)
+        }
         pipeline = Pipeline(
             sessionRoot: root,
+            makeEngine: { track in
+                try EngineFactory.make(track: track, environment: environment)
+            },
             recordPCM: environment["CATCHER_HARNESS"] == "1",
             engineLabel: EngineFactory.sessionEngineName(environment: environment)
         )
@@ -84,9 +95,7 @@ final class CatcherModel {
             statusUpdatedAt = Date()
         }
         listen()
-        let auto = ProcessInfo.processInfo.arguments.contains("--auto-record")
-            || ProcessInfo.processInfo.environment["CATCHER_AUTO_RECORD"] == "1"
-        if auto, !status.isBlocked {
+        if autoRecord, !status.isBlocked {
             await toggle()
         }
     }

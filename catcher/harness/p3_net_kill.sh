@@ -9,12 +9,8 @@ if [[ "${CATCHER_ALLOW_PF:-}" != "1" ]]; then
   echo "Refusing to change the packet filter. Re-run as root with CATCHER_ALLOW_PF=1." >&2
   exit 2
 fi
-BIN="$(catcher_bin)"
-export CATCHER_SESSION_ROOT="$SESSION"
-export CATCHER_HARNESS=1
 export CATCHER_ENGINE=grok
-"$BIN" --auto-record &
-echo $! > "$SESSION/catcher.pid"
+launch_catcher "$SESSION" 1
 sleep 3
 IPS="$(dig +short api.x.ai A | tr '\n' ' ')"
 if [[ -z "$IPS" ]]; then

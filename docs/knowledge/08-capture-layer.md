@@ -5,7 +5,8 @@
 ## The v0 pipeline
 ```
 ScreenCaptureKit (system audio + mic, two tracks)
-  → CMSampleBuffer PCM16 @ 16 kHz mono
+  → CMSampleBuffer float32, often non-interleaved, at the configured rate
+  → convert to PCM16 @ 16 kHz mono
   → WebSocket binary frames (~100 ms chunks)
   → Grok Voice Transcribe 2.0 streaming
   → transcript.partial / transcript.done events
@@ -17,8 +18,8 @@ ScreenCaptureKit (system audio + mic, two tracks)
 config.capturesAudio = true
 config.captureMicrophone = true           // macOS 15+, separate .microphone track
 config.excludesCurrentProcessAudio = true  // mandatory — no feedback loop
-config.sampleRate = 16000                  // SCK resamples; no manual conversion
-config.channelCount = 1
+config.sampleRate = 16000                  // SCK resamples rate and channel count
+config.channelCount = 1                    // samples stay float32; convert to PCM16 after the copy
 config.width = 2; config.height = 2        // collapse the video stub
 config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 ```
@@ -40,7 +41,7 @@ config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 - Limits: 100 concurrent streaming sessions/team — fine for v0.
 
 ## Gotchas for Cap
-1. Extract SCK audio with `CMSampleBufferCopyPCMDataIntoAudioBufferList` — the `GetAudioBufferListWithRetainedBlockBuffer` variant fails with `-12737` on SCK buffers.
+1. Extract SCK audio with `CMSampleBufferCopyPCMDataIntoAudioBufferList` into a list sized from the buffer's own format (float32, one `AudioBuffer` per channel when non-interleaved), then convert to 16 kHz mono PCM16. The retained-block-buffer API fails with `-12737` on SCK buffers. A destination sized for PCM16 fails the copy too; discarding that error yields zero frames and no `system.pcm`.
 2. `updateConfiguration` **replaces**, never merges — always pass the complete config or sample rate/channels/audio flags silently reset.
 3. Write segments continuously, assemble on clean stop (crash-safe recording).
 

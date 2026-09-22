@@ -106,11 +106,14 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, SCStreamDelegate
     public let failures: AsyncStream<CaptureError>
     private let frameContinuation: AsyncStream<PCMFrame>.Continuation
     private let failureContinuation: AsyncStream<CaptureError>.Continuation
-    private let queue = DispatchQueue(label: "com.catcher.sck", qos: .userInteractive)
+    private let audioQueue = DispatchQueue(label: "com.catcher.sck.audio", qos: .userInteractive)
+    private let microphoneQueue = DispatchQueue(label: "com.catcher.sck.microphone", qos: .userInteractive)
+    private let screenQueue = DispatchQueue(label: "com.catcher.sck.screen", qos: .utility)
     private let lock = NSLock()
     private var stream: SCStream?
-    private var outputs: [PCMOutput] = []
+    private var outputs: [NSObject] = []
     private var accepting = false
+    private var reportedExtractionFailure = false
 
     public override init() {
         let frames = AsyncStream<PCMFrame>.makeStream()
@@ -123,7 +126,10 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, SCStreamDelegate
     }
 
     public func start() async throws {
-        let config = CaptureConfig.make()
+        var config = CaptureConfig.make()
+        if config.microphoneDeviceID == nil {
+            config.microphoneDeviceID = AVCaptureDevice.default(for: .audio)?.uniqueID
+        }
         guard config.wholeDisplay else {
             throw CaptureError.streamStopped("capture config is not whole-display")
         }
@@ -135,19 +141,34 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, SCStreamDelegate
         let streamConfig = SCStreamConfiguration()
         config.apply(to: streamConfig)
         let stream = SCStream(filter: filter, configuration: streamConfig, delegate: self)
-        let audio = PCMOutput(track: .system) { [weak self] frame in
+        let audio = PCMOutput(track: .system, onFrame: { [weak self] frame in
             self?.emit(frame)
-        }
-        let microphone = PCMOutput(track: .microphone) { [weak self] frame in
+        }, onFailure: { [weak self] error in
+            self?.emitFailure(error)
+        })
+        let microphone = PCMOutput(track: .microphone, onFrame: { [weak self] frame in
             self?.emit(frame)
+        }, onFailure: { [weak self] error in
+            self?.emitFailure(error)
+        })
+        // Video still runs inside an audio capture. A screen consumer keeps those
+        // frames off the audio queue. Audio-only still delivers buffers if this add fails.
+        let screen = DiscardingScreenOutput()
+        try? stream.addStreamOutput(screen, type: .screen, sampleHandlerQueue: screenQueue)
+        try stream.addStreamOutput(audio, type: .audio, sampleHandlerQueue: audioQueue)
+        try stream.addStreamOutput(microphone, type: .microphone, sampleHandlerQueue: microphoneQueue)
+        // Accept before startCapture. Buffers can arrive before startCapture returns,
+        // and dropping them on `accepting == false` used to throw away the head of the take.
+        arm(stream: stream, outputs: [audio, microphone, screen])
+        do {
+            try await stream.startCapture()
+        } catch {
+            _ = takeStream()
+            throw error
         }
-        try stream.addStreamOutput(audio, type: .audio, sampleHandlerQueue: queue)
-        try stream.addStreamOutput(microphone, type: .microphone, sampleHandlerQueue: queue)
-        try await stream.startCapture()
-        remember(stream: stream, outputs: [audio, microphone])
     }
 
-    private func remember(stream: SCStream, outputs: [PCMOutput]) {
+    private func arm(stream: SCStream, outputs: [NSObject]) {
         lock.lock()
         self.stream = stream
         self.outputs = outputs
@@ -186,6 +207,21 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, SCStreamDelegate
         frameContinuation.yield(frame)
     }
 
+    private func emitFailure(_ error: CaptureError) {
+        lock.lock()
+        let open = accepting
+        let report: Bool
+        if case .pcmExtractionFailed = error {
+            report = !reportedExtractionFailure
+            reportedExtractionFailure = true
+        } else {
+            report = true
+        }
+        lock.unlock()
+        guard open, report else { return }
+        failureContinuation.yield(error)
+    }
+
     static func classify(_ error: Error) -> CaptureError {
         let ns = error as NSError
         let blob = (ns.domain + " " + ns.localizedDescription).lowercased()
@@ -196,17 +232,28 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, SCStreamDelegate
     }
 }
 
+private final class DiscardingScreenOutput: NSObject, SCStreamOutput {
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {}
+}
+
 private final class PCMOutput: NSObject, SCStreamOutput {
     let track: AudioTrack
     let onFrame: (PCMFrame) -> Void
+    let onFailure: (CaptureError) -> Void
 
-    init(track: AudioTrack, onFrame: @escaping (PCMFrame) -> Void) {
+    init(
+        track: AudioTrack,
+        onFrame: @escaping (PCMFrame) -> Void,
+        onFailure: @escaping (CaptureError) -> Void
+    ) {
         self.track = track
         self.onFrame = onFrame
+        self.onFailure = onFailure
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .audio || type == .microphone else { return }
+        guard CMSampleBufferIsValid(sampleBuffer) else { return }
         guard CMSampleBufferGetNumSamples(sampleBuffer) > 0 else { return }
         do {
             let data = try SampleBufferPCM.extract(from: sampleBuffer)
@@ -218,9 +265,11 @@ private final class PCMOutput: NSObject, SCStreamOutput {
             )
             onFrame(frame)
         } catch let error as CaptureError {
-            _ = error
+            onFailure(error)
+        } catch let failure as SampleBufferPCM.Failure {
+            onFailure(.pcmExtractionFailed(status: -1, detail: String(describing: failure)))
         } catch {
-            _ = error
+            onFailure(.pcmExtractionFailed(status: -1, detail: String(describing: error)))
         }
     }
 }

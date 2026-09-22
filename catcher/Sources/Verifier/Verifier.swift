@@ -47,7 +47,17 @@ public actor Verifier {
     }
 
     public func observeCapture(_ error: CaptureError, atMs: Int) -> VerifierEffect {
-        publish(annotations: permission.observe(error, atMs: atMs), atMs: atMs)
+        var annotations = permission.observe(error, atMs: atMs)
+        if case .pcmExtractionFailed(let status, let detail) = error {
+            let reason = detail.isEmpty
+                ? "pcm extraction failed (\(status))"
+                : "pcm extraction failed (\(status)): \(detail)"
+            if forcedReason == nil {
+                forcedReason = reason
+            }
+            annotations.append(Annotation(atMs: atMs, kind: "degraded", detail: .text(reason)))
+        }
+        return publish(annotations: annotations, atMs: atMs)
     }
 
     public func observeReprobe(_ state: PermissionState, atMs: Int) -> VerifierEffect {

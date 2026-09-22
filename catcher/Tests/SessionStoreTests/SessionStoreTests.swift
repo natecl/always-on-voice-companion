@@ -117,6 +117,40 @@ import Testing
     }
 }
 
+@Test func launchArgumentsOverrideEnvironment() {
+    let launch = LaunchConfiguration.resolve(
+        arguments: ["CatcherApp", "--session-root", "/tmp/catcher-p1", "--harness", "--engine", "stub", "--auto-record"],
+        environment: [
+            "CATCHER_SESSION_ROOT": "/ignored",
+            "CATCHER_ENGINE": "grok",
+            "CATCHER_HARNESS": "0",
+        ]
+    )
+    #expect(launch.sessionRoot == "/tmp/catcher-p1")
+    #expect(launch.harness)
+    #expect(launch.engine == "stub")
+    #expect(launch.autoRecord)
+    let merged = launch.mergedEnvironment(["XAI_API_KEY": "secret"])
+    #expect(merged["CATCHER_SESSION_ROOT"] == "/tmp/catcher-p1")
+    #expect(merged["CATCHER_HARNESS"] == "1")
+    #expect(merged["CATCHER_ENGINE"] == "stub")
+    #expect(merged["CATCHER_AUTO_RECORD"] == "1")
+    #expect(merged["XAI_API_KEY"] == "secret")
+}
+
+@Test func launchEqualsFormAndEnvironmentStillWork() {
+    let launch = LaunchConfiguration.resolve(
+        arguments: ["CatcherApp", "--session-root=/tmp/eq", "--engine=stub"],
+        environment: ["CATCHER_HARNESS": "1", "CATCHER_AUTO_RECORD": "1"]
+    )
+    #expect(launch == LaunchConfiguration(
+        sessionRoot: "/tmp/eq",
+        harness: true,
+        engine: "stub",
+        autoRecord: true
+    ))
+}
+
 private func decodeLines(_ text: String) throws -> [SessionRow] {
     try text.split(separator: "\n").map { line in
         try JSONDecoder().decode(SessionRow.self, from: Data(line.utf8))

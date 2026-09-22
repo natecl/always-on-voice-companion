@@ -5,12 +5,8 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 source "$ROOT/lib.sh"
 SESSION="${1:?session dir}"
 mkdir -p "$SESSION"
-BIN="$(catcher_bin)"
-export CATCHER_SESSION_ROOT="$SESSION"
-export CATCHER_HARNESS=1
 export CATCHER_ENGINE=grok
-"$BIN" --auto-record &
-echo $! > "$SESSION/catcher.pid"
+launch_catcher "$SESSION" 1
 echo "Speak into the mic while the fixture plays."
 afplay "$ROOT/fixtures/known-60s.wav" &
 sleep 20

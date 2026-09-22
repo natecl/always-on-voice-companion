@@ -16,6 +16,9 @@ public struct CaptureConfig: Sendable, Equatable {
     public var capturesAudio: Bool
     public var captureMicrophone: Bool
     public var wholeDisplay: Bool
+    public var queueDepth: Int
+    /// Nil keeps SCK's default input. The session fills this from the default device when one exists.
+    public var microphoneDeviceID: String?
 
     public static func make() -> CaptureConfig {
         CaptureConfig(
@@ -27,7 +30,9 @@ public struct CaptureConfig: Sendable, Equatable {
             excludesCurrentProcessAudio: true,
             capturesAudio: true,
             captureMicrophone: true,
-            wholeDisplay: true
+            wholeDisplay: true,
+            queueDepth: 8,
+            microphoneDeviceID: nil
         )
     }
 
@@ -41,10 +46,14 @@ public struct CaptureConfig: Sendable, Equatable {
         config.channelCount = channelCount
         config.width = width
         config.height = height
+        config.queueDepth = queueDepth
         config.minimumFrameInterval = CMTime(
             value: CMTimeValue(minimumFrameIntervalSeconds),
             timescale: 1
         )
+        if let microphoneDeviceID {
+            config.microphoneCaptureDeviceID = microphoneDeviceID
+        }
     }
     #endif
 }

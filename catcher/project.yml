@@ -37,6 +37,13 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "6.0"
         MACOSX_DEPLOYMENT_TARGET: "15.0"
-        CODE_SIGN_STYLE: Automatic
+        # Manual identity. Automatic with no team becomes ad-hoc, and TCC then
+        # keys the grant to the cdhash, which changes on every rebuild.
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Catcher Development"
+        CODE_SIGNING_REQUIRED: YES
+        CODE_SIGNING_ALLOWED: YES
+        CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
         ENABLE_HARDENED_RUNTIME: YES
+        OTHER_CODE_SIGN_FLAGS: "--timestamp=none"
         COMBINE_HIDPI_IMAGES: YES

@@ -13,6 +13,8 @@ import Testing
     #expect(config.capturesAudio)
     #expect(config.captureMicrophone)
     #expect(config.wholeDisplay)
+    #expect(config.queueDepth == 8)
+    #expect(config.microphoneDeviceID == nil)
     #expect(AudioFormat.chunkBytes == 3_200)
 }
 
@@ -38,6 +40,159 @@ import Testing
     #expect(mono == data)
 }
 
+@Test func float32MonoIsWiderThanTheOldPCM16Allocation() {
+    let format = SourcePCMFormat(
+        sampleRate: 16_000,
+        channels: 1,
+        bitsPerChannel: 32,
+        isFloat: true,
+        isNonInterleaved: true,
+        isBigEndian: false
+    )
+    #expect(format.bufferCount == 1)
+    #expect(format.bytesPerFramePerBuffer == 4)
+    let frames = 480
+    let oldByteCount = frames * format.channels * AudioFormat.bytesPerSample
+    #expect(format.bytesPerBuffer(frameCount: frames) == frames * 4)
+    #expect(format.bytesPerBuffer(frameCount: frames) != oldByteCount)
+}
+
+@Test func planarFloatStereoNeedsOneBufferPerChannel() {
+    let format = SourcePCMFormat(
+        sampleRate: 48_000,
+        channels: 2,
+        bitsPerChannel: 32,
+        isFloat: true,
+        isNonInterleaved: true,
+        isBigEndian: false
+    )
+    #expect(format.bufferCount == 2)
+    #expect(format.bytesPerBuffer(frameCount: 100) == 400)
+}
+
+@Test func float32MonoConvertsToPCM16() throws {
+    let format = SourcePCMFormat(
+        sampleRate: 16_000,
+        channels: 1,
+        bitsPerChannel: 32,
+        isFloat: true,
+        isNonInterleaved: true,
+        isBigEndian: false
+    )
+    let pcm = try SampleBufferPCM.convertToPCM16Mono(
+        buffers: [leFloat32([0.5, -0.5, 0])],
+        format: format,
+        frameCount: 3
+    )
+    #expect(int16Samples(pcm) == [16_384, -16_384, 0])
+}
+
+@Test func bigEndianFloatFullScaleBecomesPCM16() throws {
+    let format = SourcePCMFormat(
+        sampleRate: 16_000,
+        channels: 1,
+        bitsPerChannel: 32,
+        isFloat: true,
+        isNonInterleaved: false,
+        isBigEndian: true
+    )
+    let pcm = try SampleBufferPCM.convertToPCM16Mono(
+        buffers: [beFloat32([1, -1])],
+        format: format,
+        frameCount: 2
+    )
+    #expect(int16Samples(pcm) == [32_767, -32_767])
+}
+
+@Test func planarOppositePolarityDownmixesToSilence() throws {
+    let format = SourcePCMFormat(
+        sampleRate: 16_000,
+        channels: 2,
+        bitsPerChannel: 32,
+        isFloat: true,
+        isNonInterleaved: true,
+        isBigEndian: false
+    )
+    let pcm = try SampleBufferPCM.convertToPCM16Mono(
+        buffers: [leFloat32([1, 1]), leFloat32([-1, -1])],
+        format: format,
+        frameCount: 2
+    )
+    #expect(int16Samples(pcm) == [0, 0])
+}
+
+@Test func interleavedOppositePolarityDownmixesToSilence() throws {
+    let format = SourcePCMFormat(
+        sampleRate: 16_000,
+        channels: 2,
+        bitsPerChannel: 32,
+        isFloat: true,
+        isNonInterleaved: false,
+        isBigEndian: false
+    )
+    let pcm = try SampleBufferPCM.convertToPCM16Mono(
+        buffers: [leFloat32([1, -1, 0.5, -0.5])],
+        format: format,
+        frameCount: 2
+    )
+    #expect(int16Samples(pcm) == [0, 0])
+}
+
+@Test func fortyEightKilohertzFloatResamplesToSixteen() throws {
+    let format = SourcePCMFormat(
+        sampleRate: 48_000,
+        channels: 1,
+        bitsPerChannel: 32,
+        isFloat: true,
+        isNonInterleaved: true,
+        isBigEndian: false
+    )
+    let pcm = try SampleBufferPCM.convertToPCM16Mono(
+        buffers: [leFloat32([Float](repeating: 0.25, count: 480))],
+        format: format,
+        frameCount: 480
+    )
+    let samples = int16Samples(pcm)
+    #expect(samples.count == 160)
+    #expect(samples.allSatisfy { $0 == 8_192 })
+}
+
+@Test func sixteenKilohertzPCM16PassesThroughWithoutFloatRounding() throws {
+    let format = SourcePCMFormat(
+        sampleRate: 16_000,
+        channels: 1,
+        bitsPerChannel: 16,
+        isFloat: false,
+        isNonInterleaved: false,
+        isBigEndian: false
+    )
+    let source: [Int16] = [1000, -1000, 500, -500]
+    let pcm = try SampleBufferPCM.convertToPCM16Mono(
+        buffers: [source.withUnsafeBytes { Data($0) }],
+        format: format,
+        frameCount: source.count
+    )
+    #expect(int16Samples(pcm) == source)
+}
+
+@Test func shortFloatBufferIsRejected() {
+    let format = SourcePCMFormat(
+        sampleRate: 16_000,
+        channels: 1,
+        bitsPerChannel: 32,
+        isFloat: true,
+        isNonInterleaved: false,
+        isBigEndian: false
+    )
+    #expect(throws: SampleBufferPCM.Failure.bufferTooSmall) {
+        try SampleBufferPCM.convertToPCM16Mono(
+            buffers: [Data([0, 0, 0, 0])],
+            format: format,
+            frameCount: 2
+        )
+    }
+}
+
 @Test func hostClockMovesForward() {
     let start = HostClock.now()
     let end = HostClock.now()
@@ -56,6 +211,28 @@ import Testing
         Issue.record("expected a blocked probe off macOS")
     }
     #endif
+}
+
+private func leFloat32(_ samples: [Float]) -> Data {
+    var data = Data(capacity: samples.count * 4)
+    for sample in samples {
+        var bits = sample.bitPattern.littleEndian
+        withUnsafeBytes(of: &bits) { data.append(contentsOf: $0) }
+    }
+    return data
+}
+
+private func beFloat32(_ samples: [Float]) -> Data {
+    var data = Data(capacity: samples.count * 4)
+    for sample in samples {
+        var bits = sample.bitPattern.bigEndian
+        withUnsafeBytes(of: &bits) { data.append(contentsOf: $0) }
+    }
+    return data
+}
+
+private func int16Samples(_ data: Data) -> [Int16] {
+    data.withUnsafeBytes { Array($0.bindMemory(to: Int16.self)) }
 }
 
 #if os(macOS)
@@ -130,7 +307,88 @@ import CoreMedia
     )
     #expect(status == noErr)
     let extracted = try SampleBufferPCM.extract(from: sampleBuffer!)
-    let decoded = extracted.withUnsafeBytes { Array($0.bindMemory(to: Int16.self)) }
-    #expect(decoded == samples)
+    #expect(int16Samples(extracted) == samples)
+}
+
+@Test func sampleBufferExtractionConvertsFloat32() throws {
+    let floats: [Float] = [0.5, -0.5]
+    let extracted = try SampleBufferPCM.extract(from: try makePCMSampleBuffer(
+        asbd: AudioStreamBasicDescription(
+            mSampleRate: 16_000,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: 1,
+            mBitsPerChannel: 32,
+            mReserved: 0
+        ),
+        bytes: leFloat32(floats),
+        sampleCount: floats.count
+    ))
+    #expect(int16Samples(extracted) == [16_384, -16_384])
+}
+
+private func makePCMSampleBuffer(
+    asbd: AudioStreamBasicDescription,
+    bytes: Data,
+    sampleCount: Int
+) throws -> CMSampleBuffer {
+    var description = asbd
+    var format: CMFormatDescription?
+    let formatStatus = CMAudioFormatDescriptionCreate(
+        allocator: kCFAllocatorDefault,
+        asbd: &description,
+        layoutSize: 0,
+        layout: nil,
+        magicCookieSize: 0,
+        magicCookie: nil,
+        extensions: nil,
+        formatDescriptionOut: &format
+    )
+    #expect(formatStatus == noErr)
+    var block: CMBlockBuffer?
+    #expect(CMBlockBufferCreateWithMemoryBlock(
+        allocator: kCFAllocatorDefault,
+        memoryBlock: nil,
+        blockLength: bytes.count,
+        blockAllocator: kCFAllocatorDefault,
+        customBlockSource: nil,
+        offsetToData: 0,
+        dataLength: bytes.count,
+        flags: 0,
+        blockBufferOut: &block
+    ) == noErr)
+    try bytes.withUnsafeBytes { raw in
+        #expect(CMBlockBufferReplaceDataBytes(
+            with: raw.baseAddress!,
+            blockBuffer: block!,
+            offsetIntoDestination: 0,
+            dataLength: bytes.count
+        ) == noErr)
+    }
+    var timing = CMSampleTimingInfo(
+        duration: CMTime(value: 1, timescale: 16_000),
+        presentationTimeStamp: .invalid,
+        decodeTimeStamp: .invalid
+    )
+    var sampleBuffer: CMSampleBuffer?
+    let status = CMSampleBufferCreate(
+        allocator: kCFAllocatorDefault,
+        dataBuffer: block,
+        dataReady: true,
+        makeDataReadyCallback: nil,
+        refcon: nil,
+        formatDescription: format!,
+        sampleCount: sampleCount,
+        sampleTimingEntryCount: 1,
+        sampleTimingArray: &timing,
+        sampleSizeEntryCount: 0,
+        sampleSizeArray: nil,
+        sampleBufferOut: &sampleBuffer
+    )
+    #expect(status == noErr)
+    return try #require(sampleBuffer)
 }
 #endif

@@ -25,13 +25,13 @@ ScreenCaptureKit, the microphone permission prompt, and the SwiftUI app are macO
 
 ```bash
 cd catcher
-xcodegen generate
-xcodebuild -project CatcherApp.xcodeproj -scheme CatcherApp -destination 'platform=macOS' -derivedDataPath build build
+./scripts/build-app.sh
+export CATCHER_APP="$PWD/build/Build/Products/Debug/Catcher.app"
 ```
 
-`CatcherApp.xcodeproj` is generated and gitignored. Use one stable development signing identity. An ad-hoc resign changes the TCC identity and the grant silently disappears.
+`CatcherApp.xcodeproj` is generated and gitignored. The script signs with a stable identity (`Catcher Development`, or Apple Development if `CATCHER_DEVELOPMENT_TEAM` is set). An ad-hoc signature is rejected: TCC would bind to the cdhash and the grant would not survive the next rebuild.
 
-**Dev TCC gotcha:** the granted binary is the one you launch. A `swift run` from Terminal, or a debug session under Xcode, grants Terminal or Xcode — not Catcher. The harness launches `Catcher.app/Contents/MacOS/CatcherApp` so the grant and the environment variables belong to the app.
+**Dev TCC gotcha:** the granted binary is the one you launch. A `swift run` from Terminal, or a debug session under Xcode, grants Terminal or Xcode — not Catcher. The harness launches `Catcher.app/Contents/MacOS/CatcherApp` and checks the bundle id is `com.catcher.app`.
 
 Info.plist keys: `NSScreenCaptureUsageDescription`, `NSMicrophoneUsageDescription`. Bundle id: `com.catcher.app`.
 

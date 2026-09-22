@@ -11,11 +11,8 @@ if [[ "${CATCHER_ALLOW_TCC_RESET:-}" != "1" ]]; then
   echo "Command that will run: tccutil reset ScreenCapture $BUNDLE" >&2
   exit 2
 fi
-BIN="$(catcher_bin)"
-export CATCHER_SESSION_ROOT="$SESSION"
 export CATCHER_HARNESS=1
-"$BIN" --auto-record &
-echo $! > "$SESSION/catcher.pid"
+launch_catcher "$SESSION" 1
 sleep 2
 python3 - <<'PY' > "$SESSION/revoke_wall_ms"
 import time

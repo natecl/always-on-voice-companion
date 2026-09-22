@@ -127,6 +127,22 @@ import Verifier
     #expect(blocked.snapshot.status.isBlocked)
 }
 
+@Test func pcmExtractionFailureIsDegradedAndNotSilent() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    let effect = await verifier.observeCapture(.pcmExtractionFailed(status: -12737, detail: ""), atMs: 100)
+    #expect(effect.annotations.contains { annotation in
+        if case .text(let text) = annotation.detail {
+            return annotation.kind == "degraded" && text.contains("-12737")
+        }
+        return false
+    })
+    if case .degraded = effect.snapshot.status {} else {
+        Issue.record("expected degraded, got \(effect.snapshot.status)")
+    }
+    #expect(effect.snapshot.banner?.isEmpty == false)
+}
+
 @Test func loudChannelsAlwaysCarryAllFourSurfaces() {
     let annotation = Annotation(atMs: 10, kind: "blocked", detail: .text("no grant"))
     let channels = Loud.channels(annotation: annotation, status: .blocked("no grant"))

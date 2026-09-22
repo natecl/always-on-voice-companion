@@ -7,17 +7,15 @@ v0 stays red until `grade.json` from a Mac run has P1–P6 all `pass`.
 ## One-time setup
 
 1. macOS 15 or newer. Xcode with the macOS 15 SDK. [XcodeGen](https://github.com/yonaskolb/XcodeGen) on `PATH`. Python 3.
-2. Build the app, not a `swift run` binary:
+2. Build the app with the stable-signature script, not `swift run` and not an ad-hoc `xcodebuild`:
 
    ```bash
    cd catcher
-   xcodegen generate
-   xcodebuild -project CatcherApp.xcodeproj -scheme CatcherApp \
-     -destination 'platform=macOS' -derivedDataPath build build
+   ./scripts/build-app.sh
    export CATCHER_APP="$PWD/build/Build/Products/Debug/Catcher.app"
    ```
 
-   Sign with a stable development identity. Re-signing ad-hoc drops the TCC grant.
+   `build-app.sh` signs with `Catcher Development` (a local code-signing certificate it creates once) or with Apple Development when `CATCHER_DEVELOPMENT_TEAM` is set. The harness refuses `Signature=adhoc`. An ad-hoc cdhash changes every rebuild, so a grant cannot stick to the next binary. The designated requirement is the certificate plus `com.catcher.app`.
 3. Launch `Catcher.app` once and grant **Screen & System Audio Recording** and **Microphone** to bundle id `com.catcher.app`. The granted identity is the app. A grant given to Terminal or Xcode does not count, and P2 will grade the wrong binary.
 4. `export XAI_API_KEY=...` for any gate that uses Grok (`P1`, `P3`, `P6`). `CATCHER_ENGINE=grok` is the default. `CATCHER_ENGINE=stub` forces the deterministic engine.
 5. Replace `catcher/harness/fixtures/known-60s.wav` with a clear ~60 s reading of `known-60s.ref.txt` before scoring P1. The file in git is a 16 kHz mono PCM16 carrier so the script has something to play. It is not that reading. WER against the reference will fail until you replace it.
@@ -44,7 +42,9 @@ The path you pass is `CATCHER_SESSION_ROOT`. The app creates one directory per r
 
 `run.sh` resolves the newest child that contains `events.jsonl` and grades that directory. Default sessions outside the harness go to `~/Library/Application Support/Catcher/sessions/<uuid>/` with the same file names and no PCM unless `CATCHER_HARNESS=1`.
 
-The harness starts `Catcher.app/Contents/MacOS/CatcherApp` so `CATCHER_SESSION_ROOT`, `CATCHER_HARNESS`, and `CATCHER_ENGINE` are visible. `open(1)` would drop them.
+The harness starts `Catcher.app/Contents/MacOS/CatcherApp` (bundle id `com.catcher.app`, not an ad-hoc side binary) so `CATCHER_SESSION_ROOT`, `CATCHER_HARNESS`, `CATCHER_ENGINE`, and `XAI_API_KEY` reach the process. The same switches are also passed as `--session-root`, `--harness`, `--engine`, and `--auto-record`. `open(1)` would drop the environment, including the API key.
+
+After a P1 run, `system.pcm` in the session directory is the capture proof. It is absent when no `PCMFrame` was emitted. A `noAudio` annotation at 10s also fires when zero frames arrived, so P4 passing does not show that system audio was captured.
 
 Library CI (`.github/workflows/catcher-ci.yml` on `macos-15`) runs `swift build` and `swift test` only. It does not produce `grade.json`.
 
