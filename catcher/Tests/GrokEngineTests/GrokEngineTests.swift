@@ -318,10 +318,11 @@ import TranscriptionEngine
             socket.ignoreReceiveCancel = true
         }
         if index == 1 {
-            // The reconnect attempt while the drop is still in place. Cancel
-            // does not unblock `receive`; only `close` does. Without that close
-            // the handshake task group never returns and no later socket opens.
+            // The reconnect attempt while the drop is still in place. Neither
+            // cancel nor close resumes `receive` (a later `pf` handshake).
+            // Waiting on that receive never opens the socket that emits gap.
             socket.ignoreReceiveCancel = true
+            socket.wakeReceiveOnClose = false
         }
         if index >= 2 {
             socket.push(.text(#"{"type":"transcript.created"}"#))

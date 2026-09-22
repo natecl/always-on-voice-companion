@@ -1,6 +1,7 @@
 import AudioCapture
 import Diagnostics
 import Foundation
+import Synchronization
 import TranscriptionEngine
 
 public struct GrokEngineConfiguration: Sendable {
@@ -321,24 +322,16 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics {
     }
 
     /// `connect` has no deadline. The handshake timeout is the same budget the
-    /// engine already uses for `transcript.created`.
+    /// engine already uses for `transcript.created`. A `pf` drop can park
+    /// `connect` inside `URLSession`; the loop must not wait for that call.
     private func open(_ transport: any GrokTransport) async throws {
         let url = configuration.url
         let key = configuration.apiKey
         let timeout = configuration.handshakeTimeout
-        try await withThrowingTaskGroup(of: Bool.self) { group in
-            group.addTask {
-                try await transport.connect(url: url, authorizationBearer: key)
-                return true
-            }
-            group.addTask {
-                try await Task.sleep(for: timeout)
-                return false
-            }
-            defer { group.cancelAll() }
-            guard try await group.next() ?? false else {
-                throw EngineError.handshakeTimeout
-            }
+        try await firstToFinish(timeout: timeout, onTimeout: {
+            await transport.close()
+        }) {
+            try await transport.connect(url: url, authorizationBearer: key)
         }
     }
 
@@ -613,36 +606,55 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics {
         }
     }
 
-    private enum ReceiveRace: Sendable {
-        case event(GrokSocketEvent)
-        case timeout
+    private func receiveWithTimeout(_ transport: any GrokTransport, timeout: Duration) async throws -> GrokSocketEvent {
+        // `withThrowingTaskGroup` waits for every child. Closing the first
+        // parked handshake resumed `receive` once; the next `pf` handshake
+        // stays parked, the group never returns, and no later socket is
+        // opened — so `gap` and `streaming` (`resumed`) are never yielded.
+        try await firstToFinish(timeout: timeout, onTimeout: {
+            await transport.close()
+        }) {
+            try await transport.receive()
+        }
     }
 
-    private func receiveWithTimeout(_ transport: any GrokTransport, timeout: Duration) async throws -> GrokSocketEvent {
-        let nanos = Self.nanoseconds(timeout)
-        return try await withThrowingTaskGroup(of: ReceiveRace.self) { group in
-            group.addTask {
-                let event = try await transport.receive()
-                return .event(event)
+    /// Winner returns. The loser is cancelled and not awaited: a dropped SYN
+    /// never unblocks `URLSession`, and waiting here is the stuck reconnect.
+    private func firstToFinish<T: Sendable>(
+        timeout: Duration,
+        onTimeout: @Sendable () async -> Void,
+        _ operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        let race = FirstWin<T>()
+        let work = Task.detached {
+            do {
+                race.finish(.value(try await operation()))
+            } catch is CancellationError {
+                race.finish(.failed("cancelled"))
+            } catch {
+                race.finish(.failed(String(describing: error)))
             }
-            group.addTask {
-                try await Task.sleep(nanoseconds: nanos)
-                return .timeout
+        }
+        let timer = Task.detached {
+            do {
+                try await Task.sleep(for: timeout)
+            } catch {
+                return
             }
-            let first = try await group.next() ?? .timeout
-            switch first {
-            case .event(let event):
-                group.cancelAll()
-                return event
-            case .timeout:
-                // Cancelling this child only calls `task.cancel()`, which does not
-                // finish `receive` under a `pf` drop. The group then waits forever,
-                // so reconnect never yields `gap` and `streaming` (`resumed`).
-                // Close invalidates the session and lets the child complete.
-                await transport.close()
-                group.cancelAll()
-                throw EngineError.handshakeTimeout
-            }
+            race.finish(.timeout)
+        }
+        let outcome = await race.wait()
+        timer.cancel()
+        switch outcome {
+        case .value(let value):
+            return value
+        case .failed(let message):
+            work.cancel()
+            throw EngineError.socket(message)
+        case .timeout:
+            await onTimeout()
+            work.cancel()
+            throw EngineError.handshakeTimeout
         }
     }
 
@@ -666,11 +678,47 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics {
         let parts = duration.components
         return Double(parts.seconds) + Double(parts.attoseconds) / 1e18
     }
+}
 
-    private static func nanoseconds(_ duration: Duration) -> UInt64 {
-        let parts = duration.components
-        let seconds = UInt64(max(0, parts.seconds)) * 1_000_000_000
-        let nanos = UInt64(max(0, parts.attoseconds / 1_000_000_000))
-        return seconds &+ nanos
+/// First `finish` wins. The reconnect loop must not wait on the loser: a
+/// `pf`-dropped `receive` never returns, and waiting is what skipped `gap`.
+private final class FirstWin<Value: Sendable>: @unchecked Sendable {
+    enum Outcome: Sendable {
+        case value(Value)
+        case failed(String)
+        case timeout
+    }
+
+    private struct State: Sendable {
+        var outcome: Outcome?
+        var waiting: CheckedContinuation<Outcome, Never>?
+    }
+
+    private let state = Mutex(State())
+
+    func wait() async -> Outcome {
+        await withCheckedContinuation { continuation in
+            let already = state.withLock { state -> Outcome? in
+                if let outcome = state.outcome {
+                    return outcome
+                }
+                state.waiting = continuation
+                return nil
+            }
+            if let already {
+                continuation.resume(returning: already)
+            }
+        }
+    }
+
+    func finish(_ outcome: Outcome) {
+        let continuation = state.withLock { state -> CheckedContinuation<Outcome, Never>? in
+            guard state.outcome == nil else { return nil }
+            state.outcome = outcome
+            let continuation = state.waiting
+            state.waiting = nil
+            return continuation
+        }
+        continuation?.resume(returning: outcome)
     }
 }
