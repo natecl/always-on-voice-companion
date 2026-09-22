@@ -1,0 +1,9 @@
+Nathan: quick sync on the Acme deal — you good?
+Priya: yep, all good on my end. did we ever send them the revised pricing?
+Nathan: not yet. I'll send the revised pricing by tomorrow morning.
+Priya: perfect. and the launch date — are we still set for Friday?
+Nathan: yes, launch is Friday, no change. I'll confirm with design today.
+Priya: cool. oh — you said last week you'd review the security doc. did that happen?
+Nathan: ugh, no, I forgot. I'll review the security doc tonight, I promise.
+Priya: no worries. so we're agreed: we go with the enterprise tier for Acme?
+Nathan: agreed, enterprise tier it is.
