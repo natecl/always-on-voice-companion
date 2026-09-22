@@ -630,11 +630,17 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics {
                 return .timeout
             }
             let first = try await group.next() ?? .timeout
-            group.cancelAll()
             switch first {
             case .event(let event):
+                group.cancelAll()
                 return event
             case .timeout:
+                // Cancelling this child only calls `task.cancel()`, which does not
+                // finish `receive` under a `pf` drop. The group then waits forever,
+                // so reconnect never yields `gap` and `streaming` (`resumed`).
+                // Close invalidates the session and lets the child complete.
+                await transport.close()
+                group.cancelAll()
                 throw EngineError.handshakeTimeout
             }
         }

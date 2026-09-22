@@ -306,7 +306,75 @@ import TranscriptionEngine
     #expect(second.binary(at: 0) == blocked)
     first.release()
     await engine.finish()
-    _ = await hung.value
+    _ = try? await hung.value
+}
+
+@Test func handshakeTimeoutClosesParkedReceiveAndEmitsGap() async throws {
+    let clock = ManualClock()
+    let supply = SocketSupply()
+    supply.configure = { index, socket in
+        if index == 0 {
+            socket.wakeReceiveOnClose = false
+            socket.ignoreReceiveCancel = true
+        }
+        if index == 1 {
+            // The reconnect attempt while the drop is still in place. Cancel
+            // does not unblock `receive`; only `close` does. Without that close
+            // the handshake task group never returns and no later socket opens.
+            socket.ignoreReceiveCancel = true
+        }
+        if index >= 2 {
+            socket.push(.text(#"{"type":"transcript.created"}"#))
+        }
+    }
+    let engine = stalledEngine(
+        supply: supply,
+        clock: clock,
+        inboundStall: .milliseconds(250),
+        handshakeTimeout: .milliseconds(300)
+    )
+    defer {
+        supply.socket(0)?.release()
+        supply.socket(1)?.release()
+    }
+    var iterator = engine.events.makeAsyncIterator()
+    let connecting = Task { try await engine.connect(track: .system) }
+    try await waitUntil { supply.count >= 1 }
+    let first = try #require(supply.socket(0))
+    first.push(.text(#"{"type":"transcript.created"}"#))
+    try await connecting.value
+    let frame = Data(repeating: 9, count: 3_200)
+    try await engine.send(PCMFrame(track: .system, data: frame, hostTime: 0))
+    try await waitUntil { first.binaryCount == 1 }
+    let parked = first.receiveReturns
+    try await waitUntil { supply.count >= 3 }
+    let failedHandshake = supply.socket(1)
+    let resumedSocket = supply.socket(2)
+    var sawGap = false
+    var sawStreaming = false
+    if supply.count >= 3 {
+        for _ in 0..<24 {
+            guard let event = await iterator.next() else { break }
+            if case .gap = event { sawGap = true }
+            if case .state(.streaming) = event, sawGap {
+                sawStreaming = true
+                break
+            }
+        }
+    }
+    #expect(failedHandshake?.closeCount ?? 0 >= 1)
+    #expect(first.receiveReturns == parked)
+    #expect(sawGap)
+    #expect(sawStreaming)
+    if let resumedSocket {
+        try await waitUntil { resumedSocket.binaryCount >= 1 }
+        #expect(resumedSocket.binary(at: 0) == frame)
+    }
+    // A parked handshake receive ignores cancel. Release it before finish so a
+    // failed run still lets the recovery task leave the task group.
+    failedHandshake?.release()
+    first.release()
+    await engine.finish()
 }
 
 @Test func chunkFinalsAreKeptAndTheStitchedSpeechFinalIsDropped() async throws {
@@ -455,7 +523,8 @@ import TranscriptionEngine
 private func stalledEngine(
     supply: SocketSupply,
     clock: ManualClock,
-    inboundStall: Duration = .milliseconds(80)
+    inboundStall: Duration = .milliseconds(80),
+    handshakeTimeout: Duration = .seconds(2)
 ) -> GrokEngine {
     GrokEngine(track: .system, configuration: GrokEngineConfiguration(
         apiKey: "test-key",
@@ -465,7 +534,7 @@ private func stalledEngine(
             clock.advance(ms: Int(seconds(duration) * 1000))
         },
         nowMs: { clock.ms },
-        handshakeTimeout: .seconds(2),
+        handshakeTimeout: handshakeTimeout,
         inboundStall: inboundStall
     ))
 }
@@ -543,6 +612,7 @@ private final class ScriptedTransport: GrokTransport, @unchecked Sendable {
     private var texts: [String] = []
     private(set) var connectCount = 0
     private(set) var receiveReturns = 0
+    private(set) var closeCount = 0
     /// When false, `close` does not resume `receive` (a `pf` drop never delivers the close).
     var wakeReceiveOnClose = true
     /// When true, cancelling the reader does not unblock `receive`.
@@ -619,9 +689,16 @@ private final class ScriptedTransport: GrokTransport, @unchecked Sendable {
     }
 
     func close() async {
+        noteClose()
         failSends()
         guard wakeReceiveOnClose else { return }
         resumeReceives(reason: "stalled")
+    }
+
+    private func noteClose() {
+        lock.lock()
+        closeCount += 1
+        lock.unlock()
     }
 
     func release() {

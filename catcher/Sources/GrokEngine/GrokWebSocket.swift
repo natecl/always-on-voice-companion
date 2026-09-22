@@ -80,7 +80,7 @@ public final class URLSessionGrokTransport: GrokTransport, @unchecked Sendable {
         try await withTaskCancellationHandler {
             try await task.send(.string(text))
         } onCancel: {
-            task.cancel()
+            self.abort()
         }
     }
 
@@ -89,7 +89,7 @@ public final class URLSessionGrokTransport: GrokTransport, @unchecked Sendable {
         try await withTaskCancellationHandler {
             try await task.send(.data(data))
         } onCancel: {
-            task.cancel()
+            self.abort()
         }
     }
 
@@ -122,26 +122,27 @@ public final class URLSessionGrokTransport: GrokTransport, @unchecked Sendable {
                 return .closed(code: code == 0 ? 1006 : code, reason: reason)
             }
         } onCancel: {
-            task.cancel()
+            self.abort()
         }
     }
 
-    /// `cancel(with: .normalClosure)` waits to write a close frame. Under a `pf`
-    /// drop that frame never leaves, and `receive`/`send` stay parked. Cancel
-    /// the task locally and invalidate this socket's session so those calls fail
-    /// without a network round trip.
+    /// `URLSessionWebSocketTask.cancel()` does not resume `receive` when `pf`
+    /// has dropped the outbound SYN, and `cancel(with:)` waits on a close frame
+    /// that never leaves. Invalidate the session so `receive`/`send` fail locally.
+    /// The reconnect handshake task group will not return until `receive` does;
+    /// leaving it parked means `gap` and `streaming` are never yielded.
     public func close() async {
-        let handoff: (task: URLSessionWebSocketTask?, alreadyClosed: Bool) = state.withLock { state in
-            if state.closed {
-                return (nil, true)
-            }
+        abort()
+    }
+
+    private func abort() {
+        let invalidate = state.withLock { state -> Bool in
+            if state.closed { return false }
             state.closed = true
-            let task = state.task
             state.task = nil
-            return (task, false)
+            return true
         }
-        if handoff.alreadyClosed { return }
-        handoff.task?.cancel()
+        guard invalidate else { return }
         session.invalidateAndCancel()
     }
 
