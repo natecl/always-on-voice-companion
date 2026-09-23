@@ -1,0 +1,15 @@
+{
+  "b1UsdPerSessionHr": 0.25,
+  "sttBudgetUsdPerSessionHr": 0.20,
+  "phase3ReserveUsdPerSessionHr": 0.05,
+  "b1MinSessionMs": 3600000,
+  "b1MinSystemSpeechDuty": 0.40,
+  "serverUnderMeterTolerance": 0.02,
+  "reconcileTolerance": 0.05,
+  "shadowGate": {
+    "rmsFloor": 0.02,
+    "holdMs": 120,
+    "preRollMs": 300,
+    "hangoverMs": 1000
+  }
+}

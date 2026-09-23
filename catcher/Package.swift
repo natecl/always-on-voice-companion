@@ -14,9 +14,11 @@ let package = Package(
         .library(name: "SessionStore", targets: ["SessionStore"]),
         .library(name: "Pipeline", targets: ["Pipeline"]),
         .library(name: "Diagnostics", targets: ["Diagnostics"]),
+        .library(name: "Metering", targets: ["Metering"]),
     ],
     targets: [
         .target(name: "Diagnostics"),
+        .target(name: "Metering"),
         .target(
             name: "AudioCapture",
             dependencies: ["Diagnostics"]
@@ -74,6 +76,10 @@ let package = Package(
         .testTarget(
             name: "DiagnosticsTests",
             dependencies: ["Diagnostics"]
+        ),
+        .testTarget(
+            name: "MeteringTests",
+            dependencies: ["Metering"]
         ),
     ]
 )
