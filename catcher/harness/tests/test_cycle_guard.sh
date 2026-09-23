@@ -225,6 +225,11 @@ for name in ("p1_known_audio.sh", "p3_net_kill.sh", "p5_stub.sh", "p6_two_track.
 pf = (root / "p3_net_kill.sh").read_text(encoding="utf-8")
 if pf.count("sudo -n /sbin/pfctl") < 5:
     raise SystemExit("p3 pfctl wrap regressed")
+if 'ANCHOR="com.apple/catcher"' not in pf or '-a "$ANCHOR"' not in pf or "pfctl -E" not in pf:
+    raise SystemExit("p3 block is not an evaluated com.apple anchor with pf enabled")
+kill_line = pf.split("pfctl -k", 1)[1].split("\n", 1)[0]
+if kill_line.rstrip().endswith("&"):
+    raise SystemExit("p3 state kill is backgrounded, so the socket can reconnect during the block")
 if "CATCHER_ALLOW_PF" not in pf:
     raise SystemExit("CATCHER_ALLOW_PF gate missing")
 if "python3 - " in pf and '<<\'PY\'' in pf:

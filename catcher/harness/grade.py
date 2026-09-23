@@ -613,7 +613,7 @@ def grade_p3_track(gate: Gate, session: Path, rows: list[dict], track: str, pf_o
         f"{track}:gap-span",
         span >= int(t["p3MinGapSpanMs"]),
         f"gap {gap_from}-{gap_to} spans {span}ms (need {int(t['p3MinGapSpanMs'])}); "
-        + ("ok" if span >= int(t["p3MinGapSpanMs"]) else "block shorter than expected; check pfctl -a catcher -sr"),
+        + ("ok" if span >= int(t["p3MinGapSpanMs"]) else "block shorter than expected; check pfctl -a com.apple/catcher -sr"),
         PREMISE_CHECK,
     )
     # P3.b. Startup handshake and earlier heartbeat degrades are not the chain.

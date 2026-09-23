@@ -126,7 +126,7 @@ First match wins. `TRACE error=` is the underlying error (domain and code, OSSta
 
 ## P3 packet filter
 
-`catcher/harness/p3_net_kill.sh` loads and clears the `catcher` anchor only when `CATCHER_ALLOW_PF=1`. Every `pfctl` invocation in that script is `sudo -n /sbin/pfctl` (absolute path). `-n` exits when the sudoers rule is missing, so the script does not wait for a password. Those calls are required when the script is not root. In a root session they still run, and pfctl is root.
+`catcher/harness/p3_net_kill.sh` loads and clears the `com.apple/catcher` anchor only when `CATCHER_ALLOW_PF=1`. Stock `pf.conf` evaluates `anchor "com.apple/*"` and does not evaluate a top-level `catcher` anchor, so rules loaded there never match: state kill drops the live socket, the next connect succeeds, and the graded gap is about a second instead of the block. `pfctl -E` enables pf with a reference token (released on cleanup; a host that already had pf on stays on). Existing states are killed and waited on, then `api.x.ai:443` stays dropped for 15s. The 10s gap bar is unchanged. Every `pfctl` invocation in that script is `sudo -n /sbin/pfctl` (absolute path). `-n` exits when the sudoers rule is missing, so the script does not wait for a password. Those calls are required when the script is not root. In a root session they still run, and pfctl is root.
 
 Preferred Mac invoke:
 

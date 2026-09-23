@@ -28,12 +28,22 @@ export CATCHER_ENGINE=grok
 begin_harness_run "$SESSION" P3
 RULE=""
 PLAYER=""
+PF_TOKEN=""
+# Stock /etc/pf.conf evaluates anchor "com.apple/*" only. A top-level
+# "catcher" anchor is loaded and then ignored: -k drops the live socket,
+# the next connect succeeds, and the graded gap is the ~1s reconnect.
+ANCHOR="com.apple/catcher"
 cleanup() {
   if [[ -n "$PLAYER" ]]; then
     kill "$PLAYER" 2>/dev/null || true
     pkill -P "$PLAYER" afplay 2>/dev/null || true
   fi
+  sudo -n /sbin/pfctl -a "$ANCHOR" -F all >/dev/null 2>&1 || true
   sudo -n /sbin/pfctl -a catcher -F all >/dev/null 2>&1 || true
+  if [[ -n "$PF_TOKEN" ]]; then
+    sudo -n /sbin/pfctl -X "$PF_TOKEN" >/dev/null 2>&1 || true
+    PF_TOKEN=""
+  fi
   if [[ -n "$RULE" ]]; then
     rm -f "$RULE"
   fi
@@ -68,25 +78,30 @@ RULE="$(mktemp)"
   echo "block drop out quick proto { tcp udp } from any to <catcher_xai> port 443"
   echo "block drop in quick proto { tcp udp } from <catcher_xai> port 443 to any"
 } > "$RULE"
-sudo -n /sbin/pfctl -a catcher -f "$RULE"
+# -E reference-counts. Releasing the token in cleanup does not turn pf off
+# if the host already had it enabled.
+enable_out="$(sudo -n /sbin/pfctl -E 2>&1)" || {
+  echo "pfctl -E failed: $enable_out" >&2
+  exit 1
+}
+PF_TOKEN="$(printf '%s\n' "$enable_out" | sed -n 's/.*Token *: *//p' | head -n 1)"
+sudo -n /sbin/pfctl -a "$ANCHOR" -f "$RULE"
 append_harness_field "$SESSION" pfOnWallMs "$(wall_ms)"
 # pf passes a packet that matches an existing state without reading the rule.
-# Kill any such states. These run alongside the window, not before pfOn: the
-# rule is live once -f returns, and a slow pfctl here would stamp pfOn after
-# a degrade it caused.
-KILLS=()
+# Kill those states and wait before the hold. A background -k let the socket
+# die and reconnect while this script still called the block "on".
 for ip in $IPS; do
   if [[ "$ip" == *:* ]]; then any="::/0"; else any="0.0.0.0/0"; fi
-  sudo -n /sbin/pfctl -k "$any" -k "$ip" >/dev/null 2>&1 &
-  KILLS+=("$!")
+  sudo -n /sbin/pfctl -k "$any" -k "$ip" >/dev/null 2>&1 || true
 done
+# 15s after the states are gone. The engine's inbound stall is 5s, so the
+# hole that remains still spans the 10s grade bar and reaches pf off.
 sleep 15
-wait "${KILLS[@]}" 2>/dev/null || true
 # Rules first, then stamp: -F all clears rules before its slower steps, so a
 # stamp after it lands seconds after traffic can flow again.
-sudo -n /sbin/pfctl -a catcher -F rules >/dev/null 2>&1 || true
+sudo -n /sbin/pfctl -a "$ANCHOR" -F rules >/dev/null 2>&1 || true
 append_harness_field "$SESSION" pfOffWallMs "$(wall_ms)"
-sudo -n /sbin/pfctl -a catcher -F all >/dev/null 2>&1 || true
+sudo -n /sbin/pfctl -a "$ANCHOR" -F all >/dev/null 2>&1 || true
 echo "Network restored. Waiting for the system resume grade.py will grade."
 TARGET="$(resolve_session "$SESSION")"
 # The heredoc must not sit inside "$(...)". macOS bash 3.2 parses that as an
