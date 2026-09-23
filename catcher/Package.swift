@@ -47,6 +47,7 @@ let package = Package(
                 "Verifier",
                 "SessionStore",
                 "Diagnostics",
+                "Metering",
             ]
         ),
         .testTarget(
@@ -71,7 +72,7 @@ let package = Package(
         ),
         .testTarget(
             name: "PipelineTests",
-            dependencies: ["Pipeline", "TranscriptionEngine", "AudioCapture", "SessionStore", "Diagnostics"]
+            dependencies: ["Pipeline", "TranscriptionEngine", "AudioCapture", "SessionStore", "Diagnostics", "Metering"]
         ),
         .testTarget(
             name: "DiagnosticsTests",
