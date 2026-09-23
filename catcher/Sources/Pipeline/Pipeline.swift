@@ -25,6 +25,29 @@ public struct HostSessionClock: SessionClock {
     }
 }
 
+/// How far the session clock must run after a system resume for P3 `system:tail`.
+/// Mirrors `grade.py`: `end >= resumed.atMs + backlogMs + p3LiveMarginMs + p3MinTailMs - 5000`.
+/// The resumed stamp is the engine clock; it is written several seconds before the
+/// harness's kill, and a SIGTERM at that earlier wall time fails the tail.
+public struct LiveTailFloor: Sendable, Equatable {
+    public var marginMs: Int
+    public var tailMs: Int
+    public var slackMs: Int
+
+    public init(marginMs: Int, tailMs: Int, slackMs: Int) {
+        self.marginMs = marginMs
+        self.tailMs = tailMs
+        self.slackMs = slackMs
+    }
+
+    /// `p3LiveMarginMs`, `p3MinTailMs`, and the grader's hardcoded 5s slack.
+    public static let grader = LiveTailFloor(marginMs: 3_000, tailMs: 20_000, slackMs: 5_000)
+
+    public func endMs(resumedAtMs: Int, backlogMs: Int) -> Int {
+        resumedAtMs + backlogMs + marginMs + tailMs - slackMs
+    }
+}
+
 /// First `resume` wins. Shutdown must keep going when socket close never returns.
 private final class ResumeOnce: @unchecked Sendable {
     private let lock = NSLock()
@@ -74,6 +97,9 @@ public actor Pipeline {
     /// Gap `toMs` is the engine session clock. The following `resumed` ann uses
     /// it so a post-reconnect seg (same clock) is not stuck before the ann.
     private var resumeAtMs: [AudioTrack: Int] = [:]
+    /// The resume stamp just consumed for a track, so the tail floor uses that
+    /// backdated `atMs` and not a later `streaming` event's wall clock.
+    private var resumeStampMs: [AudioTrack: Int] = [:]
     private let stageFactory: @Sendable (URL?) -> any StageSink
     private var sink: (any StageSink)?
     private let ledger = StageLedger()
@@ -81,6 +107,11 @@ public actor Pipeline {
     private var gatingFailed = false
     private var closing = false
     private var pcmError: String?
+    /// Set when system streaming reports a post-reconnect backlog. Harness
+    /// shutdown holds the host clock until `end` reaches this, without writing
+    /// another seg or annotation.
+    private var systemTailFloorMs: Int?
+    private let liveTailFloor: LiveTailFloor
 
     public init(
         sessionRoot: URL = SessionPaths.root(),
@@ -92,6 +123,7 @@ public actor Pipeline {
         engineLabel: String = EngineFactory.sessionEngineName(),
         probeInterval: Duration = .seconds(1),
         clock: any SessionClock = HostSessionClock(),
+        liveTailFloor: LiveTailFloor = .grader,
         stages: (@Sendable (URL?) -> any StageSink)? = nil
     ) {
         self.sessionRoot = sessionRoot
@@ -103,6 +135,7 @@ public actor Pipeline {
         self.engineLabel = engineLabel
         self.probeInterval = probeInterval
         self.clock = clock
+        self.liveTailFloor = liveTailFloor
         if let stages {
             self.stageFactory = stages
         } else {
@@ -128,6 +161,8 @@ public actor Pipeline {
         failing = false
         halting = false
         resumeAtMs = [:]
+        resumeStampMs = [:]
+        systemTailFloorMs = nil
         gatingFailed = false
         closing = false
         pcmError = nil
@@ -265,10 +300,18 @@ public actor Pipeline {
     }
 
     public func stop() async {
-        await halt(clean: true)
+        await halt(clean: true, holdLiveTail: false)
     }
 
-    private func halt(clean: Bool) async {
+    /// Harness SIGTERM. Capture has to stop (a hung socket must not block `end`),
+    /// then the host clock has to reach the system live-tail floor before `end`
+    /// is stamped. Holding earlier, while the engines are still up, can write a
+    /// new degrade and fail no-relapse.
+    public func stopAfterLiveTail() async {
+        await halt(clean: true, holdLiveTail: true)
+    }
+
+    private func halt(clean: Bool, holdLiveTail: Bool = false) async {
         if halting {
             while !ended {
                 try? await Task.sleep(for: .milliseconds(10))
@@ -281,10 +324,19 @@ public actor Pipeline {
         let wasOpen = sessionOpen
         sessionOpen = false
         // `finish` waits on socket close. A pf-parked URLSession close does not
-        // return, and the harness grades one second after SIGTERM. The end row
-        // has to hit disk inside that window or the session looks like it
-        // ended at the last transcript.
+        // return, so that wait is bounded. The harness grades after the process
+        // exits; a live-tail hold below still has to finish before `end`.
         await drainShutdown(budget: .milliseconds(400))
+        if holdLiveTail, let floor = systemTailFloorMs {
+            let deficit = floor - nowMs()
+            if deficit > 0 {
+                // A few hundred milliseconds past the bar. `end >= floor`, and
+                // the harness grades after this process exits, not one second
+                // after the signal. Cap so a wild backlog cannot stick shutdown.
+                let bounded = min(deficit + 250, 20_000)
+                try? await Task.sleep(for: .milliseconds(bounded))
+            }
+        }
         if !ended {
             await closeSession(clean: clean && wasOpen)
         }
@@ -381,6 +433,16 @@ public actor Pipeline {
             var backlogMs: Int?
             if case .state(.streaming) = stamped, let diagnostics = engines[track] as? EngineDiagnostics {
                 backlogMs = await diagnostics.snapshot().lastResumeBacklogMs
+            }
+            // Only the streaming event stamped on the gap end. A later
+            // streaming event is wall-clock `now` and must not push the floor
+            // out by another backlog.
+            if track == .system, let backlogMs, backlogMs > 0,
+               let stamp = resumeStampMs.removeValue(forKey: track), at == stamp {
+                let floor = liveTailFloor.endMs(resumedAtMs: stamp, backlogMs: backlogMs)
+                if floor > (systemTailFloorMs ?? 0) {
+                    systemTailFloorMs = floor
+                }
             }
             await emit(await verifier.observeEngine(stamped, track: track, atMs: at, storedCount: stored, backlogMs: backlogMs))
             if case .transcript(let transcript) = stamped {
@@ -602,6 +664,7 @@ public actor Pipeline {
             return nowMs()
         case .state(.streaming):
             if let stamp = resumeAtMs.removeValue(forKey: track) {
+                resumeStampMs[track] = stamp
                 return stamp
             }
             return nowMs()

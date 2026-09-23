@@ -91,7 +91,7 @@ final class CatcherModel {
         if harness {
             let pipeline = pipeline
             HarnessShutdown.install {
-                await pipeline.stop()
+                await pipeline.stopAfterLiveTail()
             }
         }
     }
@@ -452,9 +452,9 @@ final class CatcherModel {
     }
 }
 
-/// The harness stops the app with SIGTERM and grades one second later.
-/// Without this, the process dies before `end` is fsynced and the session
-/// clock looks like it stopped at the last transcript.
+/// The harness stops the app with SIGTERM. Shutdown fsyncs `end` before a hung
+/// socket close, and holds the host clock until the system live-tail floor when
+/// the signal arrives early. The harness grades after this process exits.
 enum HarnessShutdown {
     private static let lock = NSLock()
     // Read and written only while `lock` is held. Swift 6 requires

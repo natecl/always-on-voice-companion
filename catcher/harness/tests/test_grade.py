@@ -430,6 +430,12 @@ class P3Tests(TempRoot):
         p3_run(self.root)
         self.assertIn("system:tail", failed(run("P3", p3_good(self, end=55000).write())))
 
+    def test_tail_horizon_matches_the_859205c_board(self) -> None:
+        # resumed 52742 + backlog 18020 + margin 3000 = liveFrom 73762.
+        # need = liveFrom + 20000 - 5000 = 88762. The run ended at 81478.
+        self.assertEqual(grade.p3_system_tail_need_ms(52742, 18020), 88762)
+        self.assertLess(81478, 88762)
+
     def test_resume_while_pf_on_is_invalid(self) -> None:
         p3_run(self.root, pf_on=5000, pf_off=40000)
         result = run("P3", p3_good(self).write())

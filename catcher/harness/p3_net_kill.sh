@@ -3,7 +3,8 @@
 # The fixture loops the whole time so there is live speech before, during,
 # and after the block. pf on/off wall times go into harness_run.json. After
 # the rule clears the script waits for resumed on the system track, then
-# keeps recording for backlogMs + the live tail before it stops the app.
+# keeps the session clock running until system:tail's horizon
+# (resumed.atMs + backlogMs + margin + 20s - 5s) before it stops the app.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 source "$ROOT/lib.sh"
@@ -49,12 +50,38 @@ pfctl -a catcher -F all || true
 append_harness_field "$SESSION" pfOffWallMs "$(wall_ms)"
 echo "Network restored. Waiting for resumed track=system (up to p3ResumeWithinMs)."
 TARGET="$(resolve_session "$SESSION")"
-WAIT_S="$(python3 - "$TARGET" "$ROOT/thresholds.json" <<'PY'
+NEED="$(python3 - "$TARGET" "$ROOT/thresholds.json" "$ROOT" <<'PY'
 import json, re, sys, time
-session, thresholds = sys.argv[1], json.load(open(sys.argv[2]))
+from datetime import datetime
+
+session, thresholds_path, root = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, root)
+from grade import p3_system_tail_need_ms
+
+thresholds = json.load(open(thresholds_path))
 deadline = time.time() + thresholds["p3ResumeWithinMs"] / 1000
-tail = thresholds["p3MinTailMs"] + thresholds["p3LiveMarginMs"]
-while time.time() < deadline:
+
+
+def session_started_ms(lines):
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("t") != "session":
+            continue
+        raw = row.get("startedAt")
+        if not isinstance(raw, str):
+            return None
+        try:
+            return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp() * 1000)
+        except ValueError:
+            return None
+    return None
+
+
+found = None
+while time.time() < deadline and found is None:
     try:
         lines = open(f"{session}/events.jsonl", encoding="utf-8").read().splitlines()
     except OSError:
@@ -67,24 +94,60 @@ while time.time() < deadline:
             continue
         detail = row.get("detail")
         if row.get("kind") == "gap" and isinstance(detail, dict) and detail.get("track") == "system":
-            gap_span = detail.get("toMs", 0) - detail.get("fromMs", 0)
-        if row.get("kind") == "resumed" and isinstance(detail, str) and "track=system" in detail and gap_span is not None:
+            gap_span = int(detail.get("toMs", 0)) - int(detail.get("fromMs", 0))
+        # The heartbeat resumed (no backlog, before this gap) is not the chain.
+        if (
+            row.get("kind") == "resumed"
+            and isinstance(detail, str)
+            and "track=system" in detail
+            and gap_span is not None
+        ):
             match = re.search(r"backlogMs=(\d+)", detail)
-            backlog = int(match.group(1)) if match else gap_span + thresholds["p3FallbackReplayMs"]
-            print((backlog + tail) // 1000 + 1)
-            raise SystemExit(0)
-    time.sleep(0.5)
-print(0)
+            backlog = int(match.group(1)) if match else gap_span + int(thresholds["p3FallbackReplayMs"])
+            found = (session_started_ms(lines), int(row.get("atMs", 0)), backlog)
+            break
+    if found is None:
+        time.sleep(0.5)
+
+if found is None:
+    print(0)
+    raise SystemExit(0)
+
+started, resumed_at, backlog = found
+need = p3_system_tail_need_ms(resumed_at, backlog, thresholds)
+# Kill a second past the bar so the end stamp still satisfies end >= need.
+target = need + 1000
+if started is None:
+    time.sleep(max(0, target - resumed_at) / 1000)
+    print(need)
+    raise SystemExit(0)
+
+# Same map as grade.py's pf window: unix ms minus the session header.
+# Cap the wait so a bad header cannot hang the gate.
+cap = time.time() + 90
+while time.time() < cap:
+    session_now = int(time.time() * 1000) - started
+    if session_now >= target:
+        break
+    time.sleep(0.25)
+print(need)
 PY
 )"
-if [[ "$WAIT_S" == "0" ]]; then
+if [[ "$NEED" == "0" ]]; then
   echo "No resumed track=system within the resume window. Stopping; the grade will say why." >&2
 else
-  echo "Resumed. Recording ${WAIT_S}s more (backlog + live tail)."
-  sleep "$WAIT_S"
+  echo "Session clock covered system:tail (need end >= ${NEED})."
 fi
-kill "$(cat "$SESSION/catcher.pid")" || true
-sleep 1
+PID="$(cat "$SESSION/catcher.pid")"
+kill "$PID" || true
+# stopAfterLiveTail may still be holding the host clock. Grade after it exits
+# so the end row is the post-hold stamp, not the pre-hold transcript.
+for _ in $(seq 1 100); do
+  if ! kill -0 "$PID" 2>/dev/null; then
+    break
+  fi
+  sleep 0.25
+done
 cleanup
 PLAYER=""
 python3 "$ROOT/grade.py" --session "$TARGET" --gate P3

@@ -523,6 +523,18 @@ def session_end_ms(rows: list[dict]) -> int:
     return last
 
 
+def p3_system_tail_need_ms(resumed_at: int, backlog_ms: int, thresholds: dict | None = None) -> int:
+    """Session clock `system:tail` requires.
+
+    `liveFrom = resumed.atMs + backlogMs + p3LiveMarginMs`, then
+    `end >= liveFrom + p3MinTailMs - 5000`. The 5s slack is the grader's,
+    not a thresholds.json key. `Pipeline.LiveTailFloor.grader` matches this.
+    """
+    t = THRESHOLDS if thresholds is None else thresholds
+    live_from = resumed_at + backlog_ms + int(t["p3LiveMarginMs"])
+    return live_from + int(t["p3MinTailMs"]) - 5000
+
+
 def grade_p3(gate: Gate, session: Path, rows: list[dict], run: dict | None) -> None:
     """Clocks: pfOn/pfOff are wall time mapped through startedAt; ann and
     seg times are the engine's rebased session clock. Evidence prints both."""
@@ -644,7 +656,7 @@ def grade_p3_track(gate: Gate, session: Path, rows: list[dict], track: str, pf_o
     gate.check(f"{track}:no-relapse", not relapses, "; ".join(relapses) or "no degrade or gap left open after resume")
     if track == "system":
         end = session_end_ms(rows)
-        need_end = live_from + int(t["p3MinTailMs"]) - 5000
+        need_end = p3_system_tail_need_ms(resumed_at, assumed, t)
         gate.check(f"{track}:tail", end >= need_end, f"session ends at {end}, need {need_end} (liveFrom + tail - 5s)")
 
 

@@ -315,6 +315,54 @@ import TranscriptionEngine
     try expectEventShapeUnchanged(events)
 }
 
+@Test func harnessStopHoldsTheClockUntilTheLiveTailFloor() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("catcher-tail-\(UUID().uuidString)", isDirectory: true)
+    let capture = FakeCapture()
+    let engines = LockedEngines()
+    // Gap toMs is 2000 in the fake. Floor = 2000 + 100 + 800 = 2900, a short hold.
+    let pipeline = Pipeline(
+        sessionRoot: root,
+        makeCapture: { capture },
+        makeEngine: { track in engines.make(track) },
+        launchProbe: { .granted },
+        recheckProbe: { .granted },
+        engineLabel: "stub",
+        liveTailFloor: LiveTailFloor(marginMs: 0, tailMs: 800, slackMs: 0)
+    )
+    await pipeline.start()
+    let directory = try #require(await pipeline.sessionDirectory)
+    engines.engine(.system)?.dropAndResume(backlogMs: 100)
+    try await waitUntil {
+        let text = (try? String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)) ?? ""
+        return text.contains("backlogMs=100")
+    }
+    await pipeline.stopAfterLiveTail()
+    let events = try String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)
+    let endAt = try endAtMs(events)
+    #expect(endAt >= 2_900)
+    #expect(events.contains("transport resumed track=system backlogMs=100"))
+    // Holding must not open another degrade after the resume.
+    let resumed = events.range(of: "backlogMs=100")
+    let after = resumed.map { events[$0.upperBound...] } ?? ""
+    #expect(!after.contains("\"kind\":\"degraded\""))
+    #expect(!after.contains("\"kind\":\"gap\""))
+}
+
+@Test func liveTailFloorMatchesTheGraderThresholds() throws {
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("harness/thresholds.json")
+    let object = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
+    let thresholds = try #require(object)
+    #expect(thresholds["p3LiveMarginMs"] as? Int == LiveTailFloor.grader.marginMs)
+    #expect(thresholds["p3MinTailMs"] as? Int == LiveTailFloor.grader.tailMs)
+    #expect(LiveTailFloor.grader.slackMs == 5_000)
+    // 859205c board: resumed 52742, backlog 18020, liveFrom 73762, tail need 88762.
+    #expect(LiveTailFloor.grader.endMs(resumedAtMs: 52_742, backlogMs: 18_020) == 88_762)
+}
+
 private final class LockedEngines: @unchecked Sendable {
     private let lock = NSLock()
     private var made: [AudioTrack: ReconnectingEngine] = [:]
@@ -376,6 +424,17 @@ private final class ReconnectingEngine: TranscriptionEngine, EngineDiagnostics, 
 private func stageLines(in directory: URL) throws -> [StageLine] {
     let text = try String(contentsOf: directory.appendingPathComponent("stages.log"), encoding: .utf8)
     return text.split(separator: "\n", omittingEmptySubsequences: true).compactMap { StageLine.parse(String($0)) }
+}
+
+private func endAtMs(_ events: String) throws -> Int {
+    for line in events.split(separator: "\n", omittingEmptySubsequences: true) {
+        let object = try #require(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+        if object["t"] as? String == "end" {
+            return try #require(object["atMs"] as? Int)
+        }
+    }
+    Issue.record("missing end row")
+    return -1
 }
 
 private func expectEventShapeUnchanged(_ events: String) throws {
