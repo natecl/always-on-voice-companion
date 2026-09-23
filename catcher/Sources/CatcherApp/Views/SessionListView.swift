@@ -1,3 +1,4 @@
+import Brief
 import SessionStore
 import SwiftUI
 
@@ -7,7 +8,17 @@ struct SessionListView: View {
     var sessions: [SessionSummary]
     var selection: String?
     var transcript: String
+    var notesEnabled: Bool = false
+    var notes: NotesSurface = .idle
+    var transcriptRows: [NotesTranscriptRow] = []
     var onSelect: (String?) -> Void
+    var onCopyNotes: () -> Void = {}
+    var onCopyBlock: (String) -> Void = { _ in }
+    var onRetry: () -> Void = {}
+    var onMakeNotes: () -> Void = {}
+    var onCopyTranscript: () -> Void = {}
+
+    @State private var citeTarget: Int?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -33,7 +44,42 @@ struct SessionListView: View {
                 }
                 .frame(minHeight: 120)
             }
-            if !transcript.isEmpty {
+            if notesEnabled {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        NotesView(
+                            surface: notes,
+                            onCopyNotes: onCopyNotes,
+                            onCopyBlock: onCopyBlock,
+                            onRetry: onRetry,
+                            onMakeNotes: onMakeNotes,
+                            onCopyTranscript: onCopyTranscript,
+                            onCite: { citeTarget = $0 }
+                        )
+                        if transcriptRows.isEmpty {
+                            if !transcript.isEmpty {
+                                Text(transcript)
+                                    .font(.callout.monospaced())
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        } else {
+                            ForEach(transcriptRows) { row in
+                                Text(row.text)
+                                    .font(.callout.monospaced())
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .id(row.seq)
+                            }
+                        }
+                    }
+                    .frame(minHeight: 180)
+                    .onChange(of: citeTarget) { _, seq in
+                        guard let seq else { return }
+                        proxy.scrollTo(seq, anchor: .center)
+                    }
+                }
+            } else if !transcript.isEmpty {
                 Text(transcript)
                     .font(.callout.monospaced())
                     .textSelection(.enabled)

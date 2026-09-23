@@ -14,6 +14,7 @@ let package = Package(
         .library(name: "SessionStore", targets: ["SessionStore"]),
         .library(name: "Pipeline", targets: ["Pipeline"]),
         .library(name: "Diagnostics", targets: ["Diagnostics"]),
+        .library(name: "Brief", targets: ["Brief"]),
     ],
     targets: [
         .target(name: "Diagnostics"),

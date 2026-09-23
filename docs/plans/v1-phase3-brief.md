@@ -315,6 +315,8 @@ A live 5× timing run did not happen: this environment has no `XAI_API_KEY`. `br
 
 A stub-engine pass of the same fixture on this Linux VM (not B3 evidence) reported stage times of read 62 ms, request 4 ms, validate 1 ms, write 36 ms, total 103 ms. The fixture file was not modified.
 
+Slice 4 is in the tree: `NotesView`, the clipboard payload (`public.utf8-plain-text` and `public.html` in one declare), the `toggle()` adapter, and SIGUSR1 (stop and stay up, only when `CATCHER_HARNESS=1` and `CATCHER_BRIEF=1`). SIGTERM is unchanged. None of this is Mac-graded. Slice 5 (B3 harness and QA doc) has not started. The keyed bake-off is still required before B3 QA.
+
 ## 10. Done-check for this plan's IMPLEMENT climb
 
 IMPLEMENT is done when all of the following hold:

@@ -71,7 +71,7 @@ public enum BriefRunMode: String, Sendable, Equatable {
     case manual
 }
 
-/// When notes run. The app calls this in a later slice; v0 gates do not.
+/// When notes run. Harness gates stay off unless `CATCHER_BRIEF=1`.
 public enum BriefLaunchPolicy {
     /// Harness runs (the v0 gates) leave notes off unless `CATCHER_BRIEF=1`.
     /// Outside the harness, notes are on unless `CATCHER_BRIEF=0`.
