@@ -2,6 +2,8 @@
 
 A failed or empty take writes a checkpoint for each pipeline stage, then two `TRACE` lines naming the first failure and a probable fix. These files do not grade P1–P6. `grade.py` never reads them. v0 stays red until a Mac `grade.json` has P1–P6 all `pass`.
 
+**Last green run:** `95837a8` on 2026-09-23. CDHash `62450598` (8 characters, as on the board). Board: `/tmp/catcher-auto/95837a8-20260923-003139/board.json` on the grading Mac. That file is not in git. Any later code change needs a new Mac run. See [v0 grading](v0-grading.md).
+
 ## Where the lines go
 
 | File | When |

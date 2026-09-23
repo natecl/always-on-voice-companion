@@ -4,6 +4,14 @@ Catcher v0 is system audio + mic → transcription → a verified transcript on 
 
 v0 stays red until `grade.json` from a Mac run has P1–P6 all `pass`.
 
+**Last green run:** `95837a8` on 2026-09-23. CDHash `62450598` (8 characters, as on the board). Board: `/tmp/catcher-auto/95837a8-20260923-003139/board.json` on the grading Mac. That file is not in git. Any later code change needs a new Mac run.
+
+## Autonomous grading
+
+`cua-driver` is Mac-side autonomous grade tooling, installed on Nathan's Mac for QA via Grok Bot and cua-driver. Scripts live under `/Users/n.chinlue/qa/catcher/`. It is not product code in `catcher/Sources`, and it does not ship inside the app bundle.
+
+It can drive the six gates end to end (grants and gate prompts) and write one `board.json`. The per-gate `grade.json` is still the verdict. Only a Mac `grade.json` or board with P1–P6 `pass` counts. The board path above is the `95837a8` evidence; it is not committed here.
+
 ## One-time setup
 
 1. macOS 15 or newer. Xcode with the macOS 15 SDK. [XcodeGen](https://github.com/yonaskolb/XcodeGen) on `PATH`. Python 3.
@@ -64,14 +72,16 @@ Library CI (`.github/workflows/catcher-ci.yml` on `macos-15`) runs `swift build`
 
 | Gate | What you do | Pass |
 |---|---|---|
-| **P1** | `run.sh p1 <dir>` plays the fixture, `kill -9`s the app, relaunches so crash recovery runs, then grades. | System-track WER ≤ 15 % against `known-60s.ref.txt`, no >2 s hole in system speech (uses `system.pcm` when present), and a recovered session. |
+| **P1**[^p1-fixture] | `run.sh p1 <dir>` plays the fixture, `kill -9`s the app, relaunches so crash recovery runs, then grades. | System-track WER ≤ 15 % against `known-60s.ref.txt`, no >2 s hole in system speech (uses `system.pcm` when present), and a recovered session. |
 | **P2** | `CATCHER_ALLOW_TCC_RESET=1 run.sh p2 <dir>`. The script runs `tccutil reset ScreenCapture com.catcher.app` and waits for you to re-grant. The score is the session that was recording at the reset. | An `ann` with `kind: blocked` on that live session within 2 s of the revoke, and no `seg` after that timestamp. |
-| **P3** | As root, `CATCHER_ALLOW_PF=1 run.sh p3 <dir>`. Blocks `api.x.ai:443` for 15 s, then clears the rule. After the rule clears, wait for the reconnect backoff (1, 2, 4, 8 s) before pressing enter. | `ann` rows `degraded`, then `gap`, then `resumed`, then a `seg` at or after resume. |
+| **P3** | As root, `CATCHER_ALLOW_PF=1 run.sh p3 <dir>`. Blocks `api.x.ai:443` for 15 s, then clears the rule. After the rule clears, wait for the reconnect backoff (1, 2, 4, 8, 16 s, capped at 30 s) before pressing enter. | `ann` rows `degraded`, then `gap`, then `resumed`, then a `seg` at or after resume. |
 | **P4** | Mute output, stay quiet, `run.sh p4 <dir>`. | `ann` `kind: noAudio` with `atMs` between 0 and 10000. |
 | **P5** | `run.sh p5 <stub-dir> <grok-session-dir>`. Forces `CATCHER_ENGINE=stub` and replays the fixture. | JSONL row types and keys match the schema and the Grok session's shape. Transcript text is not compared. |
 | **P6** | `run.sh p6 <dir>` while you talk over the fixture. | At least one `seg` on `microphone` and one on `system`, and a non-null `speaker` on a system `seg`. |
 
 P2 and P3 refuse to touch TCC or the packet filter unless the matching `CATCHER_ALLOW_*` variable is `1`.
+
+[^p1-fixture]: The committed `catcher/harness/fixtures/known-60s.wav` is still the carrier in setup step 6. This refresh does not replace it. P1 `pass` on the `95837a8` board is that Mac grade; the wav from the green run is not in git.
 
 Score one session by hand:
 
@@ -87,3 +97,5 @@ python3 catcher/harness/wer.py --ref catcher/harness/fixtures/known-60s.ref.txt 
 ## What a pass is not
 
 `swift test` passing, a stub session, or this document existing does not grade v0. QA copies `grade.json` out of the session directory from the Mac that ran the six gates. Until those six results are `pass`, v0 is red.
+
+A Linux VM `swift test`, or a VM-only harness run, is not P1–P6. Report that result as "not a Mac P-gate pass". The `macos-15` library CI run (`swift build` and `swift test`) is the same kind of result.
