@@ -140,7 +140,11 @@ def format_fields(prefix: str, fields: list[tuple[str, str]]) -> str:
 
 def verdict_lines(lines: list[dict]) -> list[dict]:
     last: dict[str, int] = {}
-    stages = [(index, line) for index, line in enumerate(lines) if line["kind"] == "STAGE"]
+    stages = [
+        (index, line)
+        for index, line in enumerate(lines)
+        if line["kind"] == "STAGE" and line["name"] in STAGE_ORDER
+    ]
     for index, line in stages:
         track = field(line, "track") or ""
         last[f"{line['name']}\t{track}"] = index
@@ -334,6 +338,7 @@ STAGE frames-received OK system=1002 microphone=1000 invalid=0 empty=0
 STAGE pcm-extract OK system=1002 microphone=1000 failed=0 osstatus=0 zeroEnergy=system
 STAGE api-stream OK system=320000 microphone=320000 pending=0 sendErrors=0
 STAGE segments-received FAIL system=0 microphone=3 partials=4 blankDropped=21 restated=0 apiErrors=0
+STAGE reconnect OK track=system attempt=1 code=1006 reason="inbound stall"
 STAGE transcript-write OK bytes=88 segments=3 recovered=false
 """
 

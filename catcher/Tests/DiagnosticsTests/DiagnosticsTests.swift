@@ -58,10 +58,11 @@ import Testing
     STAGE pcm-extract OK system=1002 microphone=1000 failed=0 osstatus=0 zeroEnergy=system
     STAGE api-stream OK system=320000 microphone=320000 pending=0 sendErrors=0
     STAGE segments-received FAIL system=0 microphone=3 partials=4 blankDropped=21 restated=0 apiErrors=0
+    STAGE reconnect OK track=system attempt=1 code=1006 reason="inbound stall"
     STAGE transcript-write OK bytes=88 segments=3 recovered=false
     """
     let lines = raw.split(separator: "\n").compactMap { StageLine.parse(String($0)) }
-    #expect(lines.count == 9)
+    #expect(lines.count == 10)
     let report = FailureTrace.report(lines: lines)
     #expect(report.lastOK == "api-stream")
     #expect(report.firstFail == "segments-received")

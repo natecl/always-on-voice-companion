@@ -58,7 +58,9 @@ public enum FailureTrace {
     /// Checkpoint lines are rewritten at close. `api-connect` keeps one line per track.
     public static func verdictLines(_ lines: [StageLine]) -> [StageLine] {
         var lastIndex: [String: Int] = [:]
-        for (index, line) in lines.enumerated() where line.kind == .stage {
+        // Names outside the eight checkpoints (reconnect) are a dig trail.
+        // They must not become last-ok or first-fail.
+        for (index, line) in lines.enumerated() where line.kind == .stage && line.stage != nil {
             let track = line.field("track") ?? ""
             lastIndex["\(line.name ?? "")\t\(track)"] = index
         }

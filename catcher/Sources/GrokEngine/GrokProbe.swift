@@ -1,5 +1,8 @@
 import Diagnostics
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public struct AuthProbeResult: Sendable, Equatable {
     public var http: Int?

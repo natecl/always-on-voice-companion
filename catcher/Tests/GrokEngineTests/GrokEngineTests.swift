@@ -363,6 +363,7 @@ import TranscriptionEngine
             }
         }
     }
+    try await waitUntil { (failedHandshake?.closeCount ?? 0) >= 1 }
     #expect(failedHandshake?.closeCount ?? 0 >= 1)
     #expect(first.receiveReturns == parked)
     #expect(sawGap)
@@ -375,6 +376,73 @@ import TranscriptionEngine
     // failed run still lets the recovery task leave the task group.
     failedHandshake?.release()
     first.release()
+    await engine.finish()
+}
+
+@Test func hungCloseStillEmitsGapAndStreaming() async throws {
+    let clock = ManualClock()
+    let supply = SocketSupply()
+    supply.configure = { index, socket in
+        if index == 0 || index == 1 {
+            // Mac URLSession: close() does not return while the dropped
+            // receive is parked, and cancel does not resume it. The in-window
+            // retry's connect parks the same way.
+            socket.wakeReceiveOnClose = false
+            socket.ignoreReceiveCancel = true
+            socket.hangClose = true
+        }
+        if index == 1 {
+            socket.hangConnect = true
+        }
+        if index >= 2 {
+            socket.push(.text(#"{"type":"transcript.created"}"#))
+        }
+    }
+    let engine = stalledEngine(
+        supply: supply,
+        clock: clock,
+        inboundStall: .milliseconds(250),
+        handshakeTimeout: .milliseconds(300)
+    )
+    defer {
+        supply.socket(0)?.release()
+        supply.socket(1)?.release()
+    }
+    var iterator = engine.events.makeAsyncIterator()
+    let connecting = Task { try await engine.connect(track: .system) }
+    try await waitUntil { supply.count >= 1 }
+    let first = try #require(supply.socket(0))
+    first.push(.text(#"{"type":"transcript.created"}"#))
+    try await connecting.value
+    let frame = Data(repeating: 9, count: 3_200)
+    try await engine.send(PCMFrame(track: .system, data: frame, hostTime: 0))
+    try await waitUntil { first.binaryCount == 1 }
+    let parked = first.receiveReturns
+    try await waitUntil { supply.count >= 3 }
+    let stalledClose = supply.socket(0)
+    let parkedConnect = supply.socket(1)
+    var sawGap = false
+    var sawStreaming = false
+    for _ in 0..<24 {
+        guard let event = await iterator.next() else { break }
+        if case .gap = event { sawGap = true }
+        if case .state(.streaming) = event, sawGap {
+            sawStreaming = true
+            break
+        }
+    }
+    #expect(sawGap)
+    #expect(sawStreaming)
+    #expect(first.receiveReturns == parked)
+    #expect(stalledClose?.closeCount ?? 0 >= 1)
+    #expect(stalledClose?.closeFinished == 0)
+    #expect(parkedConnect?.connectFinished == 0)
+    if let resumed = supply.socket(2) {
+        try await waitUntil { resumed.binaryCount >= 1 }
+        #expect(resumed.binary(at: 0) == frame)
+    }
+    stalledClose?.release()
+    parkedConnect?.release()
     await engine.finish()
 }
 
@@ -614,12 +682,22 @@ private final class ScriptedTransport: GrokTransport, @unchecked Sendable {
     private(set) var connectCount = 0
     private(set) var receiveReturns = 0
     private(set) var closeCount = 0
+    /// How many `close()` calls have returned. A `pf`-parked URLSession close stays at 0.
+    private(set) var closeFinished = 0
+    /// How many `connect()` calls have returned. A dropped SYN stays at 0.
+    private(set) var connectFinished = 0
     /// When false, `close` does not resume `receive` (a `pf` drop never delivers the close).
     var wakeReceiveOnClose = true
     /// When true, cancelling the reader does not unblock `receive`.
     var ignoreReceiveCancel = false
+    /// When true, `close()` does not return until `release()` (Mac `task.cancel()` on a parked receive).
+    var hangClose = false
+    /// When true, `connect()` does not return until `release()` (Mac `URLSession` connect while `pf` drops the SYN).
+    var hangConnect = false
     /// Hang once this many sends have already completed. `Int.max` never hangs.
     var hangSendsAfter = Int.max
+    private var closeWaiters: [CheckedContinuation<Void, Never>] = []
+    private var connectWaiters: [CheckedContinuation<Void, Never>] = []
 
     var binaryCount: Int {
         lock.lock()
@@ -648,6 +726,14 @@ private final class ScriptedTransport: GrokTransport, @unchecked Sendable {
 
     func connect(url: URL, authorizationBearer: String) async throws {
         noteConnect()
+        if hangConnect {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                lock.lock()
+                connectWaiters.append(continuation)
+                lock.unlock()
+            }
+        }
+        noteConnectFinished()
     }
 
     func sendText(_ text: String) async throws {
@@ -692,6 +778,16 @@ private final class ScriptedTransport: GrokTransport, @unchecked Sendable {
     func close() async {
         noteClose()
         failSends()
+        if hangClose {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                lock.lock()
+                closeWaiters.append(continuation)
+                lock.unlock()
+            }
+            noteCloseFinished()
+            return
+        }
+        noteCloseFinished()
         guard wakeReceiveOnClose else { return }
         resumeReceives(reason: "stalled")
     }
@@ -705,6 +801,40 @@ private final class ScriptedTransport: GrokTransport, @unchecked Sendable {
     func release() {
         failSends()
         resumeReceives(reason: "released")
+        resumeClosers()
+        resumeConnects()
+    }
+
+    private func noteCloseFinished() {
+        lock.lock()
+        closeFinished += 1
+        lock.unlock()
+    }
+
+    private func noteConnectFinished() {
+        lock.lock()
+        connectFinished += 1
+        lock.unlock()
+    }
+
+    private func resumeClosers() {
+        lock.lock()
+        let pending = closeWaiters
+        closeWaiters.removeAll()
+        lock.unlock()
+        for waiter in pending {
+            waiter.resume()
+        }
+    }
+
+    private func resumeConnects() {
+        lock.lock()
+        let pending = connectWaiters
+        connectWaiters.removeAll()
+        lock.unlock()
+        for waiter in pending {
+            waiter.resume()
+        }
     }
 
     private func failSends() {
@@ -712,8 +842,14 @@ private final class ScriptedTransport: GrokTransport, @unchecked Sendable {
         let pending = sendWaiters
         sendWaiters.removeAll()
         lock.unlock()
-        for waiter in pending {
-            waiter.resume(throwing: EngineError.socket("send stalled"))
+        // Resume off this stack. A synchronous resume re-enters the engine
+        // while `close` is still on the call that `socketDied` has not left,
+        // and the PCM `Data` buffer is not safe to mutate from both.
+        guard !pending.isEmpty else { return }
+        Task.detached {
+            for waiter in pending {
+                waiter.resume(throwing: EngineError.socket("send stalled"))
+            }
         }
     }
 

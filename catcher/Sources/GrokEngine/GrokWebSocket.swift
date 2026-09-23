@@ -146,10 +146,11 @@ public final class URLSessionGrokTransport: GrokTransport, @unchecked Sendable {
     }
 
     /// `URLSessionWebSocketTask.receive()` does not resume when `pf` drops the
-    /// outbound SYN, and `invalidateAndCancel()` only did so for the first
-    /// parked handshake. Resume our own continuations here so `close` always
-    /// unblocks `receive`/`send`. Do not invalidate the session: that waits on
-    /// the same parked task and stalls the next `URLSession`.
+    /// outbound SYN, and `invalidateAndCancel()` waits on that same parked
+    /// task. `cancel()` on the calling thread can wait too: the Mac P3 run
+    /// never got past teardown, so reconnect never yielded `gap`. Resume our
+    /// continuations and cancel the task off this call stack, and return
+    /// without waiting for either. Do not invalidate the session.
     public func close() async {
         abort()
     }
@@ -165,16 +166,13 @@ public final class URLSessionGrokTransport: GrokTransport, @unchecked Sendable {
             state.task = nil
             return (task, receives, sends)
         }
-        for continuation in taken.1 {
-            continuation.resume(returning: .closed(code: 1006, reason: "websocket is not connected"))
-        }
-        for continuation in taken.2 {
-            continuation.resume(throwing: EngineError.socket("websocket is not connected"))
-        }
-        taken.0?.cancel()
         // A custom session deallocated with a task still inside the dropped
-        // handshake can crash. Keep it alive; `cancel` already dropped the socket.
+        // handshake can crash. Keep it alive across the detached cancel.
         SessionHold.shared.keep(session)
+        let teardown = SocketTeardown(task: taken.0, receives: taken.1, sends: taken.2)
+        Task.detached {
+            teardown.run()
+        }
     }
 
     private func completeReceive(_ id: UUID, _ event: GrokSocketEvent) {
@@ -247,6 +245,36 @@ public final class URLSessionGrokTransport: GrokTransport, @unchecked Sendable {
 }
 
 #if os(macOS)
+/// Resumes parked `send`/`receive` continuations, then cancels the task.
+/// Both steps run off the caller's stack: a synchronous resume re-enters the
+/// engine, and `URLSessionWebSocketTask.cancel()` does not return while `pf`
+/// has the receive parked.
+private final class SocketTeardown: @unchecked Sendable {
+    private let task: URLSessionWebSocketTask?
+    private let receives: [CheckedContinuation<GrokSocketEvent, Never>]
+    private let sends: [CheckedContinuation<Void, Error>]
+
+    init(
+        task: URLSessionWebSocketTask?,
+        receives: [CheckedContinuation<GrokSocketEvent, Never>],
+        sends: [CheckedContinuation<Void, Error>]
+    ) {
+        self.task = task
+        self.receives = receives
+        self.sends = sends
+    }
+
+    func run() {
+        for continuation in receives {
+            continuation.resume(returning: .closed(code: 1006, reason: "websocket is not connected"))
+        }
+        for continuation in sends {
+            continuation.resume(throwing: EngineError.socket("websocket is not connected"))
+        }
+        task?.cancel()
+    }
+}
+
 /// Failed handshakes must not deallocate their `URLSession` while a task is
 /// still outstanding, and they must not call `invalidateAndCancel()` on the
 /// reconnect path. That call waits for `receive` and wedges the next session.

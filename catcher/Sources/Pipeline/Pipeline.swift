@@ -169,8 +169,13 @@ public actor Pipeline {
 
         var created: [AudioTrack: any TranscriptionEngine] = [:]
         do {
+            let stages = ensureSink()
             for track in AudioTrack.allCases {
-                created[track] = try makeEngine(track)
+                let engine = try makeEngine(track)
+                if let logging = engine as? any StageLogging {
+                    await logging.bindStages(stages)
+                }
+                created[track] = engine
             }
         } catch {
             let sentence = ErrorDetail.sentence(error)

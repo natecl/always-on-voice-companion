@@ -13,6 +13,12 @@ public protocol StageSink: Sendable {
     func recorded() -> [StageLine]
 }
 
+/// Engine hook so a reconnect line can be written to this session's
+/// `stages.log` without a process-wide sink.
+public protocol StageLogging: AnyObject, Sendable {
+    func bindStages(_ sink: any StageSink) async
+}
+
 /// stderr and `os_log` (`com.catcher.app` / `stage`). The stage file is separate.
 public enum StageMirror {
     public static func emit(_ line: String) {
