@@ -63,6 +63,27 @@ public enum PCMEnergy {
         }
         return (sum / Float(count)).squareRoot()
     }
+
+    /// RMS with the frame mean removed. A resting microphone often carries a DC
+    /// offset: raw RMS is then well above the silence floor while the waveform
+    /// is still silence. A constant buffer is 0; a zero-mean tone is unchanged.
+    public static func acRMS(_ pcm16le: Data) -> Float {
+        let count = pcm16le.count / AudioFormat.bytesPerSample
+        guard count > 0 else { return 0 }
+        var sum: Float = 0
+        var sumSquares: Float = 0
+        pcm16le.withUnsafeBytes { raw in
+            let samples = raw.bindMemory(to: Int16.self)
+            for sample in samples {
+                let unit = Float(sample) / 32768
+                sum += unit
+                sumSquares += unit * unit
+            }
+        }
+        let mean = sum / Float(count)
+        let variance = sumSquares / Float(count) - mean * mean
+        return max(0, variance).squareRoot()
+    }
 }
 
 public enum HostClock {

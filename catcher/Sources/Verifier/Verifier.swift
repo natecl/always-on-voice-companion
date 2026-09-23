@@ -70,7 +70,7 @@ public actor Verifier {
 
     public func observeFrame(_ frame: PCMFrame, atMs: Int) -> VerifierEffect {
         guard recording else { return VerifierEffect(snapshot: snapshot, annotations: []) }
-        let rms = PCMEnergy.rms(frame.data)
+        let rms = PCMEnergy.acRMS(frame.data)
         let annotation = audio.observe(track: frame.track, rms: rms, atMs: atMs)
         sanity.setAudioFlowing(!audio.allSilent && rms > AudioFlowCheck.rmsEpsilon)
         return publish(annotations: annotation.map { [$0] } ?? [], atMs: atMs)
@@ -108,7 +108,7 @@ public actor Verifier {
         if let sanityAnn = sanity.tick(atMs: atMs) {
             annotations.append(sanityAnn)
         }
-        annotations.append(contentsOf: transport.tick(atMs: atMs, audioFlowing: !audio.allSilent && !audio.noAudio))
+        annotations.append(contentsOf: transport.tick(atMs: atMs, audioFlowing: audio.audioFlowing && !audio.noAudio))
         if let crashAnn = crash.tick(atMs: atMs) {
             annotations.append(crashAnn)
         }

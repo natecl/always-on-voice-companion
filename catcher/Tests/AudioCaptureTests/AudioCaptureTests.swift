@@ -26,6 +26,14 @@ import Testing
     let samples = [Int16](repeating: 16_000, count: 160)
     let loud = samples.withUnsafeBytes { Data($0) }
     #expect(PCMEnergy.rms(loud) > 0.4)
+    #expect(PCMEnergy.acRMS(silence) == 0)
+    #expect(PCMEnergy.acRMS(loud) == 0)
+    var waving = [Int16](repeating: 0, count: 160)
+    for index in waving.indices {
+        waving[index] = index.isMultiple(of: 2) ? 16_000 : -16_000
+    }
+    let tone = waving.withUnsafeBytes { Data($0) }
+    #expect(PCMEnergy.acRMS(tone) > 0.4)
 }
 
 @Test func monoDownmixAveragesChannels() throws {
