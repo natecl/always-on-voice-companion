@@ -31,3 +31,21 @@ Re-run that gate on a Mac. Copy the short SHA, CDHash, and board path into that 
 ## How to read a red row
 
 Stage diagnostics (`stages.log`, `trace.py`) grade nothing. Read [qa/v0-diagnostics.md](qa/v0-diagnostics.md) for the first failure, then the gate definition in [qa/v0-grading.md](qa/v0-grading.md).
+
+## v1 Phase 1 — live loop (planned)
+
+Brief: [briefs/v1-better.md](briefs/v1-better.md). Plan: [plans/v1-phase1-live.md](plans/v1-phase1-live.md). Bars: B2 (partials ≤ 2 s behind speech) and B4 (cold → capturing ≤ 5 s, ≤ 2 inputs, never ambient).
+
+`PLANNED` means no code for the surface is on `main`. It becomes `UNGRADED` when its slice merges, and `GREEN` only from a Mac `grade_v1.py` pass (Tier G) or `v1-phase1-verdict.json` (Tier M) at that SHA, recorded the same way as the v0 rows. Owner paths are the plan's proposed paths. Every Phase 1 slice also re-grades the v0 rows above (P1–P6, B6), and those rows change only when that Mac run changes them.
+
+| Surface | Owner (proposed) | Prove | Gate | Status |
+|---|---|---|---|---|
+| Telemetry sidecar (`latency.jsonl`: clock, start, marks; harness mode; never fails a session) | `catcher/Sources/SessionStore/SessionSidecar.swift`; `catcher/Sources/SessionStore/SessionPaths.swift` (`latencyFile`); `catcher/Sources/Pipeline/Pipeline.swift` (`start(request:)`, `closeSession`) | `./catcher/harness/run_v1.sh b2 <dir>` and `run_v1.sh b4 <dir> <scenario>` | B2, B4 (`sidecar-present`) | PLANNED |
+| Partial-lag probe (per-track audio timeline; capture → sent → received → shown per word) | `catcher/Sources/Pipeline/LatencyProbe.swift`; `catcher/Sources/Pipeline/Pipeline.swift` (`ingest`, `consumeEvents`); `catcher/Sources/CatcherApp/CatcherApp.swift` (shown stamp) | `./catcher/harness/run_v1.sh b2 <dir>` | B2 | PLANNED |
+| Live transcript streaming (incremental finals + one partial per track; tail-pinned scroll) | `catcher/Sources/LiveTranscript/LiveTranscript.swift`; `catcher/Sources/CatcherApp/Views/LiveTranscriptView.swift`; `catcher/Sources/CatcherApp/CatcherApp.swift` (`apply`) | `./catcher/harness/run_v1.sh b2 <dir>` | B2 (`lag-p95`, `first-word-external`) | PLANNED |
+| Capture controller (single start/stop owner; last input wins; `live` only after both tracks framing and both engines streaming; `--auto-record` needs `--harness`) | `catcher/Sources/StartControl/CaptureController.swift`; `catcher/Sources/StartControl/StartRequest.swift`; `catcher/Sources/StartControl/ControllerPhase.swift`; `catcher/Sources/StartControl/SessionLifecycle.swift` | `./catcher/harness/run_v1.sh b4 <dir> <scenario>` | B4 (`single-start`, `live-honest`) | PLANNED |
+| Global hotkey start/stop (Carbon `RegisterEventHotKey`, default ⌃⌥⌘R; loud on registration failure) | `catcher/Sources/CatcherApp/Start/GlobalHotkey.swift` | `./catcher/harness/run_v1.sh b4 <dir> warm-hotkey` ×5 | B4 `warm-hotkey` | PLANNED |
+| Orb (non-activating floating panel; idle / arming / live / degraded / noAudio / blocked / stopping) | `catcher/Sources/CatcherApp/Start/OrbPanel.swift`; `catcher/Sources/CatcherApp/Views/OrbView.swift`; `catcher/Sources/StartControl/OrbState.swift` | `./catcher/harness/run_v1.sh b4 <dir> warm-orb` ×5 | B4 `warm-orb` | PLANNED |
+| Resident mode (menu bar item; survives window close; launch at login opt-in, off by default; no stream, socket, or session at idle) | `catcher/Sources/CatcherApp/Resident/MenuBar.swift`; `catcher/Sources/CatcherApp/Resident/LoginItem.swift`; `catcher/Sources/CatcherApp/Resident/AppDelegate.swift`; `catcher/Sources/CatcherApp/CatcherApp.swift` (`onAppear`) | `./catcher/harness/run_v1.sh b4 <dir> cold` ×5 | B4 `cold` (`no-session-before-input`, `idle-no-socket`) | PLANNED |
+| Fast start path (conditional: grant-cached start probe, concurrent capture + connect, content prewarm) | `catcher/Sources/Pipeline/Pipeline.swift` (`start`); `catcher/Sources/CatcherApp/CatcherApp.swift` (probe injection) | the failing B4 scenario ×5, then `./catcher/harness/run.sh verdict` | B4 (`live-within`) | PLANNED |
+| B2/B4 harness and grader (`run_v1.sh`, `b2_partials.sh`, `b4_start.sh`, `input_events.swift`, `grade_v1.py`, `verdict_v1.py`, `thresholds_v1.json`) | `catcher/harness/`; `docs/qa/v1-phase1-grading.md` | `./catcher/harness/run_v1.sh v1p1-verdict <out> …` | Phase 1 verdict | PLANNED |
