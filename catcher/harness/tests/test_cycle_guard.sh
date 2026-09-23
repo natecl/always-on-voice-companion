@@ -245,6 +245,10 @@ if "assumeIsolated" in app:
     raise SystemExit("harness Timer still calls assumeIsolated")
 if "applicationShouldTerminateAfterLastWindowClosed" not in app:
     raise SystemExit("harness launch can still quit when the window closes")
+if "NSHostingController" not in app or ".suppressed" not in app:
+    raise SystemExit("harness does not open its own key content window")
+if "setActivationPolicy" not in app.split("applicationWillFinishLaunching")[1].split("applicationDidFinishLaunching")[0]:
+    raise SystemExit("activation policy is not set before the window")
 PY
 
 echo "cycle guard ok"

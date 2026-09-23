@@ -14,11 +14,18 @@ struct CatcherApp: App {
     @NSApplicationDelegateAdaptor(HarnessAppDelegate.self) private var harnessDelegate
     @State private var model = CatcherModel()
 
+    /// A script-launched WindowGroup often never becomes key. The harness
+    /// opens one titled window itself and keeps that one in front.
+    private var harnessOwnsWindow: Bool {
+        let launch = LaunchConfiguration.resolve()
+        return launch.harness && !launch.preflight
+    }
+
     var body: some Scene {
         WindowGroup(id: "content") {
             ContentView(model: model)
         }
-        .defaultLaunchBehavior(.presented)
+        .defaultLaunchBehavior(harnessOwnsWindow ? .suppressed : .presented)
     }
 }
 
@@ -27,6 +34,13 @@ struct CatcherApp: App {
 @MainActor
 final class HarnessAppDelegate: NSObject, NSApplicationDelegate {
     private var ticker: Timer?
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        let launch = LaunchConfiguration.resolve()
+        guard launch.harness, !launch.preflight else { return }
+        // Once. Repeating this from the raise timer drops the active app.
+        NSApp.setActivationPolicy(.regular)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let launch = LaunchConfiguration.resolve()
@@ -46,6 +60,13 @@ final class HarnessAppDelegate: NSObject, NSApplicationDelegate {
 
     /// SwiftUI quits when the last window closes. A harness gate still needs
     /// this process after the content window is ordered front.
+    func applicationDidBecomeActive(_ notification: Notification) {
+        let launch = LaunchConfiguration.resolve()
+        guard launch.harness, !launch.preflight else { return }
+        let root = SessionPaths.root(environment: launch.mergedEnvironment())
+        HarnessWindow.present(sessionRoot: root)
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         let launch = LaunchConfiguration.resolve()
         return !(launch.harness && !launch.preflight)
@@ -55,26 +76,31 @@ final class HarnessAppDelegate: NSObject, NSApplicationDelegate {
 /// Orders the content window front and records that it is on screen.
 @MainActor
 enum HarnessWindow {
+    static var model: CatcherModel?
+    private static var owned: NSWindow?
+
+    static func bind(_ model: CatcherModel) {
+        self.model = model
+    }
+
     static func present(sessionRoot: URL) {
-        NSApp.setActivationPolicy(.regular)
         if NSApp.isHidden {
             NSApp.unhide(nil)
         }
         NSApp.activate()
         NSRunningApplication.current.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
-        if contentWindows.isEmpty {
-            NSApp.sendAction(Selector(("newWindowForTab:")), to: nil, from: nil)
+        let window = contentWindow()
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
         }
-        for window in contentWindows {
-            if window.isMiniaturized {
-                window.deminiaturize(nil)
-            }
-            window.orderFrontRegardless()
-            window.makeKeyAndOrderFront(nil)
-        }
-        let ready = NSApp.isActive && contentWindows.contains { window in
-            window.isKeyWindow && window.isVisible && window.screen != nil && window.frame.height >= 20
-        }
+        placeOnScreen(window)
+        window.orderFrontRegardless()
+        window.makeKeyAndOrderFront(nil)
+        let ready = NSApp.isActive
+            && window.isKeyWindow
+            && window.isVisible
+            && window.screen != nil
+            && window.frame.height >= 20
         let url = sessionRoot.appendingPathComponent("window_front")
         if ready {
             let text = "pid=\(ProcessInfo.processInfo.processIdentifier) frontmost=1 visible=1\n"
@@ -84,8 +110,46 @@ enum HarnessWindow {
         }
     }
 
-    private static var contentWindows: [NSWindow] {
-        NSApp.windows.filter { $0.canBecomeKey && $0.level == .normal }
+    /// The window this process made key, or a SwiftUI window that already is.
+    private static func contentWindow() -> NSWindow {
+        if let owned {
+            if owned.contentViewController == nil, let model {
+                owned.contentViewController = NSHostingController(rootView: ContentView(model: model))
+            }
+            return owned
+        }
+        if let existing = NSApp.windows.first(where: { window in
+            window.isKeyWindow && window.isVisible && window.screen != nil && window.frame.height >= 20
+        }) {
+            return existing
+        }
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 520),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Catcher"
+        window.isReleasedWhenClosed = false
+        window.collectionBehavior.insert(.moveToActiveSpace)
+        if let model {
+            window.contentViewController = NSHostingController(rootView: ContentView(model: model))
+        }
+        owned = window
+        return window
+    }
+
+    private static func placeOnScreen(_ window: NSWindow) {
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        let visible = screen.visibleFrame
+        var frame = window.frame
+        if frame.width < 720 { frame.size.width = 720 }
+        if frame.height < 520 { frame.size.height = 520 }
+        frame.size.width = min(frame.size.width, visible.width)
+        frame.size.height = min(frame.size.height, visible.height)
+        frame.origin.x = visible.midX - frame.width / 2
+        frame.origin.y = visible.midY - frame.height / 2
+        window.setFrame(frame, display: true)
     }
 }
 
@@ -162,6 +226,9 @@ final class CatcherModel {
             let pipeline = pipeline
             HarnessShutdown.install {
                 await pipeline.stopAfterLiveTail()
+            }
+            if !preflight {
+                HarnessWindow.bind(self)
             }
         }
         // --preflight must not wait for the SwiftUI window. A launch that
