@@ -1,6 +1,6 @@
 # v1 Phase 3 — notes after stop (plan only)
 
-**Status:** plan, plus slice 1 on this branch. Cap GO 2026-09-23. Slice 1 is the `Brief` library (model, input, validator, renderer, stub engine, launch policy) and the synthetic 60-minute fixture. No Grok client, runner, app wiring, or B3 harness yet. Not a B3 pass.
+**Status:** slices 1–5 are in the tree on this branch. Cap GO 2026-09-23. Slice 5 adds `b3_brief.sh`, `b3_grade.py`, `b3_bake.sh`, `pasteboard_probe.swift`, and `docs/qa/v1-b3-grading.md`. The B3 entry is `./catcher/harness/b3_brief.sh <dir>` because v0 `run.sh` and `thresholds.json` stay untouched. `briefModel` remains the provisional pin `grok-4.20-0309-non-reasoning`; the keyed bake has not run. Not a B3 pass.
 
 **v1 one-liner:** Granola mechanics, instant, zero friction, cheap enough to leave on.
 
@@ -315,7 +315,9 @@ A live 5× timing run did not happen: this environment has no `XAI_API_KEY`. `br
 
 A stub-engine pass of the same fixture on this Linux VM (not B3 evidence) reported stage times of read 62 ms, request 4 ms, validate 1 ms, write 36 ms, total 103 ms. The fixture file was not modified.
 
-Slice 4 is in the tree: `NotesView`, the clipboard payload (`public.utf8-plain-text` and `public.html` in one declare), the `toggle()` adapter, and SIGUSR1 (stop and stay up, only when `CATCHER_HARNESS=1` and `CATCHER_BRIEF=1`). SIGTERM is unchanged. None of this is Mac-graded. Slice 5 (B3 harness and QA doc) has not started. The keyed bake-off is still required before B3 QA.
+Slice 4 is in the tree: `NotesView`, the clipboard payload (`public.utf8-plain-text` and `public.html` in one declare), the `toggle()` adapter, and SIGUSR1 (stop and stay up, only when `CATCHER_HARNESS=1` and `CATCHER_BRIEF=1`). SIGTERM is unchanged. None of this is Mac-graded.
+
+Slice 5 is in the tree: `b3_brief.sh` (the B3 entry; v0 `run.sh` is not extended), `b3_grade.py` (the 30000 ms bar lives here, not in `thresholds.json`), `pasteboard_probe.swift`, `b3_bake.sh` (keyed 5× bake; refuses without `XAI_API_KEY` and does not change the pin), and `docs/qa/v1-b3-grading.md`. None of this is Mac-graded. The keyed bake-off is still required before Cap arms B3. This environment has no `XAI_API_KEY`, so `b3_bake.sh` exits 2 and the pin stays provisional.
 
 ## 10. Done-check for this plan's IMPLEMENT climb
 
