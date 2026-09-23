@@ -6,6 +6,7 @@
   "speechDipMs": 120,
   "silenceLimitMs": 10000,
   "noAudioEmitSlackMs": 1500,
+  "speechEvidenceRmsFloor": 0.025,
   "p1WerBar": 0.15,
   "p1GapRmsFloor": 0.001,
   "p1GapLimitMs": 2000,

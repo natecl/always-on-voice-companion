@@ -19,8 +19,9 @@ import argparse
 import json
 import math
 import platform
-import struct
+import re
 import sys
+from array import array
 from datetime import datetime
 from pathlib import Path
 
@@ -132,22 +133,119 @@ def system_text(rows: list[dict]) -> str:
     return " ".join(str(row.get("text", "")) for row in segs)
 
 
-def pcm_windows(path: Path) -> list[tuple[int, int, float]]:
+def pcm_samples(path: Path) -> array:
+    samples = array("h")
     raw = path.read_bytes()
-    count = len(raw) // 2
-    if count == 0:
+    samples.frombytes(raw[: len(raw) // 2 * 2])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    return samples
+
+
+def pcm_duration_ms(path: Path) -> int:
+    if not path.is_file():
+        return 0
+    return path.stat().st_size // 2 * 1000 // SAMPLE_RATE
+
+
+def pcm_windows_ac(path: Path) -> list[tuple[int, int, float]]:
+    """Mean-removed RMS per 100 ms window, full scale 1. DC offset is not
+    speech; this matches the verifier's `PCMEnergy.acRMS`."""
+    if not path.is_file():
         return []
-    samples = struct.unpack("<" + "h" * count, raw[: count * 2])
+    samples = pcm_samples(path)
     window = SAMPLE_RATE // 10
     windows: list[tuple[int, int, float]] = []
     for index in range(0, len(samples), window):
         chunk = samples[index : index + window]
-        energy = sum((sample / 32768) ** 2 for sample in chunk)
-        rms = math.sqrt(energy / len(chunk))
+        count = len(chunk)
+        mean = sum(chunk) / count
+        energy = sum(value * value for value in chunk) / count
+        rms = math.sqrt(max(0.0, energy - mean * mean)) / 32768
         start = index * 1000 // SAMPLE_RATE
-        end = (index + len(chunk)) * 1000 // SAMPLE_RATE
+        end = (index + count) * 1000 // SAMPLE_RATE
         windows.append((start, end, rms))
     return windows
+
+
+def sustained_runs(
+    windows: list[tuple[int, int, float]],
+    floor: float,
+    hold_ms: int | None = None,
+    dip_ms: int | None = None,
+) -> list[tuple[int, int]]:
+    """Runs of windows above `floor` that hold for `hold_ms`, bridging
+    sub-floor gaps shorter than `dip_ms`. Mirrors `AudioFlowCheck`."""
+    hold = int(THRESHOLDS["speechHoldMs"]) if hold_ms is None else hold_ms
+    dip = int(THRESHOLDS["speechDipMs"]) if dip_ms is None else dip_ms
+    runs: list[tuple[int, int]] = []
+    current: tuple[int, int] | None = None
+    for start, end, rms in windows:
+        if rms <= floor:
+            continue
+        if current is not None and start - current[1] < dip:
+            current = (current[0], end)
+        else:
+            if current is not None:
+                runs.append(current)
+            current = (start, end)
+    if current is not None:
+        runs.append(current)
+    return [run for run in runs if run[1] - run[0] >= hold]
+
+
+def percentile(values: list[float], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(fraction * (len(ordered) - 1) + 0.5))]
+
+
+def detail_text(row: dict) -> str:
+    detail = row.get("detail")
+    return detail if isinstance(detail, str) else ""
+
+
+def detail_field(row: dict, key: str) -> str | None:
+    match = re.search(rf"(?:^|\s){re.escape(key)}=(\S+)", detail_text(row))
+    return match.group(1) if match else None
+
+
+def detail_int(row: dict, key: str) -> int | None:
+    raw = detail_field(row, key)
+    try:
+        return int(raw) if raw is not None else None
+    except ValueError:
+        return None
+
+
+def noaudio_rows(rows: list[dict]) -> list[dict]:
+    return [row for row in rows_of(rows, "ann") if row.get("kind") == "noAudio"]
+
+
+def noaudio_over_speech(session: Path, rows: list[dict]) -> tuple[bool, str]:
+    """P1.n / P6.n. The PCM files start at capture start (`observedFromMs`)."""
+    floor = float(THRESHOLDS["speechEvidenceRmsFloor"])
+    limit = int(THRESHOLDS["silenceLimitMs"])
+    hits = noaudio_rows(rows)
+    if not hits:
+        return True, "no noAudio ann"
+    runs = {
+        track: sustained_runs(pcm_windows_ac(session / f"{track}.pcm"), floor)
+        for track in ("system", "microphone")
+    }
+    problems: list[str] = []
+    for row in hits:
+        origin = detail_int(row, "observedFromMs") or 0
+        to = int(row.get("atMs", 0)) - origin
+        start = to - limit
+        for track, spans in runs.items():
+            over = [f"{a}-{b}" for a, b in spans if a < to and b > start]
+            if over:
+                problems.append(f"noAudio atMs={row.get('atMs')} over {track} speech (pcm ms {', '.join(over)})")
+    if problems:
+        return False, "noAudio fired over speech; floor too high: " + "; ".join(problems)
+    return True, f"{len(hits)} noAudio ann(s), none over sustained speech (floor {floor})"
 
 
 def overlaps(start: int, end: int, seg: dict) -> bool:
@@ -162,7 +260,7 @@ def gap_evidence(session: Path, rows: list[dict]) -> tuple[bool, str]:
         return False, "no system-track seg rows"
     pcm = session / "system.pcm"
     if pcm.exists() and pcm.stat().st_size > 0:
-        windows = [item for item in pcm_windows(pcm) if item[2] > THRESHOLDS["p1GapRmsFloor"]]
+        windows = [item for item in pcm_windows_ac(pcm) if item[2] > THRESHOLDS["p1GapRmsFloor"]]
         uncovered: list[tuple[int, int]] = []
         for start, end, _rms in windows:
             if any(overlaps(start, end, seg) for seg in segs):
@@ -321,6 +419,8 @@ def grade_p1(gate: Gate, session: Path, rows: list[dict], ref: Path | None, expe
     gate.check("wer", score <= bar, f"WER {score:.3f} on the system track (bar {bar})")
     gaps_ok, gaps = gap_evidence(session, rows)
     gate.check("gaps", gaps_ok, gaps)
+    quiet_ok, quiet = noaudio_over_speech(session, rows)
+    gate.check("no-noaudio-over-speech", quiet_ok, quiet)
     if expect_recovery:
         did = recovered(session, rows)
         gate.check("recovery", did, "recovery " + ("present" if did else "missing"))
@@ -420,17 +520,82 @@ def grade_p3(gate: Gate, rows: list[dict]) -> None:
     gate.check("seg-after-resume", bool(later), f"{len(later)} seg(s) at or after resumed atMs")
 
 
-def grade_p4(gate: Gate, rows: list[dict], silence_at: int) -> None:
+def grade_p4(gate: Gate, session: Path, rows: list[dict], silence_at: int | None) -> None:
     limit = int(THRESHOLDS["silenceLimitMs"])
-    hits = [
-        row for row in rows_of(rows, "ann")
-        if row.get("kind") == "noAudio" and silence_at <= int(row.get("atMs", -1)) <= silence_at + limit
-    ]
-    gate.check(
+    slack = int(THRESHOLDS["noAudioEmitSlackMs"])
+    hits = noaudio_rows(rows)
+    first = hits[0] if hits else None
+    observed = detail_int(first, "observedFromMs") if first else None
+    # Default: the 10 s window is measured from capture start.
+    if silence_at is None:
+        silence_at = observed if observed is not None else 0
+    in_window = [row for row in hits if silence_at <= int(row.get("atMs", -1)) <= silence_at + limit]
+    # P4.a
+    if not gate.check(
         "noaudio-in-window",
-        bool(hits),
-        f"noAudio atMs={hits[0].get('atMs')}" if hits else f"no noAudio ann with atMs in [{silence_at}, {silence_at + limit}]",
+        bool(in_window),
+        f"noAudio atMs={in_window[0].get('atMs')} in [{silence_at}, {silence_at + limit}]" if in_window
+        else f"no noAudio ann with atMs in [{silence_at}, {silence_at + limit}]",
+    ):
+        return
+    row = in_window[0]
+    emitted = detail_int(row, "emittedAtMs")
+    # P4.b
+    if not gate.check(
+        "emitted-in-time",
+        emitted is not None and emitted <= silence_at + limit + slack,
+        "cannot prove emission time (no emittedAtMs)" if emitted is None
+        else f"emittedAtMs={emitted}, bar {silence_at + limit + slack}",
+    ):
+        return
+    origin = observed if observed is not None else 0
+    watched = emitted - origin
+    # P4.c
+    no_frames = detail_text(row).startswith("no frames")
+    gate.check(
+        "capture-live",
+        not no_frames,
+        "detector not exercised; capture dead (no frames for >10s)" if no_frames else "noAudio from observed frames",
     )
+    for track in ("system", "microphone"):
+        have = pcm_duration_ms(session / f"{track}.pcm")
+        gate.check(
+            f"{track}-pcm",
+            have >= watched - 1000,
+            f"{track}.pcm {have}ms, need {watched - 1000}ms (capture start to emission)",
+        )
+    # P4.d premise: the room was quiet and the output muted.
+    speech_floor = float(THRESHOLDS["speechEvidenceRmsFloor"])
+    for track in ("system", "microphone"):
+        windows = [item for item in pcm_windows_ac(session / f"{track}.pcm") if item[0] < watched]
+        spans = sustained_runs(windows, speech_floor)
+        gate.check(
+            f"quiet-{track}",
+            not spans,
+            f"sustained {track} audio above {speech_floor} at pcm ms {', '.join(f'{a}-{b}' for a, b in spans)}; operator not quiet / output not muted"
+            if spans else f"no sustained {track} audio above {speech_floor} before emission",
+            PREMISE_CHECK,
+        )
+    system_windows = [item for item in pcm_windows_ac(session / "system.pcm") if item[0] < watched]
+    peak = max((item[2] for item in system_windows), default=0.0)
+    digital = float(THRESHOLDS["p1GapRmsFloor"])
+    gate.check(
+        "system-muted",
+        peak <= digital,
+        f"system peak AC RMS {peak:.4f} (muted output is <= {digital})",
+        PREMISE_CHECK,
+    )
+    # P4.e
+    spoken = [
+        seg for seg in rows_of(rows, "seg")
+        if str(seg.get("text", "")).strip() and int(seg.get("startMs", 0)) < emitted
+    ]
+    gate.check("no-seg-before-emission", not spoken, f"{len(spoken)} non-blank seg(s) before emittedAtMs")
+    flowing = [
+        ann for ann in rows_of(rows, "ann")
+        if ann.get("kind") == "degraded" and "audio is flowing" in detail_text(ann) and int(ann.get("atMs", 0)) <= emitted
+    ]
+    gate.check("no-flowing-heartbeat", not flowing, f"{len(flowing)} 'audio is flowing' degraded row(s) before emission")
 
 
 def grade_p5(gate: Gate, rows: list[dict], reference: Path | None) -> None:
@@ -460,13 +625,36 @@ def grade_p5(gate: Gate, rows: list[dict], reference: Path | None) -> None:
     )
 
 
-def grade_p6(gate: Gate, rows: list[dict]) -> None:
+def mic_speech_levels(session: Path) -> list[float]:
+    """AC RMS of the operator's speech windows: above the digital floor and
+    inside a run that holds 300 ms."""
+    windows = pcm_windows_ac(session / "microphone.pcm")
+    runs = sustained_runs(windows, float(THRESHOLDS["p1GapRmsFloor"]))
+    return [rms for start, end, rms in windows if any(a <= start and end <= b for a, b in runs)]
+
+
+def grade_p6(gate: Gate, session: Path, rows: list[dict]) -> None:
     segs = rows_of(rows, "seg")
     tracks = {row.get("track") for row in segs}
     speaker = any(row.get("track") == "system" and row.get("speaker") for row in segs)
     gate.check("system-seg", "system" in tracks, f"tracks={sorted(t for t in tracks if t)}")
     gate.check("microphone-seg", "microphone" in tracks, f"tracks={sorted(t for t in tracks if t)}")
     gate.check("system-speaker", speaker, f"systemSpeaker={speaker}")
+    quiet_ok, quiet = noaudio_over_speech(session, rows)
+    gate.check("no-noaudio-over-speech", quiet_ok, quiet)
+    # P6.m. Evidence always carries the calibration percentiles.
+    levels = mic_speech_levels(session)
+    floor = float(THRESHOLDS["verifierRmsFloor"])
+    need = float(THRESHOLDS["p6MicSpeechFloorRatio"]) * floor
+    p10, p50, p90 = (percentile(levels, fraction) for fraction in (0.1, 0.5, 0.9))
+    gate.check(
+        "mic-speech-clears-floor",
+        bool(levels) and p50 >= need,
+        (f"microphone.pcm missing or no sustained speech" if not levels else
+         f"mic speech AC RMS p10={p10:.4f} p50={p50:.4f} p90={p90:.4f}; need p50 >= {need:.4f} "
+         f"({THRESHOLDS['p6MicSpeechFloorRatio']}x noAudio floor {floor})"
+         + ("" if p50 >= need else "; normal speech is under the noAudio floor")),
+    )
 
 
 def grade_gate(
@@ -477,7 +665,7 @@ def grade_gate(
     ref: Path | None = None,
     expect_recovery: bool = False,
     revoke_at: int | None = None,
-    silence_at: int = 0,
+    silence_at: int | None = None,
     shape_reference: Path | None = None,
     no_provenance: bool = False,
 ) -> dict[str, object]:
@@ -494,11 +682,11 @@ def grade_gate(
     elif name == "P3":
         grade_p3(gate, rows)
     elif name == "P4":
-        grade_p4(gate, rows, silence_at)
+        grade_p4(gate, session, rows, silence_at)
     elif name == "P5":
         grade_p5(gate, rows, shape_reference)
     elif name == "P6":
-        grade_p6(gate, rows)
+        grade_p6(gate, session, rows)
     provenance_checks(gate, session, rows, name, run, no_provenance)
     return gate.result()
 
@@ -510,7 +698,7 @@ def main() -> int:
     parser.add_argument("--gate", action="append", choices=GATES, dest="gates")
     parser.add_argument("--ref", type=Path)
     parser.add_argument("--revoke-at-ms", type=int)
-    parser.add_argument("--silence-at-ms", type=int, default=0)
+    parser.add_argument("--silence-at-ms", type=int, help="default: capture start (noAudio observedFromMs)")
     parser.add_argument("--shape-reference", type=Path)
     parser.add_argument("--expect-recovery", action="store_true")
     parser.add_argument("--no-provenance", action="store_true", help="unit tests only; forces unproven")

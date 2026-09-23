@@ -258,5 +258,115 @@ class ProvenanceTests(OnMac):
         self.assertIn("engine=stub", failed(run("P5", reference, shape_reference=reference)))
 
 
+def noaudio(at: int = 10000, emitted: int | None = 10000, observed: int = 0, detail: str = "RMS≈0 for >10s on microphone,system") -> str:
+    text = detail
+    if emitted is not None:
+        text += f" emittedAtMs={emitted}"
+    return text + f" observedFromMs={observed}"
+
+
+def p4_session(case: TempRoot, *, mic: list[tuple[int, int, float]] | None = None, system_rms: float = 0.0,
+               ann: str | None = None, at: int = 10000, total_ms: int = 16000, **kwargs) -> Session:
+    session = case.session(**kwargs)
+    session.ann(at, "noAudio", ann if ann is not None else noaudio(at=at))
+    session.pcm("microphone", mic or [(0, total_ms, 0.018)], total_ms)
+    session.pcm("system", [(0, total_ms, system_rms)] if system_rms else [], total_ms)
+    return session
+
+
+class P4Tests(TempRoot):
+    def test_quiet_room_with_live_capture_and_prompt_emission_has_all_checks_ok(self) -> None:
+        assert_checks_ok_but_unproven(self, run("P4", p4_session(self).end(16000).write()))
+
+    def test_backdated_noaudio_is_fail(self) -> None:
+        result = run("P4", p4_session(self, ann=noaudio(emitted=25000)).write())
+        self.assertEqual(result["result"], "fail")
+        self.assertIn("emitted-in-time", failed(result))
+
+    def test_missing_emission_time_is_fail(self) -> None:
+        result = run("P4", p4_session(self, ann=noaudio(emitted=None)).write())
+        self.assertEqual(result["result"], "fail")
+        self.assertIn("emitted-in-time", failed(result))
+
+    def test_no_frames_noaudio_is_fail(self) -> None:
+        session = self.session().ann(10000, "noAudio", noaudio(detail="no frames for >10s")).write()
+        result = run("P4", session)
+        self.assertEqual(result["result"], "fail")
+        self.assertTrue({"capture-live", "system-pcm", "microphone-pcm"} <= failed(result))
+
+    def test_short_pcm_is_fail(self) -> None:
+        result = run("P4", p4_session(self, total_ms=4000).write())
+        self.assertIn("microphone-pcm", failed(result))
+
+    def test_quiet_speech_under_the_verifier_floor_is_invalid(self) -> None:
+        result = run("P4", p4_session(self, mic=[(0, 16000, 0.018), (2000, 6000, 0.04)]).write())
+        self.assertEqual(result["result"], "invalid")
+        self.assertIn("quiet-microphone", failed(result))
+
+    def test_unmuted_output_is_invalid(self) -> None:
+        result = run("P4", p4_session(self, system_rms=0.01).write())
+        self.assertEqual(result["result"], "invalid")
+        self.assertIn("system-muted", failed(result))
+
+    def test_window_is_measured_from_capture_start(self) -> None:
+        late = p4_session(self, at=14000, ann=noaudio(at=14000, emitted=14000, observed=4000), total_ms=12000).write()
+        assert_checks_ok_but_unproven(self, run("P4", late))
+        self.assertIn("noaudio-in-window", failed(run("P4", late, silence_at=0)))
+
+    def test_seg_or_flowing_heartbeat_before_emission_is_fail(self) -> None:
+        seg = p4_session(self).seg("microphone", 3000, 4000, "hello")
+        self.assertIn("no-seg-before-emission", failed(run("P4", seg.write())))
+        other = self.root / "hb"
+        other.mkdir()
+        case = TempRoot()
+        case.root = other
+        heartbeat = p4_session(case).ann(8300, "degraded", "no engine event for 8000ms while audio is flowing track=microphone emittedAtMs=8300")
+        self.assertIn("no-flowing-heartbeat", failed(run("P4", heartbeat.write())))
+
+
+class NoAudioOverSpeechTests(TempRoot):
+    def test_noaudio_over_quiet_speech_fails_p6_and_p1(self) -> None:
+        session = self.session()
+        session.seg("system", 1000, 4000, "hello from the fixture", "S1").seg("microphone", 2000, 5000, "me")
+        session.ann(10000, "noAudio", noaudio())
+        session.pcm("microphone", [(2000, 8000, 0.04)], 12000)
+        session.pcm("system", [], 12000)
+        path = session.write()
+        for gate in ("P6", "P1"):
+            with self.subTest(gate=gate):
+                result = run(gate, path, ref=REF)
+                self.assertEqual(result["result"], "fail")
+                self.assertIn("no-noaudio-over-speech", failed(result))
+
+    def test_mic_p50_under_twice_the_floor_fails_p6(self) -> None:
+        session = self.session()
+        session.seg("system", 1000, 4000, "hello from the fixture", "S1").seg("microphone", 2000, 5000, "me")
+        session.pcm("microphone", [(2000, 8000, 0.03)], 12000)
+        session.pcm("system", [(1000, 4000, 0.2)], 12000)
+        result = run("P6", session.write())
+        self.assertEqual(failed(result), {"mic-speech-clears-floor", "provenance"})
+        self.assertIn("p50=0.0300", result["evidence"])
+
+    def test_missing_mic_pcm_fails_p6(self) -> None:
+        session = self.session()
+        session.seg("system", 1000, 4000, "hello", "S1").seg("microphone", 2000, 5000, "me")
+        self.assertIn("mic-speech-clears-floor", failed(run("P6", session.write())))
+
+
+class P1GapTests(TempRoot):
+    def test_dc_offset_system_pcm_is_not_a_false_hole(self) -> None:
+        text = REF.read_text()
+        session = self.session().seg("system", 0, 3000, text).end(12000)
+        session.pcm("system", [(0, 3000, 0.2)], 12000, dc=2000)
+        result = run("P1", session.write(), ref=REF)
+        self.assertNotIn("gaps", failed(result), result["evidence"])
+
+    def test_uncovered_system_speech_is_a_hole(self) -> None:
+        text = REF.read_text()
+        session = self.session().seg("system", 0, 3000, text)
+        session.pcm("system", [(0, 9000, 0.2)], 12000)
+        self.assertIn("gaps", failed(run("P1", session.write(), ref=REF)))
+
+
 if __name__ == "__main__":
     unittest.main()
