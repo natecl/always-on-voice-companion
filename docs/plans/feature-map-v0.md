@@ -1,6 +1,6 @@
 # v0 FEATURE_MAP — plan (plan only)
 
-**Status:** implemented. Planned against `95837a8891a07f4169ecfa9b869a7a80c4545ad3`. Map: [`../FEATURE_MAP.md`](../FEATURE_MAP.md).
+**Status:** implemented in `277b3c61872db76b2b62b3f4e27942f60be705ff`. Planned against `95837a8891a07f4169ecfa9b869a7a80c4545ad3`. Map: [`../FEATURE_MAP.md`](../FEATURE_MAP.md).
 
 **Goal:** One page that answers "which v0 surfaces exist, where does each live, what proves it, and what was the last Mac grade?" Today that answer is spread across `docs/plans/v0-catcher.md`, `docs/qa/v0-grading.md`, `docs/qa/v0-diagnostics.md`, `catcher/harness/grade.py`, and a board file on a Mac's `/tmp`. The map points at those files; it does not replace or restate them.
 
