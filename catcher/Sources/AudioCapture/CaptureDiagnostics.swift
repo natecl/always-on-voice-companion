@@ -11,6 +11,9 @@ public struct CaptureCounters: Sendable, Equatable {
     public var firstOSStatus: Int32
     public var firstFailureDetail: String
     public var displayID: UInt32
+    /// `MicrophoneGain` at the latest microphone buffer, and its session high.
+    public var microphoneGain: Float?
+    public var microphoneGainPeak: Float?
 
     public init(
         system: Int = 0,
@@ -20,7 +23,9 @@ public struct CaptureCounters: Sendable, Equatable {
         extractFailed: Int = 0,
         firstOSStatus: Int32 = 0,
         firstFailureDetail: String = "",
-        displayID: UInt32 = 0
+        displayID: UInt32 = 0,
+        microphoneGain: Float? = nil,
+        microphoneGainPeak: Float? = nil
     ) {
         self.system = system
         self.microphone = microphone
@@ -30,6 +35,8 @@ public struct CaptureCounters: Sendable, Equatable {
         self.firstOSStatus = firstOSStatus
         self.firstFailureDetail = firstFailureDetail
         self.displayID = displayID
+        self.microphoneGain = microphoneGain
+        self.microphoneGainPeak = microphoneGainPeak
     }
 }
 

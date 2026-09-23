@@ -768,6 +768,8 @@ private final class PCMOutput: NSObject, SCStreamOutput {
     let counters: CaptureCounterBox
     let onFrame: (PCMFrame) -> Void
     let onFailure: (CaptureError) -> Void
+    /// Touched only on this output's serial sample-handler queue.
+    private var gain = MicrophoneGain()
 
     init(
         track: AudioTrack,
@@ -793,7 +795,11 @@ private final class PCMOutput: NSObject, SCStreamOutput {
             return
         }
         do {
-            let data = try SampleBufferPCM.extract(from: sampleBuffer)
+            var data = try SampleBufferPCM.extract(from: sampleBuffer)
+            if track == .microphone {
+                data = gain.process(data)
+                counters.noteMicrophoneGain(current: gain.gain, peak: gain.peakGain)
+            }
             let frame = PCMFrame(
                 track: track,
                 data: data,
@@ -823,6 +829,8 @@ final class CaptureCounterBox: @unchecked Sendable {
     private let firstStatus = Atomic<Int32>(0)
     private let detailLock = NSLock()
     private var firstDetail = ""
+    private var microphoneGain: Float?
+    private var microphoneGainPeak: Float?
 
     func noteRaw(_ track: AudioTrack) {
         switch track {
@@ -851,9 +859,18 @@ final class CaptureCounterBox: @unchecked Sendable {
         detailLock.unlock()
     }
 
+    func noteMicrophoneGain(current: Float, peak: Float) {
+        detailLock.lock()
+        microphoneGain = current
+        microphoneGainPeak = peak
+        detailLock.unlock()
+    }
+
     func snapshot(displayID: UInt32) -> CaptureCounters {
         detailLock.lock()
         let detail = firstDetail
+        let gain = microphoneGain
+        let gainPeak = microphoneGainPeak
         detailLock.unlock()
         return CaptureCounters(
             system: system.load(ordering: .relaxed),
@@ -863,7 +880,9 @@ final class CaptureCounterBox: @unchecked Sendable {
             extractFailed: extractFailed.load(ordering: .relaxed),
             firstOSStatus: firstStatus.load(ordering: .relaxed),
             firstFailureDetail: detail,
-            displayID: displayID
+            displayID: displayID,
+            microphoneGain: gain,
+            microphoneGainPeak: gainPeak
         )
     }
 }

@@ -742,7 +742,9 @@ public actor Pipeline {
                 extractFailed: counters.extractFailed,
                 firstOSStatus: counters.firstOSStatus,
                 firstFailureDetail: counters.firstFailureDetail,
-                displayID: counters.displayID
+                displayID: counters.displayID,
+                microphoneGain: counters.microphoneGain,
+                microphoneGainPeak: counters.microphoneGainPeak
             )
         }
         let extracted = await ledger.extractedCounts()

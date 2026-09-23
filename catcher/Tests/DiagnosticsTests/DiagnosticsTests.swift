@@ -222,7 +222,15 @@ import Testing
     #expect(lines[0].field("invalid") == "1")
     #expect(lines[1].verdict == "OK")
     #expect(lines[1].field("zeroEnergy") == "system")
+    #expect(lines[1].field("micGain") == nil)
     #expect(lines[2].verdict == "OK")
+
+    let gained = await ledger.countLines(
+        capture: CaptureCounterSnapshot(system: 2, microphone: 2, microphoneGain: 1, microphoneGainPeak: 10.5),
+        stream: StreamSnapshot(systemBytes: 100, microphoneBytes: 100, fromEngine: true)
+    )
+    #expect(gained[1].field("micGain") == "1.00")
+    #expect(gained[1].field("micGainMax") == "10.50")
 
     let quiet = StageLedger()
     let missed = await quiet.countLines(
