@@ -1,5 +1,6 @@
 import AudioCapture
 import Foundation
+import SessionStore
 import TranscriptionEngine
 
 /// Per-track map from audio time to the host time of the frame that carried
