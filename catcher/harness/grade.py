@@ -535,6 +535,46 @@ def p3_system_tail_need_ms(resumed_at: int, backlog_ms: int, thresholds: dict | 
     return live_from + int(t["p3MinTailMs"]) - 5000
 
 
+def p3_chain(rows: list[dict], track: str, pf_on: int) -> tuple[list, tuple | None, tuple | None]:
+    """(gaps, gap, resumed) for one track, each an (index, row) pair.
+
+    The gap is the first one ending at or after pfOn; an earlier reconnect is
+    not the block. `resumed` is the first one after that gap in file order.
+    `p3_net_kill.sh` uses this so it waits on the same chain this file grades.
+    """
+    mine = [(index, row) for index, row in enumerate(rows) if row.get("t") == "ann" and ann_track(row) == track]
+    gaps = [(index, row) for index, row in mine if row.get("kind") == "gap"]
+    if not gaps:
+        return gaps, None, None
+    gap = next(((index, row) for index, row in gaps if int(row["detail"].get("toMs", 0)) >= pf_on), gaps[0])
+    resumed = next(((index, row) for index, row in mine if index > gap[0] and row.get("kind") == "resumed"), None)
+    return gaps, gap, resumed
+
+
+def p3_assumed_backlog_ms(resumed_row: dict, gap_row: dict, thresholds: dict | None = None) -> int:
+    t = THRESHOLDS if thresholds is None else thresholds
+    backlog = detail_int(resumed_row, "backlogMs")
+    if backlog is not None:
+        return backlog
+    span = int(gap_row["detail"].get("toMs", 0)) - int(gap_row["detail"].get("fromMs", 0))
+    return span + int(t["p3FallbackReplayMs"])
+
+
+def p3_harness_tail_need_ms(rows: list[dict], pf_on_wall_ms: int, thresholds: dict | None = None) -> int | None:
+    """`system:tail` need for the chain grade_p3 will grade, or None until
+    that chain's `resumed` row is on disk. A reconnect that ended before pfOn
+    is not the block, so it does not end the harness wait."""
+    t = THRESHOLDS if thresholds is None else thresholds
+    pf_on = wall_to_session_ms(rows, pf_on_wall_ms)
+    if pf_on is None:
+        return None
+    _, gap, resumed = p3_chain(rows, "system", pf_on)
+    if gap is None or resumed is None or int(gap[1]["detail"].get("toMs", 0)) < pf_on:
+        return None
+    resumed_at = int(resumed[1].get("atMs", 0))
+    return p3_system_tail_need_ms(resumed_at, p3_assumed_backlog_ms(resumed[1], gap[1], t), t)
+
+
 def grade_p3(gate: Gate, session: Path, rows: list[dict], run: dict | None) -> None:
     """Clocks: pfOn/pfOff are wall time mapped through startedAt; ann and
     seg times are the engine's rebased session clock. Evidence prints both."""
@@ -559,13 +599,13 @@ def grade_p3(gate: Gate, session: Path, rows: list[dict], run: dict | None) -> N
 def grade_p3_track(gate: Gate, session: Path, rows: list[dict], track: str, pf_on: int, pf_off: int) -> None:
     t = THRESHOLDS
     within = int(t["p3DegradeWithinMs"])
-    anns = [(index, row) for index, row in enumerate(rows) if row.get("t") == "ann"]
-    mine = [(index, row) for index, row in anns if ann_track(row) == track]
-    gaps = [(index, row) for index, row in mine if row.get("kind") == "gap"]
+    mine = [(index, row) for index, row in enumerate(rows) if row.get("t") == "ann" and ann_track(row) == track]
+    gaps, chosen, resumed = p3_chain(rows, track, pf_on)
     # P3.a
-    if not gate.check(f"{track}:gap", bool(gaps), f"{len(gaps)} gap ann(s) with track={track}"):
+    if not gate.check(f"{track}:gap", chosen is not None, f"{len(gaps)} gap ann(s) with track={track}"):
         return
-    gap_index, gap = next(((index, row) for index, row in gaps if int(row["detail"].get("toMs", 0)) >= pf_on), gaps[0])
+    assert chosen is not None
+    gap_index, gap = chosen
     gap_from = int(gap["detail"].get("fromMs", 0))
     gap_to = int(gap["detail"].get("toMs", 0))
     span = gap_to - gap_from
@@ -586,10 +626,6 @@ def grade_p3_track(gate: Gate, session: Path, rows: list[dict], track: str, pf_o
         bool(degrades),
         f"degraded track={track} at {int(degrades[0][1]['atMs'])} in [{pf_on}, {pf_on + within}]" if degrades
         else f"no degraded with track={track} in [{pf_on}, {pf_on + within}]",
-    )
-    resumed = next(
-        ((index, row) for index, row in mine if index > gap_index and row.get("kind") == "resumed"),
-        None,
     )
     if not gate.check(f"{track}:resumed", resumed is not None, f"resumed track={track} after the gap " + ("present" if resumed else "missing")):
         return
@@ -626,7 +662,7 @@ def grade_p3_track(gate: Gate, session: Path, rows: list[dict], track: str, pf_o
         )
     # P3.e. The first finals after resume are replayed/queued audio.
     backlog = detail_int(resumed_row, "backlogMs")
-    assumed = backlog if backlog is not None else span + int(t["p3FallbackReplayMs"])
+    assumed = p3_assumed_backlog_ms(resumed_row, gap, t)
     live_from = resumed_at + assumed + int(t["p3LiveMarginMs"])
     segs = [row for row in rows_of(rows, "seg") if row.get("track") == track]
     live = [row for row in segs if int(row.get("startMs", 0)) >= live_from]

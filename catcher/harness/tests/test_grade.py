@@ -436,6 +436,26 @@ class P3Tests(TempRoot):
         self.assertEqual(grade.p3_system_tail_need_ms(52742, 18020), 88762)
         self.assertLess(81478, 88762)
 
+    def test_harness_waits_on_the_chain_the_grader_grades(self) -> None:
+        session = self.session()
+        session.ann(2000, "gap", {"fromMs": 1000, "toMs": 2000, "track": "system"})
+        session.ann(2000, "resumed", "transport resumed track=system backlogMs=500")
+        pf_on_wall = START_WALL_MS + 5000
+        # Only the pre-block reconnect so far: the harness keeps waiting.
+        self.assertIsNone(grade.p3_harness_tail_need_ms(session.rows, pf_on_wall))
+        session.ann(10000, "degraded", "ws closed (1006); reconnect #1 in 1s track=system")
+        session.ann(34000, "gap", {"fromMs": 10000, "toMs": 26000, "track": "system"})
+        self.assertIsNone(grade.p3_harness_tail_need_ms(session.rows, pf_on_wall))
+        session.ann(26000, "resumed", "transport resumed track=system backlogMs=20000")
+        # 26000 + 20000 + 3000 + 20000 - 5000
+        self.assertEqual(grade.p3_harness_tail_need_ms(session.rows, pf_on_wall), 64000)
+
+    def test_harness_ignores_a_microphone_resume(self) -> None:
+        session = self.session()
+        session.ann(26000, "gap", {"fromMs": 10000, "toMs": 26000, "track": "microphone"})
+        session.ann(26000, "resumed", "transport resumed track=microphone backlogMs=20000")
+        self.assertIsNone(grade.p3_harness_tail_need_ms(session.rows, START_WALL_MS + 5000))
+
     def test_resume_while_pf_on_is_invalid(self) -> None:
         p3_run(self.root, pf_on=5000, pf_off=40000)
         result = run("P3", p3_good(self).write())

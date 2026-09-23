@@ -2,9 +2,9 @@
 # Block api.x.ai for 15s mid-session. Requires root and CATCHER_ALLOW_PF=1.
 # The fixture loops the whole time so there is live speech before, during,
 # and after the block. pf on/off wall times go into harness_run.json. After
-# the rule clears the script waits for resumed on the system track, then
-# keeps the session clock running until system:tail's horizon
-# (resumed.atMs + backlogMs + margin + 20s - 5s) before it stops the app.
+# the rule clears the script waits for the system resume grade.py will grade
+# (the first gap ending at or after pfOn), then keeps recording until
+# system:tail's horizon (resumed.atMs + backlogMs + margin + 20s - 5s).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 source "$ROOT/lib.sh"
@@ -48,101 +48,71 @@ append_harness_field "$SESSION" pfOnWallMs "$(wall_ms)"
 sleep 15
 pfctl -a catcher -F all || true
 append_harness_field "$SESSION" pfOffWallMs "$(wall_ms)"
-echo "Network restored. Waiting for resumed track=system (up to p3ResumeWithinMs)."
+echo "Network restored. Waiting for the system resume grade.py will grade."
 TARGET="$(resolve_session "$SESSION")"
-NEED="$(python3 - "$TARGET" "$ROOT/thresholds.json" "$ROOT" <<'PY'
-import json, re, sys, time
-from datetime import datetime
+NEED="$(python3 - "$TARGET" "$ROOT" "$SESSION/harness_run.json" <<'PY'
+import json, sys, time
 
-session, thresholds_path, root = sys.argv[1], sys.argv[2], sys.argv[3]
+session, root, run_path = sys.argv[1], sys.argv[2], sys.argv[3]
 sys.path.insert(0, root)
-from grade import p3_system_tail_need_ms
+import grade
 
-thresholds = json.load(open(thresholds_path))
-deadline = time.time() + thresholds["p3ResumeWithinMs"] / 1000
-
-
-def session_started_ms(lines):
-    for line in lines:
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if row.get("t") != "session":
-            continue
-        raw = row.get("startedAt")
-        if not isinstance(raw, str):
-            return None
-        try:
-            return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp() * 1000)
-        except ValueError:
-            return None
-    return None
+run = json.load(open(run_path, encoding="utf-8"))
+t = grade.THRESHOLDS
+# The grader times the resume by its backdated atMs (the gap end). The row is
+# written after the post-resume final wait (GrokEngine.postResumeBudgetMs, 8s)
+# and the new socket's handshake (5s), so a resume the grader accepts can land
+# on disk up to ~13s after pfOff + p3ResumeWithinMs.
+write_lag_s = 15
+deadline = run["pfOffWallMs"] / 1000 + t["p3ResumeWithinMs"] / 1000 + write_lag_s
 
 
-found = None
-while time.time() < deadline and found is None:
+def read_rows():
     try:
         lines = open(f"{session}/events.jsonl", encoding="utf-8").read().splitlines()
     except OSError:
-        lines = []
-    gap_span = None
+        return []
+    rows = []
     for line in lines:
         try:
-            row = json.loads(line)
+            rows.append(json.loads(line))
         except json.JSONDecodeError:
             continue
-        detail = row.get("detail")
-        if row.get("kind") == "gap" and isinstance(detail, dict) and detail.get("track") == "system":
-            gap_span = int(detail.get("toMs", 0)) - int(detail.get("fromMs", 0))
-        # The heartbeat resumed (no backlog, before this gap) is not the chain.
-        if (
-            row.get("kind") == "resumed"
-            and isinstance(detail, str)
-            and "track=system" in detail
-            and gap_span is not None
-        ):
-            match = re.search(r"backlogMs=(\d+)", detail)
-            backlog = int(match.group(1)) if match else gap_span + int(thresholds["p3FallbackReplayMs"])
-            found = (session_started_ms(lines), int(row.get("atMs", 0)), backlog)
-            break
-    if found is None:
+    return rows
+
+
+need = None
+rows = []
+while need is None and time.time() < deadline:
+    rows = read_rows()
+    need = grade.p3_harness_tail_need_ms(rows, run["pfOnWallMs"])
+    if need is None:
         time.sleep(0.5)
 
-if found is None:
+if need is None:
     print(0)
     raise SystemExit(0)
 
-started, resumed_at, backlog = found
-need = p3_system_tail_need_ms(resumed_at, backlog, thresholds)
-# Kill a second past the bar so the end stamp still satisfies end >= need.
+# Keep recording, not only the clock, until a second past the bar: the live
+# window after the backlog needs speech in it. Same wall map as the pf window.
+started = grade.session_start_ms(rows)
 target = need + 1000
-if started is None:
-    time.sleep(max(0, target - resumed_at) / 1000)
-    print(need)
-    raise SystemExit(0)
-
-# Same map as grade.py's pf window: unix ms minus the session header.
-# Cap the wait so a bad header cannot hang the gate.
 cap = time.time() + 90
-while time.time() < cap:
-    session_now = int(time.time() * 1000) - started
-    if session_now >= target:
-        break
+while time.time() < cap and int(time.time() * 1000) - started < target:
     time.sleep(0.25)
 print(need)
 PY
 )"
 if [[ "$NEED" == "0" ]]; then
-  echo "No resumed track=system within the resume window. Stopping; the grade will say why." >&2
+  echo "No system resume for the pf block within the resume window. Stopping; the grade will say why." >&2
 else
-  echo "Session clock covered system:tail (need end >= ${NEED})."
+  echo "Recorded through system:tail (need end >= ${NEED})."
 fi
 PID="$(cat "$SESSION/catcher.pid")"
 kill "$PID" || true
-# stopAfterLiveTail may still be holding the host clock. Grade after it exits
-# so the end row is the post-hold stamp, not the pre-hold transcript.
-for _ in $(seq 1 100); do
+# stopAfterLiveTail keeps recording up to 30s when the signal lands before the
+# floor. Grade after exit so the end row is the post-hold stamp.
+for _ in $(seq 1 180); do
   if ! kill -0 "$PID" 2>/dev/null; then
     break
   fi
