@@ -53,4 +53,4 @@ Default: `~/Library/Application Support/Catcher/sessions/<uuid>/`
 
 Override the parent directory with `CATCHER_SESSION_ROOT`.
 
-QA steps: [`docs/qa/v0-grading.md`](../docs/qa/v0-grading.md). v0 stays red until that run produces `grade.json` with P1–P6 `pass` on a physical Mac.
+QA steps: [`docs/qa/v0-grading.md`](../docs/qa/v0-grading.md). v0 stays red until `run.sh verdict` on a physical Mac writes `v0-verdict.json` with `GREEN` for the SHA.

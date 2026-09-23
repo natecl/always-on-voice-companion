@@ -1,6 +1,6 @@
 # v0 stage diagnostics
 
-A failed or empty take writes a checkpoint for each pipeline stage, then two `TRACE` lines naming the first failure and a probable fix. These files do not grade P1–P6. `grade.py` never reads them. v0 stays red until a Mac `grade.json` has P1–P6 all `pass`.
+A failed or empty take writes a checkpoint for each pipeline stage, then two `TRACE` lines naming the first failure and a probable fix. These files do not grade P1–P6. `grade.py` never reads them. v0 stays red until a Mac `v0-verdict.json` is `GREEN` for the SHA (see [`v0-grading.md`](v0-grading.md)).
 
 ## Where the lines go
 
@@ -114,4 +114,4 @@ First match wins. `TRACE error=` is the underlying error (domain and code, OSSta
 | `transcript-write` | `error=` present | assemble/end failed | the error names the path and errno |
 | `transcript-write` | `bytes=0` and `segments=0` | nothing to write | the trace points upstream; this is a symptom |
 
-Mid-session Screen Recording revoke and socket reconnect are graded from `blocked`, `degraded`, `gap`, and `resumed` annotations. They do not add a stage line.
+Mid-session Screen Recording revoke and socket reconnect are graded from `blocked`, `degraded`, `gap`, and `resumed` annotations. They do not add a stage line. `degraded` and `resumed` detail text ends in `track=<t>`, and `resumed` carries `backlogMs=<n>` (audio the new socket replays before live). `noAudio` and heartbeat/handshake `degraded` carry `emittedAtMs=`; `noAudio` also carries `observedFromMs=` (capture start). `stages.log` is still never read by `grade.py`; provenance comes from `harness_run.json`, not from stage lines.

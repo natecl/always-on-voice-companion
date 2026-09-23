@@ -1,6 +1,6 @@
 # v0 verifier harden — plan (plan only)
 
-**Status:** plan doc, no code. Audited at `95837a8891a07f4169ecfa9b869a7a80c4545ad3` (Mac GREEN as reported). Planning climb ran on claude-opus-5-5. The implementation climb runs on grok-4.7 with `fast=false`.
+**Status:** implemented on `cursor/verifier-harden-plan-3862` (outline steps 1–9; step 10 is the operator Mac run). Audited at `95837a8891a07f4169ecfa9b869a7a80c4545ad3` (Mac GREEN as reported). Planning and implementation climbs ran on claude-opus-5-5. Deviation: P4.d and P1.n/P6.n use a grader-only speech-evidence floor (`speechEvidenceRmsFloor` 0.025) so the §4.4 fixture (speech at 0.04) is caught; the verifier floor stays 0.05.
 
 **Goal:** `grade.py` and the verifier must not report `pass` for a run that did not prove the gate. Three soft-pass classes are closed:
 
