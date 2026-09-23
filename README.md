@@ -20,9 +20,15 @@ Jevons-paradox unlock that makes always-on judgment squanderable at consumer pri
 - **Better** — kill all friction: no bot to invite, just on. Faster (near-zero latency) and cheaper.
 - **New** — always-listening voice buddy with full life context. Gets the trial; expect it to be wrong first.
 
+v0 transcript foundation: green on Mac at `95837a8`.
+
 ## Repo map
 
 - `catcher/` — v0 Mac catcher (system audio + mic → verified transcript). QA: `docs/qa/v0-grading.md`
+- `docs/qa/v0-diagnostics.md` — stage checkpoints and preflight; these files do not grade P1–P6
+- `docs/knowledge/08-capture-layer.md` — shipped capture, reconnect, and noAudio
+- `docs/knowledge/09-v0-shipped.md` — what the v0 transcript foundation is, and the Mac evidence
+- `docs/plans/` — plans, including the v0 knowledge refresh
 - `docs/product-vision.md` — overarching product vision spec
 - `docs/proven-better-new.md` — the PBN framework, plus our PBN applied
 - `docs/knowledge/jev.md` — Jev model facts, pricing, access
