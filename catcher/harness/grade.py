@@ -505,19 +505,147 @@ def grade_p2(gate: Gate, rows: list[dict], revoke_at: int | None) -> None:
     gate.check("no-seg-after-block", not late, f"{len(late)} seg(s) after the block")
 
 
-def grade_p3(gate: Gate, rows: list[dict]) -> None:
-    anns = rows_of(rows, "ann")
-    degraded_at = next((index for index, row in enumerate(anns) if row.get("kind") == "degraded"), None)
-    gap_at = next((index for index, row in enumerate(anns) if row.get("kind") == "gap"), None)
-    resumed_at = next((index for index, row in enumerate(anns) if row.get("kind") == "resumed"), None)
-    if degraded_at is None or gap_at is None or resumed_at is None:
-        gate.check("chain", False, "need ann kinds degraded, gap, resumed in that order")
+def ann_track(row: dict) -> str | None:
+    detail = row.get("detail")
+    if isinstance(detail, dict):
+        track = detail.get("track")
+        return str(track) if track is not None else None
+    return detail_field(row, "track")
+
+
+def session_end_ms(rows: list[dict]) -> int:
+    ends = rows_of(rows, "end")
+    if ends:
+        return int(ends[-1].get("atMs", 0))
+    last = 0
+    for row in rows:
+        last = max(last, int(row.get("atMs", 0) or 0), int(row.get("endMs", 0) or 0))
+    return last
+
+
+def grade_p3(gate: Gate, session: Path, rows: list[dict], run: dict | None) -> None:
+    """Clocks: pfOn/pfOff are wall time mapped through startedAt; ann and
+    seg times are the engine's rebased session clock. Evidence prints both."""
+    run = run or {}
+    pf_on = wall_to_session_ms(rows, run.get("pfOnWallMs")) if isinstance(run.get("pfOnWallMs"), int) else None
+    pf_off = wall_to_session_ms(rows, run.get("pfOffWallMs")) if isinstance(run.get("pfOffWallMs"), int) else None
+    if not gate.check(
+        "pf-window",
+        pf_on is not None and pf_off is not None and pf_off > pf_on,
+        f"pfOn={pf_on} pfOff={pf_off} session ms (harness_run.json pfOnWallMs/pfOffWallMs)",
+    ):
         return
-    if not gate.check("order", degraded_at < gap_at < resumed_at, f"degraded={degraded_at} gap={gap_at} resumed={resumed_at}"):
+    assert pf_on is not None and pf_off is not None
+    mic_gap = any(
+        row.get("t") == "ann" and row.get("kind") == "gap" and ann_track(row) == "microphone" for row in rows
+    )
+    grade_p3_track(gate, session, rows, "system", pf_on, pf_off)
+    if mic_gap:
+        grade_p3_track(gate, session, rows, "microphone", pf_on, pf_off)
+
+
+def grade_p3_track(gate: Gate, session: Path, rows: list[dict], track: str, pf_on: int, pf_off: int) -> None:
+    t = THRESHOLDS
+    within = int(t["p3DegradeWithinMs"])
+    anns = [(index, row) for index, row in enumerate(rows) if row.get("t") == "ann"]
+    mine = [(index, row) for index, row in anns if ann_track(row) == track]
+    gaps = [(index, row) for index, row in mine if row.get("kind") == "gap"]
+    # P3.a
+    if not gate.check(f"{track}:gap", bool(gaps), f"{len(gaps)} gap ann(s) with track={track}"):
         return
-    resumed_ms = int(anns[resumed_at].get("atMs", 0))
-    later = [row for row in rows_of(rows, "seg") if int(row.get("startMs", 0)) >= resumed_ms]
-    gate.check("seg-after-resume", bool(later), f"{len(later)} seg(s) at or after resumed atMs")
+    gap_index, gap = next(((index, row) for index, row in gaps if int(row["detail"].get("toMs", 0)) >= pf_on), gaps[0])
+    gap_from = int(gap["detail"].get("fromMs", 0))
+    gap_to = int(gap["detail"].get("toMs", 0))
+    span = gap_to - gap_from
+    gate.check(
+        f"{track}:gap-span",
+        span >= int(t["p3MinGapSpanMs"]),
+        f"gap {gap_from}-{gap_to} spans {span}ms (need {int(t['p3MinGapSpanMs'])}); "
+        + ("ok" if span >= int(t["p3MinGapSpanMs"]) else "block shorter than expected; check pfctl -a catcher -sr"),
+        PREMISE_CHECK,
+    )
+    # P3.b. Startup handshake and earlier heartbeat degrades are not the chain.
+    degrades = [
+        (index, row) for index, row in mine
+        if row.get("kind") == "degraded" and pf_on <= int(row.get("atMs", -1)) <= pf_on + within
+    ]
+    tied = gate.check(
+        f"{track}:degrade-in-block",
+        bool(degrades),
+        f"degraded track={track} at {int(degrades[0][1]['atMs'])} in [{pf_on}, {pf_on + within}]" if degrades
+        else f"no degraded with track={track} in [{pf_on}, {pf_on + within}]",
+    )
+    resumed = next(
+        ((index, row) for index, row in mine if index > gap_index and row.get("kind") == "resumed"),
+        None,
+    )
+    if not gate.check(f"{track}:resumed", resumed is not None, f"resumed track={track} after the gap " + ("present" if resumed else "missing")):
+        return
+    assert resumed is not None
+    resumed_index, resumed_row = resumed
+    resumed_at = int(resumed_row.get("atMs", 0))
+    # P3.c
+    if tied:
+        degraded_index = degrades[0][0]
+        gate.check(
+            f"{track}:order",
+            degraded_index < gap_index < resumed_index,
+            f"file order degraded={degraded_index} gap={gap_index} resumed={resumed_index}",
+        )
+    gate.check(
+        f"{track}:gap-covers-block",
+        gap_from <= pf_on + within and gap_to >= pf_off - 1000,
+        f"gap {gap_from}-{gap_to} vs block {pf_on}-{pf_off}",
+    )
+    # P3.d
+    if resumed_at < pf_off - 1000:
+        gate.check(
+            f"{track}:resume-after-unblock",
+            False,
+            f"resumed atMs={resumed_at} while pf was still on (pfOff={pf_off}); the block was not real",
+            PREMISE_CHECK,
+        )
+    else:
+        upper = pf_off + int(t["p3ResumeWithinMs"])
+        gate.check(
+            f"{track}:resume-after-unblock",
+            resumed_at <= upper,
+            f"resumed atMs={resumed_at} (engine clock) in [{pf_off - 1000}, {upper}] (wall pfOff={pf_off})",
+        )
+    # P3.e. The first finals after resume are replayed/queued audio.
+    backlog = detail_int(resumed_row, "backlogMs")
+    assumed = backlog if backlog is not None else span + int(t["p3FallbackReplayMs"])
+    live_from = resumed_at + assumed + int(t["p3LiveMarginMs"])
+    segs = [row for row in rows_of(rows, "seg") if row.get("track") == track]
+    live = [row for row in segs if int(row.get("startMs", 0)) >= live_from]
+    backlog_segs = [row for row in segs if resumed_at <= int(row.get("startMs", 0)) < live_from]
+    words = sum(len(str(row.get("text", "")).split()) for row in live)
+    need_live = track == "system" or bool([
+        run for run in sustained_runs(pcm_windows_ac(session / f"{track}.pcm"), float(t["speechEvidenceRmsFloor"]))
+        if run[1] > live_from
+    ])
+    backlog_note = f"backlogMs={backlog}" if backlog is not None else f"no backlogMs; assumed gap+{int(t['p3FallbackReplayMs'])}={assumed}"
+    detail = (
+        f"{len(live)} live seg(s), {words} words from liveFrom={live_from} "
+        f"(resumed {resumed_at} + {backlog_note} + margin {int(t['p3LiveMarginMs'])}); "
+        f"{len(backlog_segs)} backlog seg(s) in [resumed, liveFrom) do not count"
+    )
+    if need_live:
+        gate.check(f"{track}:live-seg", bool(live) and words >= int(t["p3MinLiveWords"]), detail + f" (need {int(t['p3MinLiveWords'])} words)")
+    else:
+        gate.check(f"{track}:live-seg", True, "no sustained speech in the PCM after liveFrom; " + detail)
+    # P3.f
+    relapses: list[str] = []
+    for index, row in mine:
+        if index <= resumed_index or row.get("kind") not in ("degraded", "gap"):
+            continue
+        if not any(later > index and other.get("kind") == "resumed" for later, other in mine):
+            relapses.append(f"{row.get('kind')} at {row.get('atMs')} (line {index + 1}) with no later resumed")
+    gate.check(f"{track}:no-relapse", not relapses, "; ".join(relapses) or "no degrade or gap left open after resume")
+    if track == "system":
+        end = session_end_ms(rows)
+        need_end = live_from + int(t["p3MinTailMs"]) - 5000
+        gate.check(f"{track}:tail", end >= need_end, f"session ends at {end}, need {need_end} (liveFrom + tail - 5s)")
 
 
 def grade_p4(gate: Gate, session: Path, rows: list[dict], silence_at: int | None) -> None:
@@ -680,7 +808,7 @@ def grade_gate(
     elif name == "P2":
         grade_p2(gate, rows, revoke_at)
     elif name == "P3":
-        grade_p3(gate, rows)
+        grade_p3(gate, session, rows, run)
     elif name == "P4":
         grade_p4(gate, session, rows, silence_at)
     elif name == "P5":

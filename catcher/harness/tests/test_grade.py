@@ -353,6 +353,116 @@ class NoAudioOverSpeechTests(TempRoot):
         self.assertIn("mic-speech-clears-floor", failed(run("P6", session.write())))
 
 
+START_WALL_MS = 1790139600000  # 2026-09-23T05:00:00.000Z, the synthetic header
+LIVE = "the quick brown fox jumps over the lazy dog again and again"
+
+
+def p3_run(root: Path, pf_on: int = 5000, pf_off: int = 20000, **overrides) -> dict:
+    return harness_run(root, "P3", pfOnWallMs=START_WALL_MS + pf_on, pfOffWallMs=START_WALL_MS + pf_off, **overrides)
+
+
+def p3_good(case: TempRoot, *, backlog: int | None = 20000, live_at: int = 50000, end: int = 70000) -> Session:
+    """pf 5000-20000. Engine degrade at 10000, gap 10000-26000, resumed at 26000."""
+    session = case.session()
+    session.seg("system", 1000, 4000, "before the block")
+    session.ann(10000, "degraded", "ws closed (1006); reconnect #1 in 1s track=system")
+    session.ann(26000, "gap", {"fromMs": 10000, "toMs": 26000, "track": "system"})
+    resumed = "transport resumed track=system" + (f" backlogMs={backlog}" if backlog is not None else "")
+    session.ann(26000, "resumed", resumed)
+    session.seg("system", 26000, 29000, "replayed backlog words")
+    session.seg("system", live_at, live_at + 4000, LIVE)
+    session.end(end)
+    return session
+
+
+class P3Tests(TempRoot):
+    def test_block_resume_and_live_speech_past_backlog_has_all_checks_ok(self) -> None:
+        p3_run(self.root)
+        assert_checks_ok_but_unproven(self, run("P3", p3_good(self).write()))
+
+    def test_todays_shape_one_backlog_seg_at_resumed_fails(self) -> None:
+        # 95837a8: degraded, seg at resumed.atMs, gap, resumed. No track, no
+        # backlog, and the only seg after resume is replayed audio.
+        p3_run(self.root)
+        session = self.session()
+        session.ann(10000, "degraded", "ws closed (1006); reconnect #1 in 1s")
+        session.seg("system", 26000, 29000, "replayed backlog words")
+        session.ann(26000, "gap", {"fromMs": 10000, "toMs": 26000, "track": "system"})
+        session.ann(26000, "resumed", "transport resumed")
+        session.end(40000)
+        result = run("P3", session.write())
+        self.assertEqual(result["result"], "fail")
+        self.assertIn("system:degrade-in-block", failed(result))
+        self.assertIn("system:resumed", failed(result))
+
+    def test_tracked_chain_with_only_backlog_segs_fails_live_seg(self) -> None:
+        p3_run(self.root)
+        result = run("P3", p3_good(self, live_at=40000).write())
+        self.assertEqual(result["result"], "fail")
+        self.assertIn("system:live-seg", failed(result))
+        self.assertIn("backlog seg(s)", result["evidence"])
+
+    def test_missing_backlog_uses_the_conservative_fallback(self) -> None:
+        p3_run(self.root)
+        # liveFrom = 26000 + 16000 gap + 30000 + 3000 = 75000.
+        self.assertIn("system:live-seg", failed(run("P3", p3_good(self, backlog=None).write())))
+
+    def test_startup_handshake_degrade_plus_unrelated_gap_fails(self) -> None:
+        p3_run(self.root)
+        session = self.session()
+        session.ann(2000, "degraded", "no transcript.created within 5000ms track=system emittedAtMs=2100")
+        session.ann(26000, "gap", {"fromMs": 10000, "toMs": 26000, "track": "system"})
+        session.ann(26000, "resumed", "transport resumed track=system backlogMs=0")
+        session.seg("system", 30000, 34000, LIVE).end(60000)
+        result = run("P3", session.write())
+        self.assertEqual(result["result"], "fail")
+        self.assertIn("system:degrade-in-block", failed(result))
+
+    def test_relapse_after_resume_fails(self) -> None:
+        p3_run(self.root)
+        session = p3_good(self)
+        session.rows.insert(-1, {"t": "ann", "atMs": 60000, "kind": "degraded", "detail": "ws closed (1006); reconnect #1 in 1s track=system"})
+        result = run("P3", session.write())
+        self.assertEqual(result["result"], "fail")
+        self.assertIn("system:no-relapse", failed(result))
+
+    def test_short_tail_fails(self) -> None:
+        p3_run(self.root)
+        self.assertIn("system:tail", failed(run("P3", p3_good(self, end=55000).write())))
+
+    def test_resume_while_pf_on_is_invalid(self) -> None:
+        p3_run(self.root, pf_on=5000, pf_off=40000)
+        result = run("P3", p3_good(self).write())
+        self.assertEqual(result["result"], "invalid")
+        self.assertIn("system:resume-after-unblock", failed(result))
+
+    def test_short_block_is_invalid(self) -> None:
+        p3_run(self.root)
+        session = p3_good(self)
+        session.rows[3]["detail"] = {"fromMs": 20000, "toMs": 26000, "track": "system"}
+        result = run("P3", session.write())
+        self.assertEqual(result["result"], "invalid")
+        self.assertIn("system:gap-span", failed(result))
+
+    def test_missing_pf_window_fails(self) -> None:
+        harness_run(self.root, "P3")
+        result = run("P3", p3_good(self).write())
+        self.assertEqual(result["result"], "fail")
+        self.assertIn("pf-window", failed(result))
+
+    def test_microphone_gap_needs_its_own_resumed(self) -> None:
+        p3_run(self.root)
+        session = p3_good(self)
+        session.rows.insert(3, {"t": "ann", "atMs": 25000, "kind": "gap", "detail": {"fromMs": 10500, "toMs": 25000, "track": "microphone"}})
+        session.rows.insert(2, {"t": "ann", "atMs": 10500, "kind": "degraded", "detail": "ws closed (1006); reconnect #1 in 1s track=microphone"})
+        result = run("P3", session.write())
+        self.assertEqual(result["result"], "fail")
+        self.assertIn("microphone:resumed", failed(result))
+        # The system resumed does not stand in for the microphone.
+        session.rows.insert(-1, {"t": "ann", "atMs": 25000, "kind": "resumed", "detail": "transport resumed track=microphone backlogMs=15000"})
+        assert_checks_ok_but_unproven(self, run("P3", session.write()))
+
+
 class P1GapTests(TempRoot):
     def test_dc_offset_system_pcm_is_not_a_false_hole(self) -> None:
         text = REF.read_text()
