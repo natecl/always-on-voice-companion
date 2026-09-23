@@ -1,6 +1,6 @@
 # v0 feature map
 
-Hardened GREEN at `b14e31a` (`b14e31a99a431e5cac6a49669f5c1955de38a1d1`). CDHash `57250034b55e54e3ad6798983edf6e62c1553653`. Board `/tmp/catcher-auto/b14e31a-20260923-055848/board.json` (path only; the board is not in git). Preflight and P1–P6 pass under the hardened verifier (soft-pass killed). This supersedes the `95837a8` / CDHash `62450598` / board `/tmp/catcher-auto/95837a8-20260923-003139/board.json` grade. The cite is the grade. Reconcile and merge stay with Cap/Nathan.
+Hardened GREEN at `b14e31a` (`b14e31a99a431e5cac6a49669f5c1955de38a1d1`). CDHash `57250034b55e54e3ad6798983edf6e62c1553653`. Board `/tmp/catcher-auto/b14e31a-20260923-055848/board.json` (path only; the board is not in git). Preflight and P1–P6 pass under the hardened verifier (soft-pass killed). This supersedes the `95837a8` / CDHash `62450598` / board `/tmp/catcher-auto/95837a8-20260923-003139/board.json` grade. The cite is the grade. Landed on `main` via #5 (`ab4e260`; includes #9 merge `ee4e6da` into catcher).
 
 `MicrophoneGain` sits on the mic path (`catcher/Sources/AudioCapture/MicrophoneGain.swift`). The `noAudio` floor stays 0.05. The tip adds gain so held speech clears a median ≥ 0.1000. This run: micGainMax 16, P6 p50 0.2039.
 

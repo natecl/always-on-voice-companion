@@ -5,7 +5,7 @@ evidence at `b14e31a` (`b14e31a99a431e5cac6a49669f5c1955de38a1d1`), CDHash
 `57250034b55e54e3ad6798983edf6e62c1553653`, board
 `/tmp/catcher-auto/b14e31a-20260923-055848/board.json`
 ([FEATURE_MAP.md](FEATURE_MAP.md), [09-v0-shipped.md](knowledge/09-v0-shipped.md)).
-Notes, Jev, and the judgment brief are not in that grade. Reconcile and merge stay with Cap/Nathan.
+Notes, Jev, and the judgment brief are not in that grade. Foundation code is on `main` (`ab4e260`).
 
 ## One-liner
 
@@ -70,7 +70,7 @@ the entire bet.
   `/tmp/catcher-auto/b14e31a-20260923-055848/board.json`. `MicrophoneGain` on the mic path
   (floor 0.05 unchanged); held speech median clears ≥ 0.1000 (P6 p50 0.2039, micGainMax 16).
   P4 passing does not prove system audio was captured.
-  See [09-v0-shipped.md](knowledge/09-v0-shipped.md). This is the grade, not a merge.
+  See [09-v0-shipped.md](knowledge/09-v0-shipped.md). The Mac grade is SoT; the foundation is on `main` (`ab4e260`).
 - **v0 catcher — next.** Jev judges every utterance → 2-second judgment brief.
   The test is unchanged: is the brief the heat?
 - **v1 — the participant.** Live in-conversation: turn to it mid-call, ask with full context.
