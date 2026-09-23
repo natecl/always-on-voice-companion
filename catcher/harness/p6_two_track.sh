@@ -8,6 +8,7 @@ mkdir -p "$SESSION"
 export CATCHER_ENGINE=grok
 begin_harness_run "$SESSION" P6
 launch_catcher "$SESSION" 1
+require_fixture_play "$SESSION"
 echo "Speak at normal conversational volume, at arm's length from the Mac, while the fixture plays."
 afplay "$ROOT/fixtures/known-60s.wav" &
 sleep 20

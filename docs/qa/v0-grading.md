@@ -46,13 +46,14 @@ A stub engine header on P1, P3, or P6 is `fail` ("stub engine cannot prove P1/P3
 
    If the window shows a red line under `BLOCKED`, read it: it is the same text as the Console line `Catcher mic authority …` and names the one fix. `audioInputEntitlement=false` with `hardenedRuntime=true` means the bundle was signed without `com.apple.security.device.audio-input`; rebuild with `build-app.sh` (it now fails a build like that). `ownsTCCIdentity=false responsible=Terminal` means it was started from a shell; press **Relaunch Catcher for microphone** or quit and use `open -n`. `status=notDetermined` means Allow can still appear; press **Request microphone** with Catcher in front. `status=denied` means Catcher has a denied row; Re-grant opens Privacy → Microphone where the toggle is. `status=authorized ownsTCCIdentity=true audioInputEntitlement=true` with any denied banner is a bug — copy the Console line and the banner into the report. Quit Zoom before retrying; a call can suppress Allow.
 4. `export XAI_API_KEY=...` for any gate that uses Grok (`P1`, `P3`, `P6`). `CATCHER_ENGINE=grok` is the default. `CATCHER_ENGINE=stub` forces the deterministic engine.
-5. Run preflight before P1. Do not start P1 on a FAIL line; the fix on that line is the next action.
+5. Run preflight before P1. The meta cycle stops on a FAIL line and does not launch P1–P6 or play the fixture. The fix on that line is the next action.
 
    ```bash
    ./catcher/harness/run.sh preflight /tmp/catcher-pre
+   ./catcher/harness/run.sh cycle /tmp/catcher-auto/<sha>-<stamp>
    ```
 
-   The command exits 0 only when `/tmp/catcher-pre/preflight.txt` ends in `PREFLIGHT RESULT PASS`. Checks, the sample stage log, and how to read a failure are in [`v0-diagnostics.md`](v0-diagnostics.md).
+   `preflight` exits 0 only when `preflight.txt` ends in `PREFLIGHT RESULT PASS`. `cycle` writes `board.json` and returns on any other result. `PREFLIGHT tcc-screen FAIL` (`screen recording access denied`) is a host wall: Cap re-arms after Nathan re-grants Screen & System Audio Recording for `com.catcher.app`. It is not a soft-pass. Checks and the board fields are in [`v0-diagnostics.md`](v0-diagnostics.md).
 6. Replace `catcher/harness/fixtures/known-60s.wav` with a clear ~60 s reading of `known-60s.ref.txt` before scoring P1. The file in git is a 16 kHz mono PCM16 carrier so the script has something to play. It is not that reading. WER against the reference will fail until you replace it.
 
 ## How a run is laid out

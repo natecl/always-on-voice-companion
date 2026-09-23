@@ -10,6 +10,7 @@ export CATCHER_ENGINE=grok
 begin_harness_run "$SESSION" P1
 launch_catcher "$SESSION" 1
 sleep 2
+require_fixture_play "$SESSION"
 afplay "$ROOT/fixtures/known-60s.wav"
 sleep 2
 kill -9 "$(cat "$SESSION/catcher.pid")" || true

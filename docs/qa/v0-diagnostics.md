@@ -86,7 +86,13 @@ Preflight runs inside `Catcher.app` launched through LaunchServices (`open -n -W
 
 When `CATCHER_ENGINE=stub`, the four API checks print `PASS skipped=stub`.
 
-Do not start P1 on a FAIL line. The cause table below is the next action for a session trace. A preflight FAIL names the check in `preflight.txt`.
+Do not start P1 on a FAIL line. The autonomous entry is `run.sh cycle <run-dir>`. A preflight result other than `PREFLIGHT RESULT PASS` writes `<run-dir>/board.json` (`verdict` `RED`, `gatesLaunched` false, `afplay` false) and returns. P1–P6 are not launched and `afplay` does not start.
+
+`PREFLIGHT tcc-screen FAIL` with `screen recording access denied` is a host wall (`hostWall` `screen-tcc` on that board). Cap re-arms the meta re-prove after Nathan re-grants Screen & System Audio Recording for `com.catcher.app`. The cycle does not soft-pass a Screen TCC deny. `capture-display` `no display` on the same report is recorded with it and does not start the gates.
+
+Each gate that plays the fixture calls `require_fixture_play` first. Audio starts only when `catcher.pid` is alive and Catcher's content window is frontmost and on screen (the harness raises the window, then checks again). A missing or dead pid writes `raise=NO_PROCESS` to `raise.txt` and `blocked.json` (`result` `blocked`) and the gate exits. That is not a pass.
+
+The cause table below is the next action for a session trace. A preflight FAIL names the check in `preflight.txt`.
 
 ## Cause table
 

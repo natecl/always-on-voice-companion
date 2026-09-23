@@ -40,6 +40,7 @@ cleanup() {
 }
 trap cleanup EXIT
 launch_catcher "$SESSION" 1
+require_fixture_play "$SESSION"
 (while afplay "$ROOT/fixtures/known-60s.wav"; do :; done) &
 PLAYER=$!
 sleep 5

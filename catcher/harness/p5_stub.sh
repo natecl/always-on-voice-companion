@@ -9,6 +9,7 @@ mkdir -p "$SESSION"
 export CATCHER_ENGINE=stub
 begin_harness_run "$SESSION" P5
 launch_catcher "$SESSION" 1
+require_fixture_play "$SESSION"
 afplay "$ROOT/fixtures/known-60s.wav"
 sleep 2
 # kill -9 leaves no end row. The relaunch runs Recovery, which writes ann + end

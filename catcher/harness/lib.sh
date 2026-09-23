@@ -8,6 +8,12 @@
 # go through --args. There is no direct-exec fallback.
 set -euo pipefail
 
+# Harness directory. This file is sourced, so the caller's $0 is not this
+# path. Gate wrappers and run.sh do not have to export ROOT first. An unbound
+# ROOT under set -u aborted begin_harness_run and launch_via_workspace before
+# any grade.json or events.jsonl existed.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 catcher_bin() {
   local app="${CATCHER_APP:-}"
   if [[ -z "$app" || ! -d "$app" ]]; then
@@ -240,5 +246,125 @@ if not found:
     raise SystemExit(1)
 found.sort()
 print(found[-1][1])
+PY
+}
+
+# Last line of preflight.txt is the verdict. Anything else is a fail.
+preflight_is_pass() {
+  local report="$1"
+  [[ -f "$report" ]] || return 1
+  local last
+  last="$(tail -n 1 "$report" | tr -d '\r')"
+  [[ "$last" == "PREFLIGHT RESULT PASS"* ]]
+}
+
+# Board for a preflight that did not pass. P1–P6 have not been launched.
+# A tcc-screen FAIL is a host wall: Cap re-arms after Nathan re-grants.
+write_preflight_board() {
+  local run="$1"
+  local report="$2"
+  python3 - "$run/board.json" "$report" <<'PY'
+import json, sys
+from pathlib import Path
+
+board_path, report_path = sys.argv[1], sys.argv[2]
+text = ""
+if report_path and Path(report_path).is_file():
+    text = Path(report_path).read_text(encoding="utf-8")
+lines = [line for line in text.splitlines() if line.strip()]
+failed = [
+    line for line in lines
+    if line.startswith("PREFLIGHT ") and " FAIL" in line and not line.startswith("PREFLIGHT RESULT ")
+]
+result = next((line for line in reversed(lines) if line.startswith("PREFLIGHT RESULT ")), "")
+host_wall = None
+note = ""
+if any(line.startswith("PREFLIGHT tcc-screen FAIL") for line in failed):
+    host_wall = "screen-tcc"
+    note = (
+        "Screen TCC deny is a host wall. Cap re-arms after Nathan re-grants "
+        "Screen & System Audio Recording for com.catcher.app. Not a soft-pass."
+    )
+record = {
+    "verdict": "RED",
+    "stopped": "preflight",
+    "preflight": "fail",
+    "resultLine": result,
+    "failedChecks": failed,
+    "gatesLaunched": False,
+    "afplay": False,
+    "softPass": False,
+    "hostWall": host_wall,
+    "hostWallNote": note,
+    "report": report_path,
+}
+Path(board_path).parent.mkdir(parents=True, exist_ok=True)
+Path(board_path).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+# Fixture audio waits until catcher.pid is alive and the content window is
+# frontmost and on screen. A missing or dead pid is raise=NO_PROCESS.
+require_fixture_play() {
+  local session="$1"
+  local evidence status=0
+  evidence="$(ensure_catcher_window "$session")" || status=$?
+  printf '%s\n' "$evidence" > "$session/raise.txt"
+  if [[ "$status" -ne 0 ]]; then
+    printf '%s\n' "$evidence" >&2
+    write_blocked "$session" "$evidence"
+    return "$status"
+  fi
+}
+
+ensure_catcher_window() {
+  local session="$1"
+  local pid=""
+  if [[ -s "$session/catcher.pid" ]]; then
+    pid="$(tr -cd '0-9' < "$session/catcher.pid")"
+  fi
+  if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+    echo "raise=NO_PROCESS pid=${pid:-missing} session=$session"
+    return 1
+  fi
+  local helper="${CATCHER_ENSURE_WINDOW:-}"
+  if [[ -z "$helper" ]]; then
+    helper="$(compile_ensure_window)" || {
+      echo "raise=NO_HELPER pid=$pid session=$session"
+      return 1
+    }
+  fi
+  "$helper" "$pid"
+}
+
+compile_ensure_window() {
+  local src="$ROOT/ensure_window.swift"
+  local bin="${TMPDIR:-/tmp}/catcher-ensure-window"
+  if [[ ! -x "$bin" || "$src" -nt "$bin" ]]; then
+    if ! swiftc -O -framework AppKit -o "$bin" "$src"; then
+      return 1
+    fi
+  fi
+  echo "$bin"
+}
+
+write_blocked() {
+  local session="$1"
+  local evidence="$2"
+  python3 - "$session/blocked.json" "$evidence" <<'PY'
+import json, sys
+from pathlib import Path
+
+path, evidence = sys.argv[1], sys.argv[2]
+token = ""
+if evidence.startswith("raise="):
+    token = evidence.split("=", 1)[1].split()[0]
+record = {
+    "result": "blocked",
+    "raise": token,
+    "evidence": evidence,
+    "softPass": False,
+}
+Path(path).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
 PY
 }
