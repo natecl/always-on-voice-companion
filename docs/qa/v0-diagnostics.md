@@ -69,7 +69,7 @@ export XAI_API_KEY=...
 ./catcher/harness/run.sh preflight /tmp/catcher-pre
 ```
 
-Preflight runs inside `Catcher.app` launched through LaunchServices (`open -n -W` when `open` has `--env`, otherwise the same `NSWorkspace` helper as the gates). It never calls `tccutil` and never prompts. `open` does not pass the app's exit status, so `preflight.txt` is the verdict. The script exits 0 only when the last line is `PREFLIGHT RESULT PASS`.
+Preflight runs inside `Catcher.app` launched through LaunchServices (`open -n` when `open` has `--env`, otherwise the same `NSWorkspace` helper as the gates). It does not use `open -W`. It never calls `tccutil` and never prompts. `open` does not pass the app's exit status, so `preflight.txt` is the verdict. The script exits 0 only when the last line is `PREFLIGHT RESULT PASS`. If that line is still missing 40s after launch, the harness kills that preflight process and appends `PREFLIGHT preflight-finish FAIL error=hang-after-signing` and `PREFLIGHT RESULT FAIL`. The app also starts `--preflight` without waiting for its window and writes the same line if the checks have not returned in 30s.
 
 | Check | PASS when |
 |---|---|
@@ -89,6 +89,8 @@ When `CATCHER_ENGINE=stub`, the four API checks print `PASS skipped=stub`.
 Do not start P1 on a FAIL line. The autonomous entry is `run.sh cycle <run-dir>`. A preflight result other than `PREFLIGHT RESULT PASS` writes `<run-dir>/board.json` (`verdict` `RED`, `gatesLaunched` false, `afplay` false) and returns. P1–P6 are not launched and `afplay` does not start.
 
 `PREFLIGHT tcc-screen FAIL` with `screen recording access denied` is a host wall (`hostWall` `screen-tcc` on that board). Cap re-arms the meta re-prove after Nathan re-grants Screen & System Audio Recording for `com.catcher.app`. The cycle does not soft-pass a Screen TCC deny. `capture-display` `no display` on the same report is recorded with it and does not start the gates.
+
+`error=hang-after-signing` is not that wall. Screen Recording on this Mac is already granted. The board field `hangAfterSigning` is true, `hostWall` stays empty, and the cycle still stops with `gatesLaunched` false and `afplay` false. Do not read the hang as a Screen TCC deny.
 
 Each gate that plays the fixture calls `require_fixture_play` first. Audio starts only when `catcher.pid` is alive and Catcher's content window is frontmost and on screen (the harness raises the window, then checks again). A missing or dead pid writes `raise=NO_PROCESS` to `raise.txt` and `blocked.json` (`result` `blocked`) and the gate exits. That is not a pass.
 

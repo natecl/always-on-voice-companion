@@ -173,6 +173,45 @@ printf 'PREFLIGHT RESULT PASS\n' > "$tmp/preflight/preflight.txt"
 [[ -s "$tmp/gates-ran" ]] || fail "PASS did not reach the gate launcher"
 [[ ! -e "$tmp/board.json" ]] || fail "PASS wrote a preflight-fail board"
 
+# Hang after signing is a preflight-finish FAIL, not a Screen TCC host wall.
+tmp="$(mktemp -d)"
+printf 'PREFLIGHT signing PASS\n' > "$tmp/preflight.txt"
+(
+  set -euo pipefail
+  source "$HARNESS/lib.sh"
+  append_preflight_finish_fail "$tmp/preflight.txt" hang-after-signing
+  append_preflight_finish_fail "$tmp/preflight.txt" hang-after-signing
+)
+result_count="$(grep -c '^PREFLIGHT RESULT ' "$tmp/preflight.txt")"
+[[ "$result_count" == "1" ]] || fail "hang line duplicated the RESULT"
+grep -q 'error=hang-after-signing' "$tmp/preflight.txt" || fail "missing hang-after-signing"
+if grep -q 'tcc-screen' "$tmp/preflight.txt"; then
+  fail "hang-after-signing was written as a screen check"
+fi
+mkdir -p "$tmp/run/preflight"
+cp "$tmp/preflight.txt" "$tmp/run/preflight/preflight.txt"
+(
+  set -euo pipefail
+  source "$HARNESS/cycle.sh"
+  run_cycle_gates() { echo ran > "$1/gates-ran"; }
+  export CATCHER_SKIP_PREFLIGHT_LAUNCH=1
+  if cycle_main "$tmp/run"; then
+    exit 1
+  fi
+)
+[[ ! -e "$tmp/run/gates-ran" ]] || fail "gates launched after hang-after-signing"
+python3 - "$tmp/run/board.json" <<'PY'
+import json, sys
+board = json.load(open(sys.argv[1], encoding="utf-8"))
+assert board["verdict"] == "RED", board
+assert board["gatesLaunched"] is False, board
+assert board["afplay"] is False, board
+assert board["hangAfterSigning"] is True, board
+assert board["hostWall"] is None, board
+assert board["softPass"] is False, board
+assert "hang-after-signing" in " ".join(board["failedChecks"])
+PY
+
 # Fixture play stays behind the window gate in every script that calls afplay.
 python3 - "$HARNESS" <<'PY'
 import pathlib, sys
@@ -188,6 +227,11 @@ if pf.count("sudo -n /sbin/pfctl") < 5:
     raise SystemExit("p3 pfctl wrap regressed")
 if "CATCHER_ALLOW_PF" not in pf:
     raise SystemExit("CATCHER_ALLOW_PF gate missing")
+pre = (root / "preflight.sh").read_text(encoding="utf-8")
+if "open -n -W" in pre:
+    raise SystemExit("preflight still waits on open -W")
+if "hang-after-signing" not in pre:
+    raise SystemExit("preflight has no hang-after-signing timeout")
 PY
 
 echo "cycle guard ok"

@@ -249,6 +249,21 @@ print(found[-1][1])
 PY
 }
 
+# No RESULT line yet. hang-after-signing is a missed quit, not a Screen TCC deny.
+append_preflight_finish_fail() {
+  local report="$1"
+  local error="${2:-hang-after-signing}"
+  if [[ -f "$report" ]]; then
+    local last
+    last="$(tail -n 1 "$report" | tr -d '\r')"
+    if [[ "$last" == "PREFLIGHT RESULT "* ]]; then
+      return 0
+    fi
+  fi
+  mkdir -p "$(dirname "$report")"
+  printf 'PREFLIGHT preflight-finish FAIL error=%s\nPREFLIGHT RESULT FAIL failed=1\n' "$error" >> "$report"
+}
+
 # Last line of preflight.txt is the verdict. Anything else is a fail.
 preflight_is_pass() {
   local report="$1"
@@ -277,9 +292,12 @@ failed = [
     if line.startswith("PREFLIGHT ") and " FAIL" in line and not line.startswith("PREFLIGHT RESULT ")
 ]
 result = next((line for line in reversed(lines) if line.startswith("PREFLIGHT RESULT ")), "")
+hang = any("hang-after-signing" in line for line in lines)
 host_wall = None
 note = ""
-if any(line.startswith("PREFLIGHT tcc-screen FAIL") for line in failed):
+# A hang after signing is not a Screen Recording deny. Screen on this host
+# stays granted; do not mark that line as the screen-tcc host wall.
+if any(line.startswith("PREFLIGHT tcc-screen FAIL") for line in failed) and not hang:
     host_wall = "screen-tcc"
     note = (
         "Screen TCC deny is a host wall. Cap re-arms after Nathan re-grants "
@@ -294,6 +312,7 @@ record = {
     "gatesLaunched": False,
     "afplay": False,
     "softPass": False,
+    "hangAfterSigning": hang,
     "hostWall": host_wall,
     "hostWallNote": note,
     "report": report_path,

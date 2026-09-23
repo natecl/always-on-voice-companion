@@ -17,6 +17,7 @@ struct CatcherApp: App {
         WindowGroup {
             ContentView(model: model)
         }
+        .defaultLaunchBehavior(.presented)
     }
 }
 
@@ -50,6 +51,7 @@ final class CatcherModel {
     private let autoRecord: Bool
     private let harness: Bool
     private var launchStarted = false
+    private var preflightStarted = false
     private let preflight: Bool
     private let launchEnvironment: [String: String]
 
@@ -94,11 +96,24 @@ final class CatcherModel {
                 await pipeline.stopAfterLiveTail()
             }
         }
+        // --preflight must not wait for the SwiftUI window. A launch that
+        // never shows a window never runs `.task`, so onAppear never quits
+        // and `open -W` would sit on signing PASS. This task writes the
+        // report and terminates even when the window stays hidden.
+        if preflight {
+            preflightStarted = true
+            Task { @MainActor in
+                await self.runPreflightAndQuit()
+            }
+        }
     }
 
     func onAppear() async {
         if preflight {
-            await runPreflightAndQuit()
+            if !preflightStarted {
+                preflightStarted = true
+                await runPreflightAndQuit()
+            }
             return
         }
         // A second pass (SwiftUI re-creates the task when Screen Recording is
@@ -421,7 +436,7 @@ final class CatcherModel {
         } else {
             prior = ""
         }
-        let lines = await Preflight.run(environment: launchEnvironment, dependencies: PreflightHost.dependencies())
+        let lines = await preflightChecks()
         let result = Preflight.result(checks: lines, priorFails: Preflight.failCount(in: prior))
         let preflightSink = FileStageSink(directory: sessionRoot, fileName: "preflight.txt")
         let launchSink = FileStageSink(directory: sessionRoot, fileName: "launch-stages.log")
@@ -430,6 +445,24 @@ final class CatcherModel {
             launchSink.write(line, fsync: line.verdict == PreflightVerdict.fail.rawValue || line.name == "RESULT")
         }
         NSApp.terminate(nil)
+    }
+
+    /// Checks, or one `preflight-finish` line if they have not returned in 30s.
+    /// `hang-after-signing` is this deadline. It is not a Screen Recording deny.
+    private func preflightChecks() async -> [StageLine] {
+        let environment = launchEnvironment
+        return await withTaskGroup(of: [StageLine].self) { group in
+            group.addTask {
+                await Preflight.run(environment: environment, dependencies: PreflightHost.dependencies())
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(30))
+                return [.preflight("preflight-finish", .fail, [Field("error", "hang-after-signing")])]
+            }
+            let lines = await group.next() ?? [.preflight("preflight-finish", .fail, [Field("error", "hang-after-signing")])]
+            group.cancelAll()
+            return lines
+        }
     }
 
     private func noteLaunchFailure(_ sentence: String) {

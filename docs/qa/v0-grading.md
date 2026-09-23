@@ -53,7 +53,7 @@ A stub engine header on P1, P3, or P6 is `fail` ("stub engine cannot prove P1/P3
    ./catcher/harness/run.sh cycle /tmp/catcher-auto/<sha>-<stamp>
    ```
 
-   `preflight` exits 0 only when `preflight.txt` ends in `PREFLIGHT RESULT PASS`. `cycle` writes `board.json` and returns on any other result. `PREFLIGHT tcc-screen FAIL` (`screen recording access denied`) is a host wall: Cap re-arms after Nathan re-grants Screen & System Audio Recording for `com.catcher.app`. It is not a soft-pass. Checks and the board fields are in [`v0-diagnostics.md`](v0-diagnostics.md).
+   `preflight` exits 0 only when `preflight.txt` ends in `PREFLIGHT RESULT PASS`. `cycle` writes `board.json` and returns on any other result. A missing RESULT after signing is `preflight-finish` `error=hang-after-signing`: the harness kills that process and the board stays a FAIL with gates and `afplay` stopped. That hang is not a Screen Recording deny. `PREFLIGHT tcc-screen FAIL` (`screen recording access denied`) is a separate host wall: Cap re-arms after Nathan re-grants Screen & System Audio Recording for `com.catcher.app`. It is not a soft-pass. Checks and the board fields are in [`v0-diagnostics.md`](v0-diagnostics.md).
 6. Replace `catcher/harness/fixtures/known-60s.wav` with a clear ~60 s reading of `known-60s.ref.txt` before scoring P1. The file in git is a 16 kHz mono PCM16 carrier so the script has something to play. It is not that reading. WER against the reference will fail until you replace it.
 
 ## How a run is laid out
