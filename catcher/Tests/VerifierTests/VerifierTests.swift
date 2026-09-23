@@ -128,6 +128,63 @@ import Verifier
     #expect(micBack.snapshot.status.isOk)
 }
 
+@Test func backdatedResumeDoesNotLookLikeAnEightSecondStall() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    _ = await verifier.captureStarted(atMs: 0)
+    _ = await verifier.observeEngine(.state(.ready), track: .system, atMs: 60_719, storedCount: 0)
+    let speech = tone(track: .system, amplitude: 8_000)
+    _ = await verifier.observeFrame(speech, atMs: 60_000)
+    _ = await verifier.observeFrame(speech, atMs: 60_000 + AudioFlowCheck.speechHoldMs)
+    // Gap is stamped on the wall clock; resumed is stamped on the engine clock,
+    // ~8s earlier. That rewind must not trip the heartbeat on the next tick.
+    _ = await verifier.observeEngine(
+        .gap(fromMs: 39_918, toMs: 52_150),
+        track: .system,
+        atMs: 60_719,
+        storedCount: 0
+    )
+    _ = await verifier.observeEngine(
+        .state(.streaming),
+        track: .system,
+        atMs: 52_150,
+        storedCount: 0,
+        backlogMs: 17_400
+    )
+    let tick = await verifier.tick(atMs: 60_793)
+    #expect(!tick.annotations.contains { text($0).contains("no engine event") })
+}
+
+@Test func transcriptAfterHeartbeatStallWritesResumed() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    _ = await verifier.captureStarted(atMs: 0)
+    _ = await verifier.observeEngine(.state(.streaming), track: .system, atMs: 1_000, storedCount: 0)
+    let speech = tone(track: .system, amplitude: 8_000)
+    _ = await verifier.observeFrame(speech, atMs: 1_000)
+    _ = await verifier.observeFrame(speech, atMs: 1_000 + AudioFlowCheck.speechHoldMs)
+    let stalled = await verifier.tick(atMs: 9_000)
+    #expect(stalled.annotations.contains { text($0).contains("no engine event for 8000ms") })
+    let recovered = await verifier.observeEngine(
+        .transcript(TranscriptEvent(
+            track: .system,
+            kind: .final,
+            text: "with no silent gap over two seconds",
+            words: [],
+            seq: 1,
+            startMs: 9_200,
+            endMs: 9_500
+        )),
+        track: .system,
+        atMs: 9_500,
+        storedCount: 1
+    )
+    #expect(recovered.annotations.map(text) == ["transport resumed track=system"])
+    #expect(recovered.snapshot.status.isOk)
+    let later = await verifier.tick(atMs: 10_000)
+    #expect(!later.annotations.contains { text($0).contains("no engine event") })
+}
+
 @Test func heartbeatIsPerTrack() async {
     let verifier = Verifier()
     _ = await verifier.beginSession(atMs: 0)

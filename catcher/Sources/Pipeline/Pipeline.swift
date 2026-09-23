@@ -25,6 +25,22 @@ public struct HostSessionClock: SessionClock {
     }
 }
 
+/// First `resume` wins. Shutdown must keep going when socket close never returns.
+private final class ResumeOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var resumed = false
+
+    func resume(_ continuation: CheckedContinuation<Void, Never>) {
+        lock.lock()
+        let first = !resumed
+        resumed = true
+        lock.unlock()
+        if first {
+            continuation.resume()
+        }
+    }
+}
+
 /// Capture → one engine stream per track → JSONL. The verifier only observes.
 public actor Pipeline {
     public nonisolated let ui: AsyncStream<PipelineUIEvent>
@@ -264,14 +280,11 @@ public actor Pipeline {
         probeTask?.cancel()
         let wasOpen = sessionOpen
         sessionOpen = false
-        await capture?.stop()
-        for engine in engines.values {
-            await engine.finish()
-        }
-        await frameTask?.value
-        for task in eventTasks {
-            await task.value
-        }
+        // `finish` waits on socket close. A pf-parked URLSession close does not
+        // return, and the harness grades one second after SIGTERM. The end row
+        // has to hit disk inside that window or the session looks like it
+        // ended at the last transcript.
+        await drainShutdown(budget: .milliseconds(400))
         if !ended {
             await closeSession(clean: clean && wasOpen)
         }
@@ -283,6 +296,43 @@ public actor Pipeline {
         engines = [:]
         capture = nil
         halting = false
+    }
+
+    /// Stop capture and the engines, but do not wait out a hung close.
+    private func drainShutdown(budget: Duration) async {
+        let once = ResumeOnce()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let drain = Task {
+                await self.finishEnginesAndDrain()
+                once.resume(continuation)
+            }
+            Task {
+                try? await Task.sleep(for: budget)
+                drain.cancel()
+                once.resume(continuation)
+            }
+        }
+    }
+
+    private func finishEnginesAndDrain() async {
+        await capture?.stop()
+        if Task.isCancelled { return }
+        // Snapshot so a timed-out halt can drop its handles without mutating
+        // this loop.
+        let running = Array(engines.values)
+        let frames = frameTask
+        let readers = eventTasks
+        for engine in running {
+            await engine.finish()
+            // A cancelled shutdown already wrote `end` on the other path.
+            // Waiting here for a stream that `finish` did not close would stick.
+            if Task.isCancelled { return }
+        }
+        await frames?.value
+        if Task.isCancelled { return }
+        for task in readers {
+            await task.value
+        }
     }
 
     private func consumeFrames(_ frames: AsyncStream<PCMFrame>) async {

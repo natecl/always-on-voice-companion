@@ -78,6 +78,27 @@ import TranscriptionEngine
     #expect(await pipeline.isRunning == false)
 }
 
+@Test func stopWritesEndWhenEngineCloseNeverReturns() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("catcher-hang-\(UUID().uuidString)", isDirectory: true)
+    let pipeline = Pipeline(
+        sessionRoot: root,
+        makeCapture: { FakeCapture() },
+        makeEngine: { _ in HungFinishEngine() },
+        launchProbe: { .granted },
+        recheckProbe: { .granted },
+        engineLabel: "stub"
+    )
+    await pipeline.start()
+    let directory = try #require(await pipeline.sessionDirectory)
+    let started = ContinuousClock.now
+    await pipeline.stop()
+    let elapsed = ContinuousClock.now - started
+    #expect(elapsed < .seconds(2))
+    let events = try String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)
+    #expect(events.contains("\"t\":\"end\""))
+    #expect(await pipeline.isRunning == false)
+}
+
 @Test func blockedProbeDoesNotStartAFakeRecording() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("catcher-block-\(UUID().uuidString)", isDirectory: true)
     let started = LockedFlag()
@@ -417,6 +438,33 @@ private final class RevokeGate: @unchecked Sendable {
         let blocked = blocked
         lock.unlock()
         return blocked ? .blocked(reason: "screen recording access denied") : .granted
+    }
+}
+
+private final class HungFinishEngine: TranscriptionEngine, @unchecked Sendable {
+    let events: AsyncStream<EngineEvent>
+    private let continuation: AsyncStream<EngineEvent>.Continuation
+
+    init() {
+        let pair = AsyncStream<EngineEvent>.makeStream()
+        events = pair.stream
+        continuation = pair.continuation
+    }
+
+    func connect(track: AudioTrack) async throws {
+        continuation.yield(.state(.ready))
+        continuation.yield(.state(.streaming))
+    }
+
+    func send(_ frame: PCMFrame) async throws {}
+
+    func finish() async {
+        do {
+            try await Task.sleep(for: .seconds(30))
+        } catch {
+            return
+        }
+        continuation.finish()
     }
 }
 

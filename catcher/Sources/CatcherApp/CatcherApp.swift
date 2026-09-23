@@ -88,6 +88,12 @@ final class CatcherModel {
             recordPCM: environment["CATCHER_HARNESS"] == "1",
             engineLabel: EngineFactory.sessionEngineName(environment: environment)
         )
+        if harness {
+            let pipeline = pipeline
+            HarnessShutdown.install {
+                await pipeline.stop()
+            }
+        }
     }
 
     func onAppear() async {
@@ -443,6 +449,38 @@ final class CatcherModel {
         if let selectedID {
             select(selectedID)
         }
+    }
+}
+
+/// The harness stops the app with SIGTERM and grades one second later.
+/// Without this, the process dies before `end` is fsynced and the session
+/// clock looks like it stopped at the last transcript.
+enum HarnessShutdown {
+    private static let lock = NSLock()
+    private static var installed = false
+    private static var source: DispatchSourceSignal?
+
+    static func install(_ stop: @escaping @Sendable () async -> Void) {
+        lock.lock()
+        if installed {
+            lock.unlock()
+            return
+        }
+        installed = true
+        lock.unlock()
+        signal(SIGTERM, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        source.setEventHandler {
+            source.cancel()
+            Task {
+                await stop()
+                exit(0)
+            }
+        }
+        lock.lock()
+        self.source = source
+        lock.unlock()
+        source.resume()
     }
 }
 

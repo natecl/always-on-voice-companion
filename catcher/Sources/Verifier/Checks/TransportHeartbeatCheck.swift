@@ -53,8 +53,25 @@ public struct TransportHeartbeatCheck: Sendable {
     /// `backlogMs` is the audio the engine must replay on a reconnected socket
     /// before it reaches live audio. It is appended to `resumed`.
     public mutating func observe(_ event: EngineEvent, track: AudioTrack, atMs: Int, backlogMs: Int? = nil) -> [Annotation] {
-        tracks[track, default: TrackTransport()].lastEventAt = atMs
-        tracks[track, default: TrackTransport()].heartbeatEmitted = false
+        var entry = tracks[track, default: TrackTransport()]
+        // A resumed ann is stamped on the engine clock (the gap end), which is
+        // behind the wall clock by the whole reconnect. Rewinding `lastEventAt`
+        // makes the next tick look like an 8s stall while audio is still flowing.
+        entry.lastEventAt = max(entry.lastEventAt ?? atMs, atMs)
+        entry.heartbeatEmitted = false
+        // A transcript means the heartbeat stall is over. Leaving `degraded` set
+        // writes no later `resumed`, so the session stays relapsed after the
+        // backlog final finally arrives.
+        let heartbeatRecovered = if case .transcript = event {
+            entry.degraded && entry.reason.hasPrefix("no engine event")
+        } else {
+            false
+        }
+        if heartbeatRecovered {
+            entry.degraded = false
+            entry.reason = ""
+        }
+        tracks[track] = entry
         switch event {
         case .state(let state):
             return observe(state, track: track, atMs: atMs, backlogMs: backlogMs)
@@ -65,7 +82,12 @@ public struct TransportHeartbeatCheck: Sendable {
                 detail: .gap(fromMs: fromMs, toMs: toMs, track: track.rawValue)
             )]
         case .transcript:
-            return []
+            guard heartbeatRecovered else { return [] }
+            return [Annotation(
+                atMs: atMs,
+                kind: "resumed",
+                detail: .text("transport resumed track=\(track.rawValue)")
+            )]
         case .error(let error):
             return observe(.degraded(reason: Self.describe(error)), track: track, atMs: atMs)
         }
@@ -74,7 +96,7 @@ public struct TransportHeartbeatCheck: Sendable {
     public mutating func observe(_ state: EngineState, track: AudioTrack, atMs: Int, backlogMs: Int? = nil) -> [Annotation] {
         var entry = tracks[track, default: TrackTransport()]
         defer { tracks[track] = entry }
-        entry.lastEventAt = atMs
+        entry.lastEventAt = max(entry.lastEventAt ?? atMs, atMs)
         switch state {
         case .connecting:
             entry.connectingSince = atMs

@@ -382,6 +382,67 @@ func resumeReportsTheBacklogAndItsFirstFinalIsBacklog(profile: TransportProfile)
 }
 
 @Test(arguments: TransportProfile.allCases)
+func postResumeFinalThatSpansTheBacklogSplitsOffLiveWords(profile: TransportProfile) async throws {
+    let rig = ReconnectRig(profile: profile)
+    let first = try await rig.connected()
+    try await rig.engine.send(PCMFrame(track: .system, data: Data(count: 3_200), hostTime: 0))
+    try await waitUntil { first.binaryCount == 1 }
+    var iterator = rig.engine.events.makeAsyncIterator()
+    first.push(.closed(code: 1006, reason: "drop"))
+    let resumed = try await rig.socket(profile.resumeIndex)
+    for _ in 0..<10 {
+        try await rig.engine.send(PCMFrame(track: .system, data: Data(count: 3_200), hostTime: 0))
+    }
+    resumed.push(created)
+    var origin = 0
+    var streaming = false
+    for _ in 0..<40 {
+        guard let event = await iterator.next() else { break }
+        if case .gap(_, let toMs) = event { origin = toMs }
+        if case .state(.streaming) = event, origin > 0 {
+            streaming = true
+            break
+        }
+    }
+    #expect(streaming)
+    let backlog = await rig.engine.snapshot().lastResumeBacklogMs
+    let cursor = origin + backlog + GrokEngine.liveAfterBacklogMarginMs
+    let liveAt = Double(backlog + GrokEngine.liveAfterBacklogMarginMs + 200) / 1000
+    var liveWords: [String] = []
+    var liveText: [String] = []
+    for index in 1...10 {
+        let start = liveAt + Double(index) * 0.1
+        liveText.append("w\(index)")
+        liveWords.append(
+            #"{"text":"w\#(index)","start":\#(start),"end":\#(start + 0.05)}"#
+        )
+    }
+    let spoken = (["back"] + liveText).joined(separator: " ")
+    let duration = liveAt + 2
+    let wordJSON = (["{\"text\":\"back\",\"start\":0.05,\"end\":0.2}"] + liveWords).joined(separator: ",")
+    let payload = """
+    {"type":"transcript.partial","text":"\(spoken)","is_final":true,"speech_final":true,"start":0,"duration":\(duration),"words":[\(wordJSON)]}
+    """
+    resumed.push(.text(payload))
+    var finals: [TranscriptEvent] = []
+    for _ in 0..<12 {
+        guard let event = await iterator.next() else { break }
+        if case .transcript(let transcript) = event, transcript.kind == .final {
+            finals.append(transcript)
+            if finals.count == 2 { break }
+        }
+    }
+    #expect(finals.count == 2)
+    #expect(finals.first?.text == "back")
+    #expect((finals.first?.startMs ?? cursor) < cursor)
+    let live = try #require(finals.last)
+    #expect(live.startMs >= cursor)
+    #expect(live.text.split(separator: " ").count >= 10)
+    await rig.engine.finish()
+    rig.releaseAll()
+}
+
+@Test(arguments: TransportProfile.allCases)
 func bufferedSendReconnectsWhenCloseDoesNotWakeReceive(profile: TransportProfile) async throws {
     let rig = ReconnectRig(profile: profile, inboundStall: .milliseconds(80)) { index, socket in
         if index == 0 {

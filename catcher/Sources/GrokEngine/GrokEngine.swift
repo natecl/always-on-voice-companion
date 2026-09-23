@@ -556,6 +556,66 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
         let startMs = rebase.sessionMs(engineSeconds: transcript.start)
         let durationEnd = rebase.sessionMs(engineSeconds: transcript.start + transcript.duration)
         let endMs = max(durationEnd, words.map(\.endMs).max() ?? durationEnd)
+        let who = speaker(transcript)
+        if final, let cursor = liveCursorMs() {
+            let earlier = words.filter { $0.startMs < cursor }
+            let live = words.filter { $0.startMs >= cursor }
+            if !earlier.isEmpty, !live.isEmpty {
+                yieldTranscript(
+                    text: Self.joined(earlier),
+                    words: earlier,
+                    speaker: who,
+                    final: true,
+                    startMs: earlier.map(\.startMs).min() ?? startMs,
+                    endMs: earlier.map(\.endMs).max() ?? endMs
+                )
+                yieldTranscript(
+                    text: Self.joined(live),
+                    words: live,
+                    speaker: who,
+                    final: true,
+                    startMs: live.map(\.startMs).min() ?? cursor,
+                    endMs: live.map(\.endMs).max() ?? endMs
+                )
+                return
+            }
+            if earlier.isEmpty, !live.isEmpty, startMs < cursor {
+                yieldTranscript(
+                    text: transcript.text,
+                    words: live,
+                    speaker: who,
+                    final: true,
+                    startMs: live.map(\.startMs).min() ?? cursor,
+                    endMs: max(endMs, live.map(\.endMs).max() ?? endMs)
+                )
+                return
+            }
+        }
+        yieldTranscript(
+            text: transcript.text,
+            words: words,
+            speaker: who,
+            final: final,
+            startMs: startMs,
+            endMs: max(endMs, startMs)
+        )
+    }
+
+    /// Session time where replayed audio ends and the grader's live window
+    /// begins. Nil on the first socket, which has no backlog to cut.
+    private func liveCursorMs() -> Int? {
+        guard lastResumeBacklogMs > 0 else { return nil }
+        return socketOriginMs + lastResumeBacklogMs + Self.liveAfterBacklogMarginMs
+    }
+
+    private func yieldTranscript(
+        text: String,
+        words: [TranscriptWord],
+        speaker: String?,
+        final: Bool,
+        startMs: Int,
+        endMs: Int
+    ) {
         let confidences = words.compactMap(\.conf)
         let confidence = confidences.isEmpty ? nil : confidences.reduce(0, +) / Double(confidences.count)
         seq += 1
@@ -566,14 +626,18 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
         continuation.yield(.transcript(TranscriptEvent(
             track: track,
             kind: final ? .final : .partial,
-            text: transcript.text,
+            text: text,
             words: words,
-            speaker: speaker(transcript),
+            speaker: speaker,
             confidence: confidence,
             seq: seq,
             startMs: startMs,
             endMs: max(endMs, startMs)
         )))
+    }
+
+    private static func joined(_ words: [TranscriptWord]) -> String {
+        words.map(\.w).filter { !$0.isEmpty }.joined(separator: " ")
     }
 
     private func speaker(_ transcript: GrokTranscript) -> String? {
@@ -591,6 +655,12 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
     /// when `resumed` appears, so this wait ends when that final has been
     /// yielded, and still yields streaming if the server stays quiet.
     private static let postResumeBudgetMs = 8_000
+
+    /// Words this far past the replayed backlog are live audio. The session
+    /// grader counts a segment as live only when its `startMs` is at or after
+    /// `resumed + backlogMs + 3s`. One speech-final that spans the replay would
+    /// otherwise stay a single backlog row.
+    public static let liveAfterBacklogMarginMs = 3_000
 
     private func waitForPostResumeSegment() async {
         var waited = 0
