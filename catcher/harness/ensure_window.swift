@@ -2,30 +2,46 @@ import AppKit
 import CoreGraphics
 import Foundation
 
-// Raise Catcher's content window before the harness plays fixture audio.
-// usage: ensure_window <pid>
+// Raise Catcher's content window before a gate continues.
+// usage: ensure_window <pid> <session-dir>
 // stdout: raise=OK | raise=NO_PROCESS | raise=NOT_FRONTMOST | raise=NOT_VISIBLE
+//
+// This binary is not Catcher.app, so Screen Recording does not let it list
+// Catcher's windows. Catcher writes <session>/window_front when its own
+// content window is key, on a screen, and the app is active. Frontmost is
+// still read here from NSWorkspace.
 
 let arguments = CommandLine.arguments
-guard arguments.count == 2, let pid = Int32(arguments[1]) else {
-    fputs("usage: ensure_window <pid>\n", stderr)
+guard arguments.count == 3, let pid = Int32(arguments[1]) else {
+    fputs("usage: ensure_window <pid> <session-dir>\n", stderr)
     exit(2)
 }
+let session = arguments[2]
 
-func finish(_ token: String) -> Never {
-    print("raise=\(token) pid=\(pid)")
+func finish(_ token: String, _ detail: String = "") -> Never {
+    if detail.isEmpty {
+        print("raise=\(token) pid=\(pid)")
+    } else {
+        print("raise=\(token) pid=\(pid) \(detail)")
+    }
     fflush(stdout)
     exit(token == "OK" ? 0 : 1)
 }
-
-let application = NSApplication.shared
-application.setActivationPolicy(.accessory)
 
 guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
     finish("NO_PROCESS")
 }
 
-func onScreenContentWindow() -> Bool {
+func processAlive() -> Bool {
+    guard let running = NSRunningApplication(processIdentifier: pid) else { return false }
+    return !running.isTerminated
+}
+
+func frontmost() -> Bool {
+    NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+}
+
+func listedOnScreen() -> Bool {
     let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
     guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
         return false
@@ -42,42 +58,53 @@ func onScreenContentWindow() -> Bool {
     return false
 }
 
-func raised() -> Bool {
-    if app.isTerminated {
-        return false
+func stamp() -> String {
+    let url = URL(fileURLWithPath: session, isDirectory: true).appendingPathComponent("window_front")
+    guard let text = try? String(contentsOf: url, encoding: .utf8) else { return "missing" }
+    let modified = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+    if let modified, Date().timeIntervalSince(modified) > 2 {
+        return "stale"
     }
-    let front = NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
-    return front && onScreenContentWindow()
+    let fresh = text.contains("pid=\(pid)") && text.contains("frontmost=1") && text.contains("visible=1")
+    return fresh ? "fresh" : "mismatch"
+}
+
+func raised() -> Bool {
+    guard processAlive(), frontmost() else { return false }
+    if listedOnScreen() { return true }
+    return stamp() == "fresh"
 }
 
 func reopen() {
-    if app.isHidden {
-        app.unhide()
+    guard let running = NSRunningApplication(processIdentifier: pid), !running.isTerminated else { return }
+    if running.isHidden {
+        running.unhide()
     }
-    app.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+    running.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
 }
 
 reopen()
-let deadline = Date().addingTimeInterval(2.0)
-var reopened = false
+let deadline = Date().addingTimeInterval(8)
+var nextReopen = Date().addingTimeInterval(1)
 while Date() < deadline {
-    if app.isTerminated {
+    if !processAlive() {
         finish("NO_PROCESS")
     }
     if raised() {
-        finish("OK")
+        finish("OK", "window_front=\(stamp())")
     }
-    if !reopened && Date().addingTimeInterval(1.0) > deadline {
+    if Date() >= nextReopen {
         reopen()
-        reopened = true
+        nextReopen = Date().addingTimeInterval(1)
     }
     Thread.sleep(forTimeInterval: 0.1)
 }
 
-if app.isTerminated {
+if !processAlive() {
     finish("NO_PROCESS")
 }
-if NSWorkspace.shared.frontmostApplication?.processIdentifier != pid {
-    finish("NOT_FRONTMOST")
+let mark = stamp()
+if !frontmost() {
+    finish("NOT_FRONTMOST", "window_front=\(mark)")
 }
-finish("NOT_VISIBLE")
+finish("NOT_VISIBLE", "window_front=\(mark)")

@@ -232,6 +232,11 @@ if "open -n -W" in pre:
     raise SystemExit("preflight still waits on open -W")
 if "hang-after-signing" not in pre:
     raise SystemExit("preflight has no hang-after-signing timeout")
+lib = (root / "lib.sh").read_text(encoding="utf-8")
+if '"$helper" "$pid" "$session"' not in lib:
+    raise SystemExit("ensure_window is not passed the session")
+if "require_fixture_play \"$session\"" not in lib.split("launch_catcher()")[1].split("resolve_session()")[0]:
+    raise SystemExit("launch_catcher returns before the content window is raised")
 PY
 
 echo "cycle guard ok"

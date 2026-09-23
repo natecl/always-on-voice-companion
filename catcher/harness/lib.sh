@@ -224,6 +224,9 @@ launch_catcher() {
     echo "Catcher did not write $session/catcher.pid within 15 s." >&2
     return 1
   fi
+  # Pid is written in init, before the content window exists. Raise it before
+  # the gate continues. afplay still checks again.
+  require_fixture_play "$session"
 }
 
 resolve_session() {
@@ -353,7 +356,7 @@ ensure_catcher_window() {
       return 1
     }
   fi
-  "$helper" "$pid"
+  "$helper" "$pid" "$session"
 }
 
 compile_ensure_window() {

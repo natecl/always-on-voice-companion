@@ -11,13 +11,78 @@ import Verifier
 
 @main
 struct CatcherApp: App {
+    @NSApplicationDelegateAdaptor(HarnessAppDelegate.self) private var harnessDelegate
     @State private var model = CatcherModel()
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: "content") {
             ContentView(model: model)
         }
         .defaultLaunchBehavior(.presented)
+    }
+}
+
+/// Harness launches must show the content window. Preflight quits without one.
+/// A normal launch is unchanged.
+@MainActor
+final class HarnessAppDelegate: NSObject, NSApplicationDelegate {
+    private var ticker: Timer?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let launch = LaunchConfiguration.resolve()
+        guard launch.harness, !launch.preflight else { return }
+        let root = SessionPaths.root(environment: launch.mergedEnvironment())
+        HarnessWindow.present(sessionRoot: root)
+        ticker = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { timer in
+            MainActor.assumeIsolated {
+                if HarnessWindow.noteTick() {
+                    timer.invalidate()
+                    return
+                }
+                HarnessWindow.present(sessionRoot: root)
+            }
+        }
+    }
+}
+
+/// Orders the content window front and records that it is on screen.
+@MainActor
+enum HarnessWindow {
+    private static var ticks = 0
+
+    /// True when the launch-time raise loop should stop.
+    static func noteTick() -> Bool {
+        ticks += 1
+        return ticks > 60
+    }
+
+    static func present(sessionRoot: URL) {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        if contentWindows.isEmpty {
+            NSApp.sendAction(Selector(("newWindowForTab:")), to: nil, from: nil)
+        }
+        for window in contentWindows {
+            if window.isMiniaturized {
+                window.deminiaturize(nil)
+            }
+            window.orderFrontRegardless()
+            window.makeKeyAndOrderFront(nil)
+        }
+        let ready = NSApp.isActive && contentWindows.contains { window in
+            window.isKeyWindow && window.isVisible && window.screen != nil && window.frame.height >= 20
+        }
+        let url = sessionRoot.appendingPathComponent("window_front")
+        if ready {
+            let text = "pid=\(ProcessInfo.processInfo.processIdentifier) frontmost=1 visible=1\n"
+            try? text.write(to: url, atomically: true, encoding: .utf8)
+        } else {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    private static var contentWindows: [NSWindow] {
+        NSApp.windows.filter { $0.canBecomeKey && $0.level == .normal }
     }
 }
 
@@ -145,6 +210,9 @@ final class CatcherModel {
             banner = channels.banner
         }
         await refreshSessions()
+        if harness {
+            HarnessWindow.present(sessionRoot: sessionRoot)
+        }
         let probe = await PermissionGate.startCaptureProbe()
         await applyLaunchProbe(probe)
         listen()

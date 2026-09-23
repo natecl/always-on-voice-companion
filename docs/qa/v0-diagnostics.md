@@ -92,7 +92,7 @@ Do not start P1 on a FAIL line. The autonomous entry is `run.sh cycle <run-dir>`
 
 `error=hang-after-signing` is not that wall. Screen Recording on this Mac is already granted. The board field `hangAfterSigning` is true, `hostWall` stays empty, and the cycle still stops with `gatesLaunched` false and `afplay` false. Do not read the hang as a Screen TCC deny.
 
-Each gate that plays the fixture calls `require_fixture_play` first. Audio starts only when `catcher.pid` is alive and Catcher's content window is frontmost and on screen (the harness raises the window, then checks again). A missing or dead pid writes `raise=NO_PROCESS` to `raise.txt` and `blocked.json` (`result` `blocked`) and the gate exits. That is not a pass.
+Each gate launch raises the content window before it continues, and each gate that plays the fixture checks again. Audio starts only when `catcher.pid` is alive and Catcher is frontmost with its content window on screen. Under `--harness`, the app activates, orders that window front, and writes `window_front` while the window is key. The raise helper is not Catcher, so it does not use Screen Recording to list windows; it trusts a fresh `window_front` for this pid plus `NSWorkspace` frontmost. A missing or dead pid writes `raise=NO_PROCESS`. A live pid whose window never becomes key writes `raise=NOT_VISIBLE` and `window_front=missing` (or `stale`). Both land in `raise.txt` and `blocked.json` (`result` `blocked`) and the gate exits. That is not a pass. A preflight `tcc-screen PASS` does not set `hostWall`.
 
 The cause table below is the next action for a session trace. A preflight FAIL names the check in `preflight.txt`.
 
