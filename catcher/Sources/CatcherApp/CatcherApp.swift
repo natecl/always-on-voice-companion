@@ -33,12 +33,17 @@ final class HarnessAppDelegate: NSObject, NSApplicationDelegate {
         guard launch.harness, !launch.preflight else { return }
         let root = SessionPaths.root(environment: launch.mergedEnvironment())
         HarnessWindow.present(sessionRoot: root)
+        // `timer` stays in this callback. Moving it into `assumeIsolated` sends
+        // a non-Sendable Timer across the main-actor boundary and the build fails.
         ticker = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { timer in
+            let stop = MainActor.assumeIsolated {
+                HarnessWindow.noteTick()
+            }
+            if stop {
+                timer.invalidate()
+                return
+            }
             MainActor.assumeIsolated {
-                if HarnessWindow.noteTick() {
-                    timer.invalidate()
-                    return
-                }
                 HarnessWindow.present(sessionRoot: root)
             }
         }
