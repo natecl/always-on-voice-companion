@@ -53,4 +53,4 @@ Default: `~/Library/Application Support/Catcher/sessions/<uuid>/`
 
 Override the parent directory with `CATCHER_SESSION_ROOT`.
 
-QA steps: [`docs/qa/v0-grading.md`](../docs/qa/v0-grading.md). v0 stays red until that run produces `grade.json` with P1–P6 `pass` on a physical Mac.
+QA steps: [`docs/qa/v0-grading.md`](../docs/qa/v0-grading.md). v0 stays red until `run.sh verdict` on a physical Mac writes `v0-verdict.json` with `GREEN` for the SHA. Last hardened GREEN: `b14e31a` (`b14e31a99a431e5cac6a49669f5c1955de38a1d1`), CDHash `57250034b55e54e3ad6798983edf6e62c1553653`, board `/tmp/catcher-auto/b14e31a-20260923-055848/board.json`. Preflight and P1–P6 pass (soft-pass killed). `MicrophoneGain` on the mic path; floor 0.05 unchanged; P6 p50 0.2039, micGainMax 16. Map: [`docs/FEATURE_MAP.md`](../docs/FEATURE_MAP.md).

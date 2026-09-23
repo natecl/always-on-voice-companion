@@ -11,6 +11,10 @@ public struct EngineDiagnosticsSnapshot: Sendable, Equatable {
     public var unknownMessages: [String]
     public var sendErrors: Int
     public var binaryFrames: Int
+    /// Audio queued for the socket that last resumed (replay plus outage), in
+    /// ms. Its first finals describe this backlog, not live speech. 0 on the
+    /// first connect.
+    public var lastResumeBacklogMs: Int
 
     public init(
         bytesSent: Int = 0,
@@ -23,7 +27,8 @@ public struct EngineDiagnosticsSnapshot: Sendable, Equatable {
         httpBody: String? = nil,
         unknownMessages: [String] = [],
         sendErrors: Int = 0,
-        binaryFrames: Int = 0
+        binaryFrames: Int = 0,
+        lastResumeBacklogMs: Int = 0
     ) {
         self.bytesSent = bytesSent
         self.pendingCount = pendingCount
@@ -36,6 +41,7 @@ public struct EngineDiagnosticsSnapshot: Sendable, Equatable {
         self.unknownMessages = unknownMessages
         self.sendErrors = sendErrors
         self.binaryFrames = binaryFrames
+        self.lastResumeBacklogMs = lastResumeBacklogMs
     }
 }
 

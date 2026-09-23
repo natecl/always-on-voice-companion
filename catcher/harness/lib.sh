@@ -59,6 +59,75 @@ require_stable_signature() {
   fi
 }
 
+# Provenance for grade.py and verdict.py. Written once per gate run, before
+# launch, at <root>/harness_run.json (the parent of the <uuid> session). Not
+# tamper-proof: it proves "ran through this harness on a Mac", nothing more.
+begin_harness_run() {
+  local root="$1"
+  local gate="$2"
+  local app="${CATCHER_APP:-}"
+  mkdir -p "$root"
+  local sign="" plist_sha=""
+  if [[ -n "$app" && -d "$app" ]]; then
+    sign="$(codesign -dvvv "$app" 2>&1 || true)"
+    plist_sha="$(plutil -extract CatcherGitSHA raw -o - "$app/Contents/Info.plist" 2>/dev/null || true)"
+  fi
+  HR_ROOT="$root" HR_GATE="$gate" HR_APP="$app" HR_SIGN="$sign" HR_PLIST_SHA="$plist_sha" \
+  HR_OS="$(sw_vers -productVersion 2>/dev/null || true)" \
+  HR_ARCH="$(uname -m)" \
+  HR_MODEL="$(sysctl -n hw.model 2>/dev/null || true)" \
+  HR_HARNESS_SHA="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)" \
+  HR_ENGINE="${CATCHER_ENGINE:-}" \
+  python3 - <<'PY'
+import json, os, platform, time
+sign = os.environ["HR_SIGN"]
+def field(name):
+    return [line.split("=", 1)[1] for line in sign.splitlines() if line.startswith(name + "=")]
+record = {
+    "gate": os.environ["HR_GATE"],
+    "startedWallMs": int(time.time() * 1000),
+    "host": platform.system(),
+    "macOS": os.environ["HR_OS"],
+    "arch": os.environ["HR_ARCH"],
+    "hwModel": os.environ["HR_MODEL"],
+    "catcherApp": os.environ["HR_APP"],
+    "catcherGitSHA": os.environ["HR_PLIST_SHA"],
+    "catcherEngine": os.environ["HR_ENGINE"],
+    "harnessGitSHA": os.environ["HR_HARNESS_SHA"],
+    "codesign": {
+        "cdhash": (field("CDHash") or [""])[0],
+        "teamIdentifier": (field("TeamIdentifier") or [""])[0],
+        "signature": (field("Signature") or [""])[0],
+        "authority": field("Authority"),
+    },
+}
+path = os.path.join(os.environ["HR_ROOT"], "harness_run.json")
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(record, handle, indent=2)
+    handle.write("\n")
+PY
+}
+
+# append_harness_field <root> <key> <int>. Gate scripts stamp their own wall
+# times (P2 revokeWallMs, P3 pfOnWallMs / pfOffWallMs).
+append_harness_field() {
+  local root="$1"
+  python3 - "$root/harness_run.json" "$2" "$3" <<'PY'
+import json, sys
+path, key, value = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path, encoding="utf-8") as handle:
+    record = json.load(handle)
+record[key] = int(value)
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(record, handle, indent=2)
+    handle.write("\n")
+PY
+}
+
+wall_ms() {
+  python3 -c 'import time; print(int(time.time() * 1000))'
+}
+
 # NSWorkspace.openApplication, not a shell exec. The helper inherits this
 # process's environment and hands that dictionary to LaunchServices, so
 # CATCHER_SESSION_ROOT, CATCHER_HARNESS, CATCHER_AUTO_RECORD, CATCHER_ENGINE,

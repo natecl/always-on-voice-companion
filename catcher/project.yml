@@ -38,6 +38,9 @@ targets:
         INFOPLIST_FILE: Sources/CatcherApp/Info.plist
         MARKETING_VERSION: "0.0.1"
         CURRENT_PROJECT_VERSION: "1"
+        # build-app.sh overrides this with `git rev-parse HEAD` (+ -dirty).
+        # The grader rejects `unknown` and `-dirty` as provenance.
+        CATCHER_GIT_SHA: unknown
         SWIFT_VERSION: "6.0"
         MACOSX_DEPLOYMENT_TARGET: "15.0"
         # Manual identity. Automatic with no team becomes ad-hoc, and TCC then

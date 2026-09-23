@@ -1,0 +1,22 @@
+{
+  "grokEngine": "grok-voice-transcribe-2.0",
+  "minMacOSMajor": 15,
+  "verifierRmsFloor": 0.05,
+  "speechHoldMs": 300,
+  "speechDipMs": 120,
+  "silenceLimitMs": 10000,
+  "noAudioEmitSlackMs": 1500,
+  "speechEvidenceRmsFloor": 0.025,
+  "p1WerBar": 0.15,
+  "p1GapRmsFloor": 0.001,
+  "p1GapLimitMs": 2000,
+  "p2BlockWithinMs": 2000,
+  "p3DegradeWithinMs": 12000,
+  "p3ResumeWithinMs": 45000,
+  "p3MinGapSpanMs": 10000,
+  "p3LiveMarginMs": 3000,
+  "p3MinLiveWords": 10,
+  "p3MinTailMs": 20000,
+  "p3FallbackReplayMs": 30000,
+  "p6MicSpeechFloorRatio": 2.0
+}

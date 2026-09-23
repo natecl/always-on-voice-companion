@@ -109,11 +109,104 @@ import Verifier
     #expect(resumed.snapshot.status.isOk)
 }
 
+@Test func systemReconnectDoesNotClearMicrophoneDegraded() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    let reason = "ws closed (1006); reconnect #1 in 1s"
+    let system = await verifier.observeEngine(.state(.degraded(reason: reason)), track: .system, atMs: 5_000, storedCount: 0)
+    let mic = await verifier.observeEngine(.state(.degraded(reason: reason)), track: .microphone, atMs: 5_100, storedCount: 0)
+    // Identical reason text on two tracks is two rows.
+    #expect(system.annotations.map(text) == ["\(reason) track=system"])
+    #expect(mic.annotations.map(text) == ["\(reason) track=microphone"])
+    let back = await verifier.observeEngine(.state(.streaming), track: .system, atMs: 20_000, storedCount: 0, backlogMs: 21_000)
+    #expect(back.annotations.map(text) == ["transport resumed track=system backlogMs=21000"])
+    if case .degraded = back.snapshot.status {} else {
+        Issue.record("microphone is still down; got \(back.snapshot.status)")
+    }
+    let micBack = await verifier.observeEngine(.state(.streaming), track: .microphone, atMs: 22_000, storedCount: 0, backlogMs: 0)
+    #expect(micBack.annotations.map(text) == ["transport resumed track=microphone backlogMs=0"])
+    #expect(micBack.snapshot.status.isOk)
+}
+
+@Test func backdatedResumeDoesNotLookLikeAnEightSecondStall() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    _ = await verifier.captureStarted(atMs: 0)
+    _ = await verifier.observeEngine(.state(.ready), track: .system, atMs: 60_719, storedCount: 0)
+    let speech = tone(track: .system, amplitude: 8_000)
+    _ = await verifier.observeFrame(speech, atMs: 60_000)
+    _ = await verifier.observeFrame(speech, atMs: 60_000 + AudioFlowCheck.speechHoldMs)
+    // Gap is stamped on the wall clock; resumed is stamped on the engine clock,
+    // ~8s earlier. That rewind must not trip the heartbeat on the next tick.
+    _ = await verifier.observeEngine(
+        .gap(fromMs: 39_918, toMs: 52_150),
+        track: .system,
+        atMs: 60_719,
+        storedCount: 0
+    )
+    _ = await verifier.observeEngine(
+        .state(.streaming),
+        track: .system,
+        atMs: 52_150,
+        storedCount: 0,
+        backlogMs: 17_400
+    )
+    let tick = await verifier.tick(atMs: 60_793)
+    #expect(!tick.annotations.contains { text($0).contains("no engine event") })
+}
+
+@Test func transcriptAfterHeartbeatStallWritesResumed() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    _ = await verifier.captureStarted(atMs: 0)
+    _ = await verifier.observeEngine(.state(.streaming), track: .system, atMs: 1_000, storedCount: 0)
+    let speech = tone(track: .system, amplitude: 8_000)
+    _ = await verifier.observeFrame(speech, atMs: 1_000)
+    _ = await verifier.observeFrame(speech, atMs: 1_000 + AudioFlowCheck.speechHoldMs)
+    let stalled = await verifier.tick(atMs: 9_000)
+    #expect(stalled.annotations.contains { text($0).contains("no engine event for 8000ms") })
+    let recovered = await verifier.observeEngine(
+        .transcript(TranscriptEvent(
+            track: .system,
+            kind: .final,
+            text: "with no silent gap over two seconds",
+            words: [],
+            seq: 1,
+            startMs: 9_200,
+            endMs: 9_500
+        )),
+        track: .system,
+        atMs: 9_500,
+        storedCount: 1
+    )
+    #expect(recovered.annotations.map(text) == ["transport resumed track=system"])
+    #expect(recovered.snapshot.status.isOk)
+    let later = await verifier.tick(atMs: 10_000)
+    #expect(!later.annotations.contains { text($0).contains("no engine event") })
+}
+
+@Test func heartbeatIsPerTrack() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    _ = await verifier.captureStarted(atMs: 0)
+    _ = await verifier.observeEngine(.state(.ready), track: .system, atMs: 100, storedCount: 0)
+    _ = await verifier.observeEngine(.state(.ready), track: .microphone, atMs: 100, storedCount: 0)
+    let speech = tone(track: .microphone, amplitude: 8_000)
+    _ = await verifier.observeFrame(PCMFrame.silence(track: .system, sampleCount: 160, hostTime: 0), atMs: 0)
+    _ = await verifier.observeFrame(speech, atMs: 0)
+    _ = await verifier.observeFrame(speech, atMs: AudioFlowCheck.speechHoldMs)
+    // The system engine keeps talking; only the flowing mic track is stale.
+    _ = await verifier.observeEngine(.state(.streaming), track: .system, atMs: 8_000, storedCount: 0)
+    let tick = await verifier.tick(atMs: 8_100)
+    #expect(tick.annotations.map(text) == ["no engine event for 8000ms while audio is flowing track=microphone emittedAtMs=8100"])
+}
+
 @Test func finalWordFloorFlagsWhenAudioIsFlowing() async {
     let verifier = Verifier()
     _ = await verifier.beginSession(atMs: 0)
     let loud = tone(track: .system, amplitude: 8_000, sampleCount: 80)
     _ = await verifier.observeFrame(loud, atMs: 1_000)
+    _ = await verifier.observeFrame(loud, atMs: 1_000 + AudioFlowCheck.speechHoldMs)
     let tooSoon = await verifier.tick(atMs: 19_000)
     #expect(tooSoon.annotations.isEmpty)
     let flagged = await verifier.tick(atMs: 20_000)
@@ -258,6 +351,104 @@ import Verifier
     if case .degraded = later.snapshot.status {} else {
         Issue.record("expected degraded while speech is flowing, got \(later.snapshot.status)")
     }
+}
+
+@Test func silenceIsMeasuredFromCaptureStartNotSessionOpen() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    _ = await verifier.captureStarted(atMs: 4_000)
+    _ = await verifier.observeFrame(PCMFrame.silence(track: .system, sampleCount: 160, hostTime: 0), atMs: 4_000)
+    _ = await verifier.observeFrame(tone(track: .microphone, amplitude: 600), atMs: 4_000)
+    let early = await verifier.tick(atMs: 13_999)
+    #expect(!early.annotations.contains { $0.kind == "noAudio" })
+    let tripped = await verifier.tick(atMs: 14_000)
+    let noAudio = tripped.annotations.first { $0.kind == "noAudio" }
+    #expect(noAudio?.atMs == 14_000)
+    #expect(text(noAudio).contains("emittedAtMs=14000"))
+    #expect(text(noAudio).contains("observedFromMs=4000"))
+}
+
+@Test func noAudioCarriesTheTimeItActuallyFired() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    _ = await verifier.captureStarted(atMs: 0)
+    _ = await verifier.observeFrame(PCMFrame.silence(track: .system, sampleCount: 160, hostTime: 0), atMs: 0)
+    _ = await verifier.observeFrame(PCMFrame.silence(track: .microphone, sampleCount: 160, hostTime: 0), atMs: 0)
+    // A stalled tick loop: the boundary is still 10s, the emission is not.
+    let late = await verifier.tick(atMs: 25_000)
+    let noAudio = late.annotations.first { $0.kind == "noAudio" }
+    #expect(noAudio?.atMs == 10_000)
+    #expect(text(noAudio).contains("emittedAtMs=25000"))
+}
+
+@Test func noFramesNoAudioStartsAtCaptureStartAndSaysSo() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    _ = await verifier.captureStarted(atMs: 3_000)
+    #expect(await verifier.tick(atMs: 12_999).annotations.isEmpty)
+    let tripped = await verifier.tick(atMs: 13_000)
+    let noAudio = tripped.annotations.first { $0.kind == "noAudio" }
+    #expect(noAudio?.atMs == 13_000)
+    #expect(text(noAudio).hasPrefix("no frames for >10s"))
+}
+
+@Test func syllabicSpeechWithShortDipsIsFlowingNotNoAudio() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    _ = await verifier.captureStarted(atMs: 0)
+    let burst = tone(track: .microphone, amplitude: Int16(0.08 * 32_768))
+    let dip = PCMFrame.silence(track: .microphone, sampleCount: 160, hostTime: 0)
+    let system = PCMFrame.silence(track: .system, sampleCount: 160, hostTime: 0)
+    var annotations: [Annotation] = []
+    var at = 0
+    while at <= 12_000 {
+        // 250 ms at 0.08, then an 80 ms syllable gap. No single burst holds 300 ms.
+        let frame = at % 330 < 250 ? burst : dip
+        annotations += await verifier.observeFrame(frame, atMs: at).annotations
+        annotations += await verifier.observeFrame(system, atMs: at).annotations
+        if at % 1_000 == 0 {
+            annotations += await verifier.tick(atMs: at).annotations
+        }
+        at += 10
+    }
+    #expect(!annotations.contains { $0.kind == "noAudio" })
+    let effect = await verifier.tick(atMs: 12_000)
+    if case .noAudio = effect.snapshot.status {
+        Issue.record("syllabic speech was treated as silence")
+    }
+}
+
+@Test func oneLoudFrameAtATickIsNotAFlowingHeartbeat() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    _ = await verifier.captureStarted(atMs: 0)
+    _ = await verifier.observeEngine(.state(.ready), track: .microphone, atMs: 300, storedCount: 0)
+    _ = await verifier.observeFrame(PCMFrame.silence(track: .system, sampleCount: 160, hostTime: 0), atMs: 0)
+    _ = await verifier.observeFrame(PCMFrame.silence(track: .microphone, sampleCount: 160, hostTime: 0), atMs: 0)
+    _ = await verifier.observeFrame(tone(track: .microphone, amplitude: 12_000), atMs: 8_400)
+    let tick = await verifier.tick(atMs: 8_500)
+    #expect(!tick.annotations.contains { text($0).contains("audio is flowing") })
+}
+
+@Test func thresholdsFileMatchesTheVerifierConstants() throws {
+    // Drift guard for grade.py. Not P evidence.
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("harness/thresholds.json")
+    let object = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
+    let thresholds = try #require(object)
+    #expect((thresholds["verifierRmsFloor"] as? Double).map(Float.init) == AudioFlowCheck.rmsEpsilon)
+    #expect(thresholds["speechHoldMs"] as? Int == AudioFlowCheck.speechHoldMs)
+    #expect(thresholds["speechDipMs"] as? Int == AudioFlowCheck.speechDipMs)
+    #expect(thresholds["silenceLimitMs"] as? Int == AudioFlowCheck.silenceLimitMs)
+    #expect(thresholds["grokEngine"] as? String == EngineFactory.grokModelName)
+}
+
+private func text(_ annotation: Annotation?) -> String {
+    if case .text(let value) = annotation?.detail { return value }
+    return ""
 }
 
 private func tone(track: AudioTrack, amplitude: Int16, sampleCount: Int = 160) -> PCMFrame {

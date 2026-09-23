@@ -11,6 +11,8 @@ public struct CaptureCounterSnapshot: Sendable, Equatable {
     public var firstOSStatus: Int32
     public var firstFailureDetail: String
     public var displayID: UInt32
+    public var microphoneGain: Float?
+    public var microphoneGainPeak: Float?
 
     public init(
         system: Int = 0,
@@ -20,7 +22,9 @@ public struct CaptureCounterSnapshot: Sendable, Equatable {
         extractFailed: Int = 0,
         firstOSStatus: Int32 = 0,
         firstFailureDetail: String = "",
-        displayID: UInt32 = 0
+        displayID: UInt32 = 0,
+        microphoneGain: Float? = nil,
+        microphoneGainPeak: Float? = nil
     ) {
         self.system = system
         self.microphone = microphone
@@ -30,6 +34,8 @@ public struct CaptureCounterSnapshot: Sendable, Equatable {
         self.firstOSStatus = firstOSStatus
         self.firstFailureDetail = firstFailureDetail
         self.displayID = displayID
+        self.microphoneGain = microphoneGain
+        self.microphoneGainPeak = microphoneGainPeak
     }
 
     public static let empty = CaptureCounterSnapshot()
@@ -161,6 +167,10 @@ public actor StageLedger {
             Field("osstatus", String(capture.firstOSStatus)),
             Field("zeroEnergy", zero),
         ]
+        if let gain = capture.microphoneGain, let peak = capture.microphoneGainPeak {
+            pcmFields.append(Field("micGain", String(format: "%.2f", Double(gain))))
+            pcmFields.append(Field("micGainMax", String(format: "%.2f", Double(peak))))
+        }
         if !capture.firstFailureDetail.isEmpty {
             pcmFields.append(Field("error", capture.firstFailureDetail))
         }

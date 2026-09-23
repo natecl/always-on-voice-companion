@@ -3,6 +3,24 @@ import Foundation
 public enum CatcherMetadata {
     public static let appVersion = "0.0.1"
     public static let bundleIdentifier = "com.catcher.app"
+    public static let gitSHAInfoKey = "CatcherGitSHA"
+
+    /// `CatcherGitSHA` from the app's Info.plist, set by `build-app.sh`.
+    /// SwiftPM and test builds have no such key and report `unknown`, which
+    /// the grader never accepts as provenance.
+    public static var buildSHA: String {
+        buildSHA(info: Bundle.main.infoDictionary ?? [:])
+    }
+
+    public static func buildSHA(info: [String: Any]) -> String {
+        guard let raw = info[gitSHAInfoKey] as? String else { return "unknown" }
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty || value.hasPrefix("$(") { return "unknown" }
+        return value
+    }
+
+    /// Session header `app`. Same key, value carries the build.
+    public static var headerApp: String { "\(appVersion)+\(buildSHA)" }
 }
 
 public enum SessionPaths {

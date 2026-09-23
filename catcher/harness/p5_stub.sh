@@ -7,6 +7,7 @@ SESSION="${1:?stub session parent dir}"
 REFERENCE="${2:-}"
 mkdir -p "$SESSION"
 export CATCHER_ENGINE=stub
+begin_harness_run "$SESSION" P5
 launch_catcher "$SESSION" 1
 afplay "$ROOT/fixtures/known-60s.wav"
 sleep 2

@@ -78,7 +78,7 @@ public enum Assembler {
             startedAt: header?.startedAt ?? "",
             engine: header?.engine ?? "",
             tracks: header?.tracks ?? [],
-            app: header?.app ?? CatcherMetadata.appVersion,
+            app: header?.app ?? CatcherMetadata.headerApp,
             clean: end?.clean == true && !recoveredFlag,
             recovered: recoveredFlag,
             segmentCount: segments,

@@ -68,11 +68,34 @@ import TranscriptionEngine
     #expect(!events.contains("\"text\":\"partial\""))
     #expect(!events.contains("\"conf\""))
     #expect(events.contains("\"t\":\"end\""))
+    // SwiftPM has no Info.plist CatcherGitSHA. The grader rejects `unknown`.
+    #expect(events.contains("\"app\":\"0.0.1+unknown\""))
     let transcript = try String(contentsOf: SessionPaths.transcriptFile(in: directory), encoding: .utf8)
     #expect(transcript.contains("[them] S1"))
     #expect(transcript.contains("[me]"))
     let pcm = try Data(contentsOf: SessionPaths.pcmFile(track: "system", in: directory))
     #expect(pcm.count == 3_200)
+    #expect(await pipeline.isRunning == false)
+}
+
+@Test func stopWritesEndWhenEngineCloseNeverReturns() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("catcher-hang-\(UUID().uuidString)", isDirectory: true)
+    let pipeline = Pipeline(
+        sessionRoot: root,
+        makeCapture: { FakeCapture() },
+        makeEngine: { _ in HungFinishEngine() },
+        launchProbe: { .granted },
+        recheckProbe: { .granted },
+        engineLabel: "stub"
+    )
+    await pipeline.start()
+    let directory = try #require(await pipeline.sessionDirectory)
+    let started = ContinuousClock.now
+    await pipeline.stop()
+    let elapsed = ContinuousClock.now - started
+    #expect(elapsed < .seconds(2))
+    let events = try String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)
+    #expect(events.contains("\"t\":\"end\""))
     #expect(await pipeline.isRunning == false)
 }
 
@@ -265,9 +288,192 @@ import TranscriptionEngine
     #expect(transcript.field("error")?.isEmpty == false)
 }
 
+@Test func resumedRowCarriesTrackAndEngineBacklog() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("catcher-resume-\(UUID().uuidString)", isDirectory: true)
+    let capture = FakeCapture()
+    let engines = LockedEngines()
+    let pipeline = Pipeline(
+        sessionRoot: root,
+        makeCapture: { capture },
+        makeEngine: { track in engines.make(track) },
+        launchProbe: { .granted },
+        recheckProbe: { .granted },
+        engineLabel: "stub"
+    )
+    await pipeline.start()
+    let directory = try #require(await pipeline.sessionDirectory)
+    engines.engine(.system)?.dropAndResume(backlogMs: 21_000)
+    try await waitUntil {
+        let text = (try? String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)) ?? ""
+        return text.contains("\"kind\":\"resumed\"")
+    }
+    await pipeline.stop()
+    let events = try String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)
+    #expect(events.contains("ws closed (1006) track=system"))
+    #expect(events.contains("\"track\":\"system\""))
+    #expect(events.contains("transport resumed track=system backlogMs=21000"))
+    try expectEventShapeUnchanged(events)
+}
+
+@Test func harnessStopKeepsRecordingUntilTheLiveTailFloor() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("catcher-tail-\(UUID().uuidString)", isDirectory: true)
+    let capture = FakeCapture()
+    let engines = LockedEngines()
+    // Gap toMs is 2000 in the fake. Floor = 2000 + 100 + 800 = 2900, a short hold.
+    let pipeline = Pipeline(
+        sessionRoot: root,
+        makeCapture: { capture },
+        makeEngine: { track in engines.make(track) },
+        launchProbe: { .granted },
+        recheckProbe: { .granted },
+        engineLabel: "stub",
+        liveTailFloor: LiveTailFloor(marginMs: 0, tailMs: 800, slackMs: 0)
+    )
+    await pipeline.start()
+    let directory = try #require(await pipeline.sessionDirectory)
+    engines.engine(.system)?.dropAndResume(backlogMs: 100)
+    try await waitUntil {
+        let text = (try? String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)) ?? ""
+        return text.contains("backlogMs=100")
+    }
+    let stopping = Task { await pipeline.stopAfterLiveTail() }
+    try await Task.sleep(for: .milliseconds(200))
+    // Still recording inside the hold: capture reaches the engine and a live
+    // final is stored, so the tail window has speech and not an idle clock.
+    #expect(await pipeline.isRunning)
+    let system = try #require(engines.engine(.system))
+    let sentBefore = system.sentFrames
+    capture.emit(PCMFrame(track: .system, data: Data(repeating: 1, count: 3_200), hostTime: HostClock.now()))
+    try await waitUntil { system.sentFrames > sentBefore }
+    system.speakFinal("live words after the backlog", startMs: 2_500)
+    try await waitUntil {
+        let text = (try? String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)) ?? ""
+        return text.contains("live words after the backlog")
+    }
+    await stopping.value
+    let events = try String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)
+    let endAt = try endAtMs(events)
+    #expect(endAt >= 2_900)
+    #expect(await pipeline.isRunning == false)
+    #expect(events.contains("transport resumed track=system backlogMs=100"))
+    // Holding must not open another degrade after the resume.
+    let resumed = events.range(of: "backlogMs=100")
+    let after = resumed.map { events[$0.upperBound...] } ?? ""
+    #expect(!after.contains("\"kind\":\"degraded\""))
+    #expect(!after.contains("\"kind\":\"gap\""))
+}
+
+@Test func liveTailFloorMatchesTheGraderThresholds() throws {
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("harness/thresholds.json")
+    let object = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
+    let thresholds = try #require(object)
+    #expect(thresholds["p3LiveMarginMs"] as? Int == LiveTailFloor.grader.marginMs)
+    #expect(thresholds["p3MinTailMs"] as? Int == LiveTailFloor.grader.tailMs)
+    #expect(LiveTailFloor.grader.slackMs == 5_000)
+    // 859205c board: resumed 52742, backlog 18020, liveFrom 73762, tail need 88762.
+    #expect(LiveTailFloor.grader.endMs(resumedAtMs: 52_742, backlogMs: 18_020) == 88_762)
+}
+
+private final class LockedEngines: @unchecked Sendable {
+    private let lock = NSLock()
+    private var made: [AudioTrack: ReconnectingEngine] = [:]
+
+    func make(_ track: AudioTrack) -> ReconnectingEngine {
+        let engine = ReconnectingEngine()
+        lock.lock()
+        made[track] = engine
+        lock.unlock()
+        return engine
+    }
+
+    func engine(_ track: AudioTrack) -> ReconnectingEngine? {
+        lock.lock()
+        defer { lock.unlock() }
+        return made[track]
+    }
+}
+
+private final class ReconnectingEngine: TranscriptionEngine, EngineDiagnostics, @unchecked Sendable {
+    let events: AsyncStream<EngineEvent>
+    private let continuation: AsyncStream<EngineEvent>.Continuation
+    private let lock = NSLock()
+    private var backlog = 0
+    private var sent = 0
+    private var track = AudioTrack.system
+    private var seq = 0
+
+    init() {
+        let pair = AsyncStream<EngineEvent>.makeStream()
+        events = pair.stream
+        continuation = pair.continuation
+    }
+
+    var sentFrames: Int { lock.withLock { sent } }
+
+    func connect(track: AudioTrack) async throws {
+        lock.withLock { self.track = track }
+        continuation.yield(.state(.connecting))
+        continuation.yield(.state(.ready))
+        continuation.yield(.state(.streaming))
+    }
+
+    func send(_ frame: PCMFrame) async throws {
+        lock.withLock { sent += 1 }
+    }
+
+    func speakFinal(_ text: String, startMs: Int) {
+        let (track, seq) = lock.withLock { () -> (AudioTrack, Int) in
+            self.seq += 1
+            return (self.track, self.seq)
+        }
+        continuation.yield(.transcript(TranscriptEvent(
+            track: track,
+            kind: .final,
+            text: text,
+            words: [],
+            seq: seq,
+            startMs: startMs,
+            endMs: startMs + 1_000
+        )))
+    }
+
+    func finish() async {
+        continuation.yield(.state(.closed))
+        continuation.finish()
+    }
+
+    func dropAndResume(backlogMs: Int) {
+        lock.lock()
+        backlog = backlogMs
+        lock.unlock()
+        continuation.yield(.state(.degraded(reason: "ws closed (1006)")))
+        continuation.yield(.gap(fromMs: 1_000, toMs: 2_000))
+        continuation.yield(.state(.streaming))
+    }
+
+    func snapshot() async -> EngineDiagnosticsSnapshot {
+        EngineDiagnosticsSnapshot(lastResumeBacklogMs: lock.withLock { backlog })
+    }
+}
+
 private func stageLines(in directory: URL) throws -> [StageLine] {
     let text = try String(contentsOf: directory.appendingPathComponent("stages.log"), encoding: .utf8)
     return text.split(separator: "\n", omittingEmptySubsequences: true).compactMap { StageLine.parse(String($0)) }
+}
+
+private func endAtMs(_ events: String) throws -> Int {
+    for line in events.split(separator: "\n", omittingEmptySubsequences: true) {
+        let object = try #require(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+        if object["t"] as? String == "end" {
+            return try #require(object["atMs"] as? Int)
+        }
+    }
+    Issue.record("missing end row")
+    return -1
 }
 
 private func expectEventShapeUnchanged(_ events: String) throws {
@@ -330,6 +536,33 @@ private final class RevokeGate: @unchecked Sendable {
         let blocked = blocked
         lock.unlock()
         return blocked ? .blocked(reason: "screen recording access denied") : .granted
+    }
+}
+
+private final class HungFinishEngine: TranscriptionEngine, @unchecked Sendable {
+    let events: AsyncStream<EngineEvent>
+    private let continuation: AsyncStream<EngineEvent>.Continuation
+
+    init() {
+        let pair = AsyncStream<EngineEvent>.makeStream()
+        events = pair.stream
+        continuation = pair.continuation
+    }
+
+    func connect(track: AudioTrack) async throws {
+        continuation.yield(.state(.ready))
+        continuation.yield(.state(.streaming))
+    }
+
+    func send(_ frame: PCMFrame) async throws {}
+
+    func finish() async {
+        do {
+            try await Task.sleep(for: .seconds(30))
+        } catch {
+            return
+        }
+        continuation.finish()
     }
 }
 

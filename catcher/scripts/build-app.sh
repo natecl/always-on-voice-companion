@@ -100,10 +100,18 @@ else
   )
 fi
 
+# Provenance. Info.plist CatcherGitSHA is what the session header `app` and
+# harness_run.json carry. A dirty tree is recorded as such and never grades.
+GIT_SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+if [[ "$GIT_SHA" != "unknown" && -n "$(git status --porcelain 2>/dev/null)" ]]; then
+  GIT_SHA="${GIT_SHA}-dirty"
+fi
+
 xcodegen generate
 xcodebuild -project CatcherApp.xcodeproj -scheme CatcherApp \
   -destination 'platform=macOS' -derivedDataPath build \
   "${SIGN_ARGS[@]}" \
+  "CATCHER_GIT_SHA=${GIT_SHA}" \
   build
 
 APP="$PWD/build/Build/Products/Debug/Catcher.app"
@@ -128,7 +136,13 @@ if grep -q "flags=.*runtime" <<<"$INFO"; then
     exit 1
   fi
 fi
+PLIST_SHA="$(plutil -extract CatcherGitSHA raw -o - "$APP/Contents/Info.plist" 2>/dev/null || echo missing)"
+if [[ "$PLIST_SHA" != "$GIT_SHA" ]]; then
+  echo "Info.plist CatcherGitSHA is '$PLIST_SHA', expected '$GIT_SHA'. Sessions from this build cannot be graded." >&2
+  exit 1
+fi
 echo "Signed $APP"
+echo "CatcherGitSHA=$PLIST_SHA"
 echo "$INFO" | grep -E "Authority=|Signature=|TeamIdentifier=|Identifier=|CDHash=|flags=" || true
 codesign -d --entitlements :- "$APP" 2>/dev/null | grep -E "audio-input" || true
 echo "Export CATCHER_APP=\"$APP\""

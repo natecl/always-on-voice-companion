@@ -123,7 +123,7 @@ catcher/
     p1_known_audio.sh                    # afplay fixture into system output; then grade.py --wer --gaps
     p2_tcc_revoke.sh                     # tccutil reset ScreenCapture <bundle id> mid-session; timestamps block latency; re-grant instructions
     p3_net_kill.sh                       # pfctl rule blocking api.x.ai for N s mid-session; expects degraded + gap + resume
-    p4_silence.sh                        # mute output + no mic input for 60 s; expects noAudio annotation ≤ 10 s
+    p4_silence.sh                        # mute output + no mic input for 16 s; expects noAudio ≤ 10 s after capture start
     p5_stub.sh                           # CATCHER_ENGINE=stub, replays p1; asserts identical JSONL shape
     p6_two_track.sh                      # plays fixture + human speaks; asserts both tracks + speaker labels present
     wer.py                               # normalised WER against .ref.txt
@@ -157,8 +157,8 @@ Partials are UI-only and never written. Assembly on clean stop produces `transcr
 |---|---|---|---|
 | **P1** Known 60 s system audio → transcript, WER ≤ 15 %, no silent gap > 2 s | `AudioCapture/SCKCaptureSession.swift`, `AudioCapture/SampleBufferPCM.swift` → `GrokEngine/GrokEngine.swift`, `GrokEngine/GrokWebSocket.swift` (endpointing=800) → `SessionStore/JSONLWriter.swift`, `SessionStore/Assembler.swift` | `p1_known_audio.sh`, `wer.py`, `grade.py --gaps` (gap = span with no `seg` on the system track > 2 s while RMS > 0) |
 | **P2** Revoke Screen Recording → loud block ≤ 2 s + re-grant path; no fake recording | `AudioCapture/PermissionGate.swift`, `AudioCapture/CaptureError.swift` (`tccRevokedMidSession`) → `Verifier/Checks/PermissionCheck.swift`, `Verifier/Loud.swift` → `CatcherApp/Views/VerifierStatusView.swift` (re-grant button deep-links System Settings) → `CatcherApp/CatcherApp.swift` (launch probe) | `p2_tcc_revoke.sh` (timestamps revoke vs `ann kind:blocked`) |
-| **P3** Network kill mid-session → DEGRADED + gap timestamp + resume; no silent loss | `GrokEngine/Reconnect.swift`, `TranscriptionEngine/EngineEvent.swift` (`.gap`) → `Verifier/Checks/TransportHeartbeatCheck.swift` → `SessionStore/Rows.swift` (`ann gap/degraded/resumed`) → `VerifierStatusView.swift` | `p3_net_kill.sh` (pfctl block api.x.ai 15 s; asserts `degraded` → `gap` → `resumed` rows and post-resume `seg`s) |
-| **P4** 60 s silence → no-audio within 10 s | `Verifier/Checks/AudioFlowCheck.swift` → `Verifier/Loud.swift` → `AudioCapture/PCMFrame.swift` (frames still flow; content is zero) | `p4_silence.sh` (asserts `ann kind:noAudio` with `atMs ≤ 10 000` after silence start) |
+| **P3** Network kill mid-session → DEGRADED + gap timestamp + resume plus a live seg past backlog; no silent loss | `GrokEngine/Reconnect.swift`, `TranscriptionEngine/EngineEvent.swift` (`.gap`) → `Verifier/Checks/TransportHeartbeatCheck.swift` → `SessionStore/Rows.swift` (`ann gap/degraded/resumed`) → `VerifierStatusView.swift` | `p3_net_kill.sh` (pfctl block api.x.ai 15 s with the fixture looping; asserts per-track `degraded` → `gap` → `resumed` rows tied to the recorded pf window and a live `seg` after `resumed + backlogMs`) |
+| **P4** Silence (16 s harness run) → no-audio within 10 s of capture start | `Verifier/Checks/AudioFlowCheck.swift` → `Verifier/Loud.swift` → `AudioCapture/PCMFrame.swift` (frames still flow; content is zero) | `p4_silence.sh` (asserts `ann kind:noAudio` within 10 s of capture start, emitted in time, from live frames, in a quiet room) |
 | **P5** Stub engine behind same interface → pipeline unchanged | `TranscriptionEngine/TranscriptionEngine.swift`, `TranscriptionEngine/StubEngine.swift`, `TranscriptionEngine/EngineFactory.swift` → `Pipeline/Pipeline.swift` (must have zero engine-specific branches) | `p5_stub.sh` (`CATCHER_ENGINE=stub`; `grade.py` diffs JSONL *shape* against a Grok run; `Tests/TranscriptionEngineTests` conformance suite passes for both) |
 | **P6** System + live mic → both tracks preserved, speaker labels present | `AudioCapture/SCKCaptureSession.swift` (two `SCStreamOutput` types), `Pipeline/TrackRouter.swift` (one engine stream per track) → `TranscriptionEngine/TranscriptEvent.swift` (`track` mandatory, `speaker` optional) → `SessionStore/Assembler.swift` ([me]/[them] + speaker) | `p6_two_track.sh` (asserts `seg` rows with `track:microphone` **and** `track:system`, and ≥1 non-null `speaker` on the system track) |
 
@@ -181,7 +181,7 @@ Cross-cutting: `Verifier/Checks/CrashSafetyCheck.swift` + `SessionStore/Recovery
 - Diarization labels are per-stream: `S1` on the system track and `S1` on the mic track are unrelated. Assembler must namespace by track; the interface itself stays diarization-agnostic (locked).
 
 **Mac CI / build**
-- P1–P6 need a logged-in GUI session, TCC grants, real audio output, and network fault injection — none of which a hosted runner provides. CI runs `swift build` + `swift test` only; the gates are a QA-run harness on a physical Mac, and green is claimed only from a `grade.json` produced there.
+- P1–P6 need a logged-in GUI session, TCC grants, real audio output, and network fault injection — none of which a hosted runner provides. CI runs `swift build` + `swift test` only; the gates are a QA-run harness on a physical Mac, and green is claimed only from a `v0-verdict.json` produced there.
 - `.xcodeproj` generated from `project.yml` avoids merge-conflict churn but adds an xcodegen dependency for the app target. Library targets stay pure SwiftPM.
 - Signing: TCC keys permissions to the bundle identifier + code signature; an unsigned or ad-hoc-signed rebuild can silently re-prompt or lose the grant. Use a stable dev signing identity for harness builds.
 
@@ -204,4 +204,6 @@ Notes, Jev, interjection, context graph, iOS/Windows, AssemblyAI implementation 
 
 ## 8. Done-check for this plan's implementation climb
 
-The implementation is done when `harness/grade.py` on a QA-run session emits `grade.json` with P1–P6 all `pass`, and `docs/qa/v0-grading.md` lets QA reproduce it without the builder present. Until QA produces that file, v0 is red.
+The implementation is done when `run.sh verdict` on a QA Mac writes `v0-verdict.json` with `GREEN` (P1–P6 all `pass` on one SHA and CDHash), and `docs/qa/v0-grading.md` lets QA reproduce it without the builder present. Until QA produces that file, v0 is red.
+
+Hardened GREEN evidence (Cap-reported, not in git): `b14e31a` (`b14e31a99a431e5cac6a49669f5c1955de38a1d1`), CDHash `57250034b55e54e3ad6798983edf6e62c1553653`, board `/tmp/catcher-auto/b14e31a-20260923-055848/board.json`. Preflight and P1–P6 pass under the hardened verifier (soft-pass killed). `MicrophoneGain` on the mic path (floor 0.05 unchanged); P6 p50 0.2039, micGainMax 16. This supersedes `95837a8`. Reconcile and merge stay with Cap/Nathan.

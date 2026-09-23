@@ -5,7 +5,7 @@ Synthesized judgments from the deep-research pass and the founder's decisions to
 ## The sequence (locked)
 
 1. **Spike validates Jev** — DONE, PASS (2026-09-22; see [03-jev.md](03-jev.md)).
-2. **Build the proven base** — Granola's mechanics + the better-friction layer (consumer wedge; see [01-consumer-wedge.md](01-consumer-wedge.md)).
+2. **Build the proven base** — v0 transcript foundation hardened GREEN (`b14e31a`, CDHash `57250034b55e54e3ad6798983edf6e62c1553653`, board `/tmp/catcher-auto/b14e31a-20260923-055848/board.json`); notes and judgment brief next. (Consumer wedge: [01-consumer-wedge.md](01-consumer-wedge.md).)
 3. **Trial the new** — the always-on buddy with Jev-powered interjection. Expect it wrong first (Pincus: "the new gets the trial").
 
 Nathan approves the brief (pass/fail defined first) before Cap builds anything.
@@ -23,6 +23,7 @@ The track-5 research changed the bet's edges, not its shape:
 ## The 5 open gaps (from the research takeaways)
 
 1. **Fix capture reliability.** Silent failure is the most-hated property in the category: capture health checks, loud failure alerts, user-controlled encrypted audio retention, file import. > "A generic summary can be edited. A blank session cannot."
+   - Capture health checks and loud failures are in the hardened GREEN grade at `b14e31a` ([09-v0-shipped.md](09-v0-shipped.md)). Encrypted retention and file import are not in that grade.
 2. **Solve the proactivity trigger with Jev.** Friend proved unprompted AI reads as creepy; full-duplex infra just shipped with no judgment layer. Calibrated Noul/Choice/Score gates at $42/B tokens, 70–500ms — the first economically viable "should I speak now?" machinery. Build the interruptibility score.
 3. **Make privacy verifiable, not promised.** Training-off-by-default, local-first, auto-expiring transcripts — ship what Pedregal says he's *researching* before he does.
 4. **No hardware — colonize the devices people already wear.** Phone mics + earbuds; the meeting flow Granola proved. Hardware is where startups in this space go to die.
@@ -44,7 +45,7 @@ The proven base is being built narrow-slice, not as a Granola clone:
 - **The verifier is the product of v0** — capture health checks, loud failures, binary pass/fail. It exists because silent capture failure is the category's most-hated property.
 - **Build order:** capture layer first (the hard part), verifier second, Grok wiring third.
 - **Engine is a commodity input, not the moat** — Grok is xAI, same dependency class as Meta. The moat is the context graph + Jev judgment; the interface keeps the engine swappable so no lab is a landlord.
-- v0 brief drafted at `~/workspace/briefs/v0-transcript-foundation/brief.md` — six binary gates (P1–P6). **Awaiting Nathan's approval before Cap builds.**
+- v0 brief drafted at `~/workspace/briefs/v0-transcript-foundation/brief.md` (local, not in repo) — six binary gates (P1–P6). Hardened GREEN at `b14e31a` (`b14e31a99a431e5cac6a49669f5c1955de38a1d1`), CDHash `57250034b55e54e3ad6798983edf6e62c1553653`, board `/tmp/catcher-auto/b14e31a-20260923-055848/board.json`. Soft-pass killed. See [09-v0-shipped.md](09-v0-shipped.md).
 
 ## Related
 

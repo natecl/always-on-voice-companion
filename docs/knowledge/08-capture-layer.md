@@ -1,6 +1,8 @@
 # Capture layer — 2026-09-22
 
-**Verdict:** solved engineering, not open research. ScreenCaptureKit delivers 16 kHz mono PCM directly — exactly what Grok's streaming endpoint consumes. The provider is the easy part; the OS audio plumbing is the actual build.
+**Verdict:** solved engineering, not open research. ScreenCaptureKit delivers 48 kHz stereo float; the app downmixes and resamples that to 16 kHz mono PCM16. The provider is the easy part; the OS audio plumbing is the actual build.
+
+**Hardened GREEN evidence:** `b14e31a` (`b14e31a99a431e5cac6a49669f5c1955de38a1d1`). CDHash `57250034b55e54e3ad6798983edf6e62c1553653`. Board `/tmp/catcher-auto/b14e31a-20260923-055848/board.json`. Preflight and P1–P6 pass under the hardened verifier (soft-pass killed). This supersedes `95837a8`. `MicrophoneGain` (`AudioCapture/MicrophoneGain.swift`) runs on the mic path before the verifier and `microphone.pcm`. Floor `rmsEpsilon` 0.05 is unchanged. Held speech is lifted so the median clears ≥ 0.1000. This run: micGainMax 16, P6 p50 0.2039. See [09-v0-shipped.md](09-v0-shipped.md). The cite is the grade, not a merge.
 
 ## The v0 pipeline
 ```
@@ -61,4 +63,4 @@ This is the anti-Granola layer: silent capture failure is the category's most-ha
 
 Full brief: `~/workspace/research_notes/capture-layer-brief-20260922/report.md`
 
-Related: [07-transcription.md](07-transcription.md) · [06-strategic-reads.md](06-strategic-reads.md) · [02-granola.md](02-granola.md)
+Related: [07-transcription.md](07-transcription.md) · [09-v0-shipped.md](09-v0-shipped.md) · [06-strategic-reads.md](06-strategic-reads.md) · [02-granola.md](02-granola.md)

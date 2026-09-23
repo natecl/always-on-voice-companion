@@ -1,6 +1,8 @@
 # v0 stage diagnostics
 
-A failed or empty take writes a checkpoint for each pipeline stage, then two `TRACE` lines naming the first failure and a probable fix. These files do not grade P1–P6. `grade.py` never reads them. v0 stays red until a Mac `grade.json` has P1–P6 all `pass`.
+A failed or empty take writes a checkpoint for each pipeline stage, then two `TRACE` lines naming the first failure and a probable fix. These files do not grade P1–P6. `grade.py` never reads them. v0 stays red until a Mac `v0-verdict.json` is `GREEN` for the SHA (see [`v0-grading.md`](v0-grading.md)).
+
+**Last hardened GREEN:** `b14e31a` (`b14e31a99a431e5cac6a49669f5c1955de38a1d1`) on 2026-09-23. CDHash `57250034b55e54e3ad6798983edf6e62c1553653`. Board `/tmp/catcher-auto/b14e31a-20260923-055848/board.json` on the grading Mac (not in git). Preflight and P1–P6 pass under the hardened verifier (soft-pass killed). `MicrophoneGain` on the mic path (floor 0.05 unchanged); P6 p50 0.2039, micGainMax 16. See [v0 grading](v0-grading.md).
 
 ## Where the lines go
 
@@ -17,7 +19,7 @@ grep -E '^(STAGE|TRACE)' <uuid>/stages.log
 log stream --predicate 'subsystem == "com.catcher.app" AND category == "stage"'
 ```
 
-Count stages are written at a 10 s checkpoint and again at close. The last line for a stage is its verdict (`api-connect` keeps one line per `track=`). A stage that was never written is `not-reached`. A FAIL at `tcc-check`, `capture-start`, or `api-connect` means later stages are not written. `zeroEnergy` is informational and leaves `pcm-extract` at OK, because P4 is a legitimate silence run.
+Count stages are written at a 10 s checkpoint and again at close. The last line for a stage is its verdict (`api-connect` keeps one line per `track=`). A stage that was never written is `not-reached`. A FAIL at `tcc-check`, `capture-start`, or `api-connect` means later stages are not written. `zeroEnergy` is informational and leaves `pcm-extract` at OK, because P4 is a legitimate silence run. `micGain` (latest) and `micGainMax` (session high) are the microphone gain factors from `MicrophoneGain`; `1.00` means the mic track was passed through unchanged.
 
 ## Line grammar
 
@@ -114,4 +116,4 @@ First match wins. `TRACE error=` is the underlying error (domain and code, OSSta
 | `transcript-write` | `error=` present | assemble/end failed | the error names the path and errno |
 | `transcript-write` | `bytes=0` and `segments=0` | nothing to write | the trace points upstream; this is a symptom |
 
-Mid-session Screen Recording revoke and socket reconnect are graded from `blocked`, `degraded`, `gap`, and `resumed` annotations. They do not add a stage line.
+Mid-session Screen Recording revoke and socket reconnect are graded from `blocked`, `degraded`, `gap`, and `resumed` annotations. They do not add a stage line. `degraded` and `resumed` detail text ends in `track=<t>`, and `resumed` carries `backlogMs=<n>` (audio the new socket replays before live). `noAudio` and heartbeat/handshake `degraded` carry `emittedAtMs=`; `noAudio` also carries `observedFromMs=` (capture start). `stages.log` is still never read by `grade.py`; provenance comes from `harness_run.json`, not from stage lines.
