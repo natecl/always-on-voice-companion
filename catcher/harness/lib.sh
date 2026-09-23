@@ -194,6 +194,14 @@ launch_catcher() {
   if [[ -n "${XAI_API_KEY:-}" ]]; then
     envs+=(--env "XAI_API_KEY=$XAI_API_KEY")
   fi
+  # Optional. Unset on P1–P6, so those launches do not gain a brief flag.
+  # `open --env` does not inherit the shell; the LaunchServices helper does.
+  local key
+  for key in CATCHER_BRIEF CATCHER_NOTES_ENGINE CATCHER_BRIEF_MODEL; do
+    if [[ -n "${!key:-}" ]]; then
+      envs+=(--env "$key=${!key}")
+    fi
+  done
   if [[ "$auto" == "1" ]]; then
     export CATCHER_AUTO_RECORD=1
     args+=(--auto-record)

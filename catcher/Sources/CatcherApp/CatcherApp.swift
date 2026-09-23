@@ -1,5 +1,6 @@
 import AppKit
 import AudioCapture
+import Brief
 import Diagnostics
 import GrokEngine
 import Observation
@@ -42,6 +43,9 @@ final class CatcherModel {
     var sessions: [SessionSummary] = []
     var selectedID: String?
     var selectedTranscript = ""
+    var notesSurface = NotesSurface.idle
+    var transcriptRows: [NotesTranscriptRow] = []
+    var showsNotes: Bool { BriefLaunchPolicy.notesEnabled(environment: launchEnvironment) }
     private var finals: [TranscriptEvent] = []
     private var partials: [AudioTrack: TranscriptEvent] = [:]
     private var listenTask: Task<Void, Never>?
@@ -52,12 +56,15 @@ final class CatcherModel {
     private var launchStarted = false
     private let preflight: Bool
     private let launchEnvironment: [String: String]
+    private let notesCoordinator: NotesCoordinator
+    private var notesBySession: [String: NotesPhase] = [:]
 
     init() {
         GrokEngineBootstrap.install()
         let launch = LaunchConfiguration.resolve()
         let environment = launch.mergedEnvironment(ProcessInfo.processInfo.environment)
         launchEnvironment = environment
+        notesCoordinator = NotesCoordinator(engine: Self.notesEngine(environment: environment))
         preflight = launch.preflight
         if !launch.preflight {
             Loud.prepare()
@@ -133,6 +140,11 @@ final class CatcherModel {
         let probe = await PermissionGate.startCaptureProbe()
         await applyLaunchProbe(probe)
         listen()
+        if BriefSignalPolicy.installsStopAndStayUp(environment: launchEnvironment) {
+            BriefHarnessSignal.install { [weak self] in
+                await self?.stopFromSignal()
+            }
+        }
         if autoRecord, !status.isBlocked {
             await toggle()
         }
@@ -140,13 +152,43 @@ final class CatcherModel {
 
     func toggle() async {
         if await pipeline.isRunning {
-            await pipeline.stop()
+            if BriefLaunchPolicy.notesEnabled(environment: launchEnvironment) {
+                let stopRequested = SystemStopwatch().nowMs()
+                let directory = await pipeline.sessionDirectory
+                await pipeline.stop()
+                await finishToggle()
+                if let directory, !isRecording {
+                    beginNotes(directory: directory, stopRequested: stopRequested, trigger: .button)
+                }
+            } else {
+                await pipeline.stop()
+                await finishToggle()
+            }
         } else if !status.isBlocked {
             finals = []
             partials = [:]
             rebuildLines()
             await pipeline.start()
+            await finishToggle()
+        } else {
+            await finishToggle()
         }
+    }
+
+    /// SIGUSR1. Stop the live session and stay up. Does not start a recording.
+    private func stopFromSignal() async {
+        guard BriefSignalPolicy.installsStopAndStayUp(environment: launchEnvironment) else { return }
+        guard await pipeline.isRunning else { return }
+        let stopRequested = SystemStopwatch().nowMs()
+        let directory = await pipeline.sessionDirectory
+        await pipeline.stop()
+        await finishToggle()
+        if let directory, !isRecording {
+            beginNotes(directory: directory, stopRequested: stopRequested, trigger: .harness)
+        }
+    }
+
+    private func finishToggle() async {
         isRecording = await pipeline.isRunning
         if harness, isRecording {
             await pinLiveSession()
@@ -154,6 +196,104 @@ final class CatcherModel {
         await refreshSessions()
         if !isRecording {
             await refreshSessions()
+        }
+    }
+
+    private func beginNotes(directory: URL, stopRequested: Int, trigger: StopTrigger) {
+        let ended: SessionEnded
+        do {
+            ended = try BriefStopAdapter.sessionEnded(
+                directory: directory,
+                stopRequestedWallMs: stopRequested,
+                assembledWallMs: SystemStopwatch().nowMs(),
+                trigger: trigger
+            )
+        } catch {
+            let phase = NotesPhase.failed("session.json unreadable")
+            notesBySession[directory.lastPathComponent] = phase
+            notesSurface = NotesSurface.make(phase: phase, nowMs: stopRequested)
+            return
+        }
+        let writing = NotesPhase.writing(startedWallMs: stopRequested)
+        notesBySession[ended.sessionID] = writing
+        notesSurface = NotesSurface.make(phase: writing, nowMs: stopRequested)
+        select(ended.sessionID, preserveNotes: true)
+        let environment = launchEnvironment
+        Task { @MainActor in
+            let phase = await self.notesCoordinator.stop(ended: ended, environment: environment)
+            self.notesBySession[ended.sessionID] = phase
+            guard self.selectedID == ended.sessionID else { return }
+            self.notesSurface = NotesSurface.make(phase: phase, nowMs: SystemStopwatch().nowMs())
+        }
+    }
+
+    func makeNotes() {
+        guard showsNotes, let id = selectedID else { return }
+        let directory = sessionRoot.appendingPathComponent(id, isDirectory: true)
+        let now = SystemStopwatch().nowMs()
+        let ended: SessionEnded
+        do {
+            ended = try BriefStopAdapter.sessionEnded(
+                directory: directory,
+                stopRequestedWallMs: now,
+                assembledWallMs: now,
+                trigger: .button
+            )
+        } catch {
+            notesSurface = NotesSurface.make(phase: .failed("session.json unreadable"), nowMs: now)
+            return
+        }
+        notesSurface = NotesSurface.make(phase: .writing(startedWallMs: now), nowMs: now)
+        let environment = launchEnvironment
+        Task { @MainActor in
+            let phase = await self.notesCoordinator.makeNotes(ended: ended, environment: environment)
+            self.notesBySession[ended.sessionID] = phase
+            guard self.selectedID == ended.sessionID else { return }
+            self.notesSurface = NotesSurface.make(phase: phase, nowMs: SystemStopwatch().nowMs())
+        }
+    }
+
+    func retryNotes() {
+        guard showsNotes else { return }
+        let now = SystemStopwatch().nowMs()
+        notesSurface = NotesSurface.make(phase: .writing(startedWallMs: now), nowMs: now)
+        let environment = launchEnvironment
+        let sessionID = selectedID
+        Task { @MainActor in
+            let phase = await self.notesCoordinator.retry(environment: environment)
+            if let sessionID {
+                self.notesBySession[sessionID] = phase
+            }
+            guard self.selectedID == sessionID else { return }
+            self.notesSurface = NotesSurface.make(phase: phase, nowMs: SystemStopwatch().nowMs())
+        }
+    }
+
+    func copyNotes() {
+        guard case .ready(let brief) = notesSurface.phase else { return }
+        Clipboard.write(.notes(brief))
+        let now = SystemStopwatch().nowMs()
+        notesSurface = notesSurface.markedCopied(nowMs: now)
+    }
+
+    func copyBlock(_ id: String) {
+        guard let block = notesSurface.blocks.first(where: { $0.id == id }) else { return }
+        Clipboard.write(.block(block))
+        notesSurface = notesSurface.markedCopied(nowMs: SystemStopwatch().nowMs())
+    }
+
+    func copyTranscript() {
+        Clipboard.write(.transcript(selectedTranscript))
+    }
+
+    private static func notesEngine(environment: [String: String]) -> any NotesEngine {
+        guard BriefLaunchPolicy.notesEnabled(environment: environment) else {
+            return StubNotesEngine()
+        }
+        do {
+            return try NotesEngineFactory.make(environment: environment)
+        } catch {
+            return FailingNotesEngine()
         }
     }
 
@@ -314,10 +454,14 @@ final class CatcherModel {
         }
     }
 
-    func select(_ id: String?) {
+    func select(_ id: String?, preserveNotes: Bool = false) {
         selectedID = id
         guard let id else {
             selectedTranscript = ""
+            transcriptRows = []
+            if !preserveNotes {
+                notesSurface = .idle
+            }
             return
         }
         let directory = sessionRoot.appendingPathComponent(id, isDirectory: true)
@@ -327,6 +471,13 @@ final class CatcherModel {
             selectedTranscript = ""
             StageMirror.note("transcript read \(ErrorDetail.sentence(error))")
         }
+        guard showsNotes else { return }
+        transcriptRows = NotesTranscript.rows(eventsFile: SessionPaths.eventsFile(in: directory))
+        if preserveNotes { return }
+        let recovered = sessions.first { $0.id == id }?.recovered ?? false
+        let phase = notesBySession[id] ?? NotesDisk.phase(directory: directory, recovered: recovered)
+        notesBySession[id] = phase
+        notesSurface = NotesSurface.make(phase: phase, nowMs: SystemStopwatch().nowMs())
     }
 
     private func listen() {
@@ -455,6 +606,46 @@ final class CatcherModel {
 /// The harness stops the app with SIGTERM. When the signal arrives before the
 /// system live-tail floor, the session keeps recording until it; shutdown then
 /// fsyncs `end` before a hung socket close. The harness grades after exit.
+/// SIGUSR1 stops recording and leaves the app up. Only installed when
+/// `BriefSignalPolicy.installsStopAndStayUp` is true. SIGTERM is unchanged.
+enum BriefHarnessSignal {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var installed = false
+    nonisolated(unsafe) private static var source: DispatchSourceSignal?
+
+    static func install(_ stop: @escaping @MainActor () async -> Void) {
+        lock.lock()
+        if installed {
+            lock.unlock()
+            return
+        }
+        installed = true
+        lock.unlock()
+        signal(SIGUSR1, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
+        source.setEventHandler {
+            Task { @MainActor in
+                await stop()
+            }
+        }
+        lock.lock()
+        self.source = source
+        lock.unlock()
+        source.resume()
+    }
+}
+
+private struct FailingNotesEngine: NotesEngine {
+    var label: BriefEngineInfo {
+        BriefEngineInfo(name: "grok-notes", model: NotesService.briefModel)
+    }
+
+    func write(_ input: BriefInput, timeout: Duration) async throws -> NotesDraft {
+        _ = (input, timeout)
+        throw NotesEngineError.missingAPIKey
+    }
+}
+
 enum HarnessShutdown {
     private static let lock = NSLock()
     // Read and written only while `lock` is held. Swift 6 requires
@@ -520,7 +711,15 @@ struct ContentView: View {
                 sessions: model.sessions,
                 selection: model.selectedID,
                 transcript: model.selectedTranscript,
-                onSelect: { model.select($0) }
+                notesEnabled: model.showsNotes,
+                notes: model.notesSurface,
+                transcriptRows: model.transcriptRows,
+                onSelect: { model.select($0) },
+                onCopyNotes: { model.copyNotes() },
+                onCopyBlock: { model.copyBlock($0) },
+                onRetry: { model.retryNotes() },
+                onMakeNotes: { model.makeNotes() },
+                onCopyTranscript: { model.copyTranscript() }
             )
         }
         .padding(16)
