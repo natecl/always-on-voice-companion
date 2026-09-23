@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """Read a Catcher session and write grade.json for the requested P gates.
 
-P1–P6 are graded from events.jsonl (and system.pcm / session.json when present).
-Gates that were not requested are n/a. This script does not claim a build is
-green; it only scores the session directory it was given.
+Each gate is {"result", "evidence", "checks"}. `result` is one of:
+
+  pass      every check passed and provenance says a Mac harness run
+  fail      a check failed
+  invalid   the run did not set up the premise (re-run; not a product result)
+  unproven  checks passed but provenance is missing or not a Mac harness run
+  n/a       not requested
+
+Only `pass` counts. This script does not claim a build is green; verdict.py
+is the only artifact that can.
 """
 
 from __future__ import annotations
@@ -16,13 +23,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
 from wer import word_error_rate  # noqa: E402
 
 GATES = ("P1", "P2", "P3", "P4", "P5", "P6")
 SAMPLE_RATE = 16000
-RMS_EPSILON = 0.001
-GAP_LIMIT_MS = 2000
+THRESHOLDS: dict[str, float] = json.loads((HERE / "thresholds.json").read_text(encoding="utf-8"))
 
 SESSION_KEYS = {"t", "id", "startedAt", "engine", "tracks", "app"}
 SEG_REQUIRED = {"t", "seq", "track", "startMs", "endMs", "final", "text", "words"}
@@ -32,9 +39,43 @@ ANN_OPTIONAL = {"detail"}
 END_REQUIRED = {"t", "atMs", "clean"}
 END_OPTIONAL = {"recovered"}
 
+GATE_CHECK = "gate"
+PREMISE_CHECK = "premise"
+PROVENANCE_CHECK = "provenance"
 
-def result(status: str, evidence: str) -> dict[str, str]:
-    return {"result": status, "evidence": evidence}
+
+class Gate:
+    """Ordered checks. A premise failure is `invalid`, a gate failure is
+    `fail`, a provenance failure is `unproven`. Evidence lists the failures
+    first so the reason is on the first line of grade.json."""
+
+    def __init__(self) -> None:
+        self.checks: list[dict[str, object]] = []
+
+    def check(self, name: str, ok: bool, detail: str, kind: str = GATE_CHECK) -> bool:
+        self.checks.append({"name": name, "ok": bool(ok), "detail": detail, "kind": kind})
+        return bool(ok)
+
+    def failed(self, kind: str) -> list[dict[str, object]]:
+        return [item for item in self.checks if not item["ok"] and item["kind"] == kind]
+
+    def result(self) -> dict[str, object]:
+        if self.failed(PREMISE_CHECK):
+            status = "invalid"
+        elif self.failed(GATE_CHECK):
+            status = "fail"
+        elif self.failed(PROVENANCE_CHECK):
+            status = "unproven"
+        else:
+            status = "pass"
+        bad = [item for item in self.checks if not item["ok"]]
+        good = [item for item in self.checks if item["ok"]]
+        evidence = "; ".join(f"{item['name']}: {item['detail']}" for item in bad + good)
+        return {"result": status, "evidence": evidence, "checks": self.checks}
+
+
+def not_requested() -> dict[str, object]:
+    return {"result": "n/a", "evidence": "not requested", "checks": []}
 
 
 def load_rows(session: Path) -> tuple[list[dict], str]:
@@ -60,15 +101,19 @@ def rows_of(rows: list[dict], kind: str) -> list[dict]:
     return [row for row in rows if row.get("t") == kind]
 
 
+def header(rows: list[dict]) -> dict:
+    return next((row for row in rows if row.get("t") == "session"), {})
+
+
 def session_start_ms(rows: list[dict]) -> int | None:
-    for row in rows:
-        if row.get("t") == "session" and row.get("startedAt"):
-            try:
-                started = datetime.fromisoformat(row["startedAt"].replace("Z", "+00:00"))
-            except ValueError:
-                return None
-            return int(started.timestamp() * 1000)
-    return None
+    started_at = header(rows).get("startedAt")
+    if not started_at:
+        return None
+    try:
+        started = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int(started.timestamp() * 1000)
 
 
 def wall_to_session_ms(rows: list[dict], wall_ms: int | None) -> int | None:
@@ -109,13 +154,14 @@ def overlaps(start: int, end: int, seg: dict) -> bool:
 
 
 def gap_evidence(session: Path, rows: list[dict]) -> tuple[bool, str]:
+    limit = int(THRESHOLDS["p1GapLimitMs"])
     segs = [row for row in rows_of(rows, "seg") if row.get("track") == "system"]
     segs.sort(key=lambda row: int(row.get("startMs", 0)))
     if not segs:
         return False, "no system-track seg rows"
     pcm = session / "system.pcm"
     if pcm.exists() and pcm.stat().st_size > 0:
-        windows = [item for item in pcm_windows(pcm) if item[2] > RMS_EPSILON]
+        windows = [item for item in pcm_windows(pcm) if item[2] > THRESHOLDS["p1GapRmsFloor"]]
         uncovered: list[tuple[int, int]] = []
         for start, end, _rms in windows:
             if any(overlaps(start, end, seg) for seg in segs):
@@ -124,18 +170,18 @@ def gap_evidence(session: Path, rows: list[dict]) -> tuple[bool, str]:
                 uncovered[-1] = (uncovered[-1][0], max(uncovered[-1][1], end))
             else:
                 uncovered.append((start, end))
-        holes = [f"{start}-{end}" for start, end in uncovered if end - start > GAP_LIMIT_MS]
+        holes = [f"{start}-{end}" for start, end in uncovered if end - start > limit]
         if holes:
-            return False, "system.pcm speech without a seg >2s: " + ", ".join(holes)
-        return True, f"no silent gap >2s across {len(windows)} speech windows"
+            return False, f"system.pcm speech without a seg >{limit}ms: " + ", ".join(holes)
+        return True, f"no silent gap >{limit}ms across {len(windows)} speech windows"
     holes = []
     for previous, nxt in zip(segs, segs[1:]):
         gap = int(nxt.get("startMs", 0)) - int(previous.get("endMs", 0))
-        if gap > GAP_LIMIT_MS:
+        if gap > limit:
             holes.append(str(gap))
     if holes:
-        return False, "system.pcm missing; inter-segment holes >2s (ms): " + ", ".join(holes)
-    return True, "system.pcm missing; no inter-segment hole >2s"
+        return False, f"system.pcm missing; inter-segment holes >{limit}ms: " + ", ".join(holes)
+    return True, f"system.pcm missing; no inter-segment hole >{limit}ms"
 
 
 def shape_keys(rows: list[dict]) -> dict[str, set[str]]:
@@ -190,23 +236,25 @@ def recovered(session: Path, rows: list[dict]) -> bool:
     return any(row.get("recovered") is True for row in rows_of(rows, "end"))
 
 
-def grade_p1(session: Path, rows: list[dict], ref: Path | None, expect_recovery: bool) -> dict[str, str]:
-    evidence: list[str] = []
-    ok = True
+def provenance_checks(gate: Gate, session: Path, rows: list[dict], name: str, no_provenance: bool) -> None:
+    if no_provenance:
+        gate.check("provenance", False, "--no-provenance: unit-test grading, never a pass", PROVENANCE_CHECK)
+        return
+    gate.check("provenance", False, "this grader build does not verify harness provenance", PROVENANCE_CHECK)
+
+
+def grade_p1(gate: Gate, session: Path, rows: list[dict], ref: Path | None, expect_recovery: bool) -> None:
     if ref is None or not ref.exists():
-        return result("fail", "missing reference transcript")
+        gate.check("reference", False, "missing reference transcript")
+        return
+    bar = float(THRESHOLDS["p1WerBar"])
     score = word_error_rate(ref.read_text(encoding="utf-8"), system_text(rows))
-    evidence.append(f"WER {score:.3f} on the system track (bar 0.15)")
-    if score > 0.15:
-        ok = False
+    gate.check("wer", score <= bar, f"WER {score:.3f} on the system track (bar {bar})")
     gaps_ok, gaps = gap_evidence(session, rows)
-    evidence.append(gaps)
-    ok = ok and gaps_ok
+    gate.check("gaps", gaps_ok, gaps)
     if expect_recovery:
         did = recovered(session, rows)
-        evidence.append("recovery " + ("present" if did else "missing"))
-        ok = ok and did
-    return result("pass" if ok else "fail", "; ".join(evidence))
+        gate.check("recovery", did, "recovery " + ("present" if did else "missing"))
 
 
 def launch_failure(session: Path) -> bool:
@@ -275,78 +323,102 @@ def pick_revoke_session(root: Path) -> Path:
     return pool[-1]
 
 
-def grade_p2(rows: list[dict], revoke_at: int | None) -> dict[str, str]:
+def grade_p2(gate: Gate, rows: list[dict], revoke_at: int | None) -> None:
     blocked = [row for row in rows_of(rows, "ann") if row.get("kind") == "blocked"]
-    if not blocked:
-        return result("fail", "no ann kind=blocked")
+    if not gate.check("blocked", bool(blocked), "ann kind=blocked " + ("present" if blocked else "missing")):
+        return
     at = int(blocked[0].get("atMs", -1))
-    evidence = [f"blocked atMs={at}"]
-    ok = True
+    within = int(THRESHOLDS["p2BlockWithinMs"])
     if revoke_at is not None:
         latency = at - revoke_at
-        evidence.append(f"latency {latency}ms from revoke")
-        if latency < 0 or latency > 2000:
-            ok = False
+        gate.check("latency", 0 <= latency <= within, f"blocked atMs={at}, {latency}ms from revoke (bar {within})")
     late = [row for row in rows_of(rows, "seg") if int(row.get("startMs", 0)) > at]
-    if late:
-        evidence.append(f"{len(late)} seg(s) after the block")
-        ok = False
-    return result("pass" if ok else "fail", "; ".join(evidence))
+    gate.check("no-seg-after-block", not late, f"{len(late)} seg(s) after the block")
 
 
-def grade_p3(rows: list[dict]) -> dict[str, str]:
+def grade_p3(gate: Gate, rows: list[dict]) -> None:
     anns = rows_of(rows, "ann")
     degraded_at = next((index for index, row in enumerate(anns) if row.get("kind") == "degraded"), None)
     gap_at = next((index for index, row in enumerate(anns) if row.get("kind") == "gap"), None)
     resumed_at = next((index for index, row in enumerate(anns) if row.get("kind") == "resumed"), None)
     if degraded_at is None or gap_at is None or resumed_at is None:
-        return result("fail", "need ann kinds degraded, gap, resumed in that order")
-    if not (degraded_at < gap_at < resumed_at):
-        return result("fail", f"order degraded={degraded_at} gap={gap_at} resumed={resumed_at}")
+        gate.check("chain", False, "need ann kinds degraded, gap, resumed in that order")
+        return
+    if not gate.check("order", degraded_at < gap_at < resumed_at, f"degraded={degraded_at} gap={gap_at} resumed={resumed_at}"):
+        return
     resumed_ms = int(anns[resumed_at].get("atMs", 0))
     later = [row for row in rows_of(rows, "seg") if int(row.get("startMs", 0)) >= resumed_ms]
-    if not later:
-        return result("fail", "no seg at or after resumed atMs")
-    return result("pass", f"degraded → gap → resumed, then {len(later)} seg(s)")
+    gate.check("seg-after-resume", bool(later), f"{len(later)} seg(s) at or after resumed atMs")
 
 
-def grade_p4(rows: list[dict], silence_at: int) -> dict[str, str]:
+def grade_p4(gate: Gate, rows: list[dict], silence_at: int) -> None:
+    limit = int(THRESHOLDS["silenceLimitMs"])
     hits = [
         row for row in rows_of(rows, "ann")
-        if row.get("kind") == "noAudio" and silence_at <= int(row.get("atMs", -1)) <= silence_at + 10_000
+        if row.get("kind") == "noAudio" and silence_at <= int(row.get("atMs", -1)) <= silence_at + limit
     ]
-    if not hits:
-        return result("fail", f"no noAudio ann with atMs in [{silence_at}, {silence_at + 10000}]")
-    return result("pass", f"noAudio atMs={hits[0].get('atMs')}")
+    gate.check(
+        "noaudio-in-window",
+        bool(hits),
+        f"noAudio atMs={hits[0].get('atMs')}" if hits else f"no noAudio ann with atMs in [{silence_at}, {silence_at + limit}]",
+    )
 
 
-def grade_p5(rows: list[dict], reference: Path | None) -> dict[str, str]:
+def grade_p5(gate: Gate, rows: list[dict], reference: Path | None) -> None:
     problems = schema_problems(rows)
-    evidence = ["schema ok" if not problems else "; ".join(problems)]
-    ok = not problems
-    if reference is not None:
-        ref_rows, _note = load_rows(reference if reference.is_dir() else reference.parent)
-        if reference.name == "events.jsonl":
-            ref_rows, _note = load_rows(reference.parent)
-        left = shape_keys(rows)
-        right = shape_keys(ref_rows)
-        if left.keys() != right.keys() or any(left[key] != right[key] for key in left):
-            ok = False
-            evidence.append(f"shape left={ {k: sorted(v) for k, v in left.items()} } right={ {k: sorted(v) for k, v in right.items()} }")
-        else:
-            evidence.append("JSONL key shape matches the reference session")
-    else:
-        evidence.append("no shape reference; schema only")
-    return result("pass" if ok else "fail", "; ".join(evidence))
+    gate.check("schema", not problems, "schema ok" if not problems else "; ".join(problems))
+    if reference is None:
+        gate.check("shape-reference", False, "no Grok shape reference; schema alone does not prove P5")
+        return
+    ref_dir = reference.parent if reference.name == "events.jsonl" else reference
+    ref_rows, _note = load_rows(ref_dir)
+    left = shape_keys(rows)
+    right = shape_keys(ref_rows)
+    same = left.keys() == right.keys() and all(left[key] == right[key] for key in left)
+    gate.check(
+        "shape",
+        same,
+        "JSONL key shape matches the reference session" if same
+        else f"shape left={ {k: sorted(v) for k, v in left.items()} } right={ {k: sorted(v) for k, v in right.items()} }",
+    )
 
 
-def grade_p6(rows: list[dict]) -> dict[str, str]:
+def grade_p6(gate: Gate, rows: list[dict]) -> None:
     segs = rows_of(rows, "seg")
     tracks = {row.get("track") for row in segs}
     speaker = any(row.get("track") == "system" and row.get("speaker") for row in segs)
-    evidence = f"tracks={sorted(t for t in tracks if t)} systemSpeaker={speaker}"
-    ok = "system" in tracks and "microphone" in tracks and speaker
-    return result("pass" if ok else "fail", evidence)
+    gate.check("system-seg", "system" in tracks, f"tracks={sorted(t for t in tracks if t)}")
+    gate.check("microphone-seg", "microphone" in tracks, f"tracks={sorted(t for t in tracks if t)}")
+    gate.check("system-speaker", speaker, f"systemSpeaker={speaker}")
+
+
+def grade_gate(
+    name: str,
+    session: Path,
+    rows: list[dict],
+    *,
+    ref: Path | None = None,
+    expect_recovery: bool = False,
+    revoke_at: int | None = None,
+    silence_at: int = 0,
+    shape_reference: Path | None = None,
+    no_provenance: bool = False,
+) -> dict[str, object]:
+    gate = Gate()
+    if name == "P1":
+        grade_p1(gate, session, rows, ref, expect_recovery)
+    elif name == "P2":
+        grade_p2(gate, rows, revoke_at)
+    elif name == "P3":
+        grade_p3(gate, rows)
+    elif name == "P4":
+        grade_p4(gate, rows, silence_at)
+    elif name == "P5":
+        grade_p5(gate, rows, shape_reference)
+    elif name == "P6":
+        grade_p6(gate, rows)
+    provenance_checks(gate, session, rows, name, no_provenance)
+    return gate.result()
 
 
 def main() -> int:
@@ -359,6 +431,7 @@ def main() -> int:
     parser.add_argument("--silence-at-ms", type=int, default=0)
     parser.add_argument("--shape-reference", type=Path)
     parser.add_argument("--expect-recovery", action="store_true")
+    parser.add_argument("--no-provenance", action="store_true", help="unit tests only; forces unproven")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
     if args.pick_revoke_session is not None:
@@ -375,21 +448,23 @@ def main() -> int:
     report: dict[str, object] = {"session": str(session)}
     if note:
         report["notes"] = note
-    graders = {
-        "P1": lambda: grade_p1(session, rows, args.ref, args.expect_recovery),
-        "P2": lambda: grade_p2(rows, revoke_at),
-        "P3": lambda: grade_p3(rows),
-        "P4": lambda: grade_p4(rows, args.silence_at_ms),
-        "P5": lambda: grade_p5(rows, args.shape_reference),
-        "P6": lambda: grade_p6(rows),
-    }
     exit_code = 0
-    for gate in GATES:
-        if gate not in requested:
-            report[gate] = result("n/a", "not requested")
+    for name in GATES:
+        if name not in requested:
+            report[name] = not_requested()
             continue
-        graded = graders[gate]()
-        report[gate] = graded
+        graded = grade_gate(
+            name,
+            session,
+            rows,
+            ref=args.ref,
+            expect_recovery=args.expect_recovery,
+            revoke_at=revoke_at,
+            silence_at=args.silence_at_ms,
+            shape_reference=args.shape_reference,
+            no_provenance=args.no_provenance,
+        )
+        report[name] = graded
         if graded["result"] != "pass":
             exit_code = 1
     out = args.out or (session / "grade.json")
