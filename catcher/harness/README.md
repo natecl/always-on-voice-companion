@@ -19,6 +19,8 @@ export XAI_API_KEY=...          # P1, P3, P6
 
 Each gate script writes `harness_run.json` (host, macOS, codesign CDHash, the app's `CatcherGitSHA`) before launch. `grade.py` reports `pass`, `fail`, `invalid`, `unproven`, or `n/a` per gate; only `pass` counts, and off a Mac the best result is `unproven`. `verdict` re-grades all six roots and writes `v0-verdict.json`; it is `GREEN` only for six passes on one SHA and one CDHash, and it is the only v0 claim. Evidence tiers are in [`docs/qa/v0-grading.md`](../../docs/qa/v0-grading.md#evidence-tiers). `tests/` is Tier L grader regression (`python3 -m unittest discover -s catcher/harness/tests`), not gate evidence.
 
+Last hardened GREEN: `b14e31a` (`b14e31a99a431e5cac6a49669f5c1955de38a1d1`), CDHash `57250034b55e54e3ad6798983edf6e62c1553653`, board `/tmp/catcher-auto/b14e31a-20260923-055848/board.json`. Preflight and P1–P6 pass under this verifier (soft-pass killed). `MicrophoneGain` on the mic path; floor 0.05 unchanged; P6 p50 0.2039, micGainMax 16. Rows: [`docs/FEATURE_MAP.md`](../../docs/FEATURE_MAP.md).
+
 `grade.json` is written into the session directory the app created under the path you passed (`<path>/<uuid>/grade.json`).
 
 `fixtures/known-60s.wav` is a 60 s 16 kHz mono PCM16 timing carrier so `afplay` has a file. It is not a recording of `known-60s.ref.txt`. Replace the wav with a clear reading of the reference before treating P1 WER as a measurement. Until then P1 is expected to fail WER, and that failure belongs to the fixture, not to a claim that the build is green.

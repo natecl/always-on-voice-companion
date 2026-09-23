@@ -4,6 +4,8 @@ Catcher v0 is system audio + mic → transcription → a verified transcript on 
 
 v0 stays red until `v0-verdict.json` is `GREEN` for the SHA being claimed.
 
+**Last hardened GREEN:** `b14e31a` (`b14e31a99a431e5cac6a49669f5c1955de38a1d1`) on 2026-09-23. CDHash `57250034b55e54e3ad6798983edf6e62c1553653`. Board `/tmp/catcher-auto/b14e31a-20260923-055848/board.json` on the grading Mac (not in git). Preflight and P1–P6 pass under the hardened verifier (soft-pass killed). This supersedes `95837a8` / CDHash `62450598` / board `/tmp/catcher-auto/95837a8-20260923-003139/board.json`. `MicrophoneGain` is on the mic path; the 0.05 `noAudio` floor is unchanged; held speech clears median ≥ 0.1000 (P6 p50 0.2039, micGainMax 16). A later commit stays ungraded until the next Mac run. Reconcile and merge stay with Cap/Nathan. Rows: [FEATURE_MAP.md](../FEATURE_MAP.md). Narrative: [09-v0-shipped.md](../knowledge/09-v0-shipped.md).
+
 ## Evidence tiers
 
 | Tier | What | Counts for |

@@ -1,7 +1,11 @@
 # Product Vision: Always-On Voice Companion
 
-**Status:** vision spec — the north star. The v0 build brief (with pass/fail) is a separate,
-smaller document. Nothing here is a build order until the v0 brief is approved.
+**Status:** vision spec — the north star. The v0 transcript foundation has hardened GREEN
+evidence at `b14e31a` (`b14e31a99a431e5cac6a49669f5c1955de38a1d1`), CDHash
+`57250034b55e54e3ad6798983edf6e62c1553653`, board
+`/tmp/catcher-auto/b14e31a-20260923-055848/board.json`
+([FEATURE_MAP.md](FEATURE_MAP.md), [09-v0-shipped.md](knowledge/09-v0-shipped.md)).
+Notes, Jev, and the judgment brief are not in that grade. Reconcile and merge stay with Cap/Nathan.
 
 ## One-liner
 
@@ -59,8 +63,16 @@ the entire bet.
 
 ## Phases
 
-- **v0 — the catcher (embarrassingly small).** Per-call record/upload → transcript → Jev
-  judges every utterance → 2-second judgment brief. Tests: is the judgment brief the heat?
+- **v0 transcript foundation — hardened GREEN evidence.** System audio + mic → verified
+  transcript on disk; loud on blocked, degraded/gap/resumed, and noAudio. Preflight and
+  P1–P6 pass at `b14e31a` under the hardened verifier (soft-pass killed). CDHash
+  `57250034b55e54e3ad6798983edf6e62c1553653`. Board
+  `/tmp/catcher-auto/b14e31a-20260923-055848/board.json`. `MicrophoneGain` on the mic path
+  (floor 0.05 unchanged); held speech median clears ≥ 0.1000 (P6 p50 0.2039, micGainMax 16).
+  P4 passing does not prove system audio was captured.
+  See [09-v0-shipped.md](knowledge/09-v0-shipped.md). This is the grade, not a merge.
+- **v0 catcher — next.** Jev judges every utterance → 2-second judgment brief.
+  The test is unchanged: is the brief the heat?
 - **v1 — the participant.** Live in-conversation: turn to it mid-call, ask with full context.
 - **v2 — the buddy.** True always-on: ambient listening, proactive interjection gated by
   judgment confidence.

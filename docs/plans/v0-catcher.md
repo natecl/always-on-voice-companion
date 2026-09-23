@@ -205,3 +205,5 @@ Notes, Jev, interjection, context graph, iOS/Windows, AssemblyAI implementation 
 ## 8. Done-check for this plan's implementation climb
 
 The implementation is done when `run.sh verdict` on a QA Mac writes `v0-verdict.json` with `GREEN` (P1–P6 all `pass` on one SHA and CDHash), and `docs/qa/v0-grading.md` lets QA reproduce it without the builder present. Until QA produces that file, v0 is red.
+
+Hardened GREEN evidence (Cap-reported, not in git): `b14e31a` (`b14e31a99a431e5cac6a49669f5c1955de38a1d1`), CDHash `57250034b55e54e3ad6798983edf6e62c1553653`, board `/tmp/catcher-auto/b14e31a-20260923-055848/board.json`. Preflight and P1–P6 pass under the hardened verifier (soft-pass killed). `MicrophoneGain` on the mic path (floor 0.05 unchanged); P6 p50 0.2039, micGainMax 16. This supersedes `95837a8`. Reconcile and merge stay with Cap/Nathan.

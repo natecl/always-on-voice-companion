@@ -2,6 +2,8 @@
 
 A failed or empty take writes a checkpoint for each pipeline stage, then two `TRACE` lines naming the first failure and a probable fix. These files do not grade P1–P6. `grade.py` never reads them. v0 stays red until a Mac `v0-verdict.json` is `GREEN` for the SHA (see [`v0-grading.md`](v0-grading.md)).
 
+**Last hardened GREEN:** `b14e31a` (`b14e31a99a431e5cac6a49669f5c1955de38a1d1`) on 2026-09-23. CDHash `57250034b55e54e3ad6798983edf6e62c1553653`. Board `/tmp/catcher-auto/b14e31a-20260923-055848/board.json` on the grading Mac (not in git). Preflight and P1–P6 pass under the hardened verifier (soft-pass killed). `MicrophoneGain` on the mic path (floor 0.05 unchanged); P6 p50 0.2039, micGainMax 16. See [v0 grading](v0-grading.md).
+
 ## Where the lines go
 
 | File | When |
