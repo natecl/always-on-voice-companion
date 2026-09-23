@@ -57,4 +57,9 @@ public enum SessionPaths {
     public static func pcmFile(track: String, in directory: URL) -> URL {
         directory.appendingPathComponent("\(track).pcm")
     }
+
+    /// Harness timing sidecar. Not part of the v0 JSONL schema.
+    public static func latencyFile(in directory: URL) -> URL {
+        directory.appendingPathComponent("latency.jsonl")
+    }
 }

@@ -76,6 +76,60 @@ import TranscriptionEngine
     let pcm = try Data(contentsOf: SessionPaths.pcmFile(track: "system", in: directory))
     #expect(pcm.count == 3_200)
     #expect(await pipeline.isRunning == false)
+    #expect(!FileManager.default.fileExists(atPath: SessionPaths.latencyFile(in: directory).path))
+}
+
+@Test func harnessLatencySidecarStaysOutOfTheEventSchema() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("catcher-latency-\(UUID().uuidString)", isDirectory: true)
+    let capture = FakeCapture()
+    let started = HostClock.now()
+    let pipeline = Pipeline(
+        sessionRoot: root,
+        makeCapture: { capture },
+        makeEngine: { track in StubEngine(track: track, framesPerFinal: 1) },
+        launchProbe: { .granted },
+        recheckProbe: { .granted },
+        writeLatency: true,
+        engineLabel: "stub"
+    )
+    let listener = Task {
+        for await event in pipeline.ui {
+            if Task.isCancelled { break }
+            if case .transcript(let transcript) = event {
+                await pipeline.noteShown(
+                    track: transcript.track,
+                    seq: transcript.seq,
+                    atMs: SessionClockAnchor.milliseconds()
+                )
+            }
+        }
+    }
+    await pipeline.start(request: StartRequest(
+        source: .harnessAutoRecord,
+        inputHostTime: started,
+        processStartHostTime: started
+    ))
+    let host = HostClock.now()
+    capture.emit(PCMFrame(track: .system, data: Data(repeating: 1, count: 3_200), hostTime: host))
+    capture.emit(PCMFrame(track: .microphone, data: Data(repeating: 1, count: 3_200), hostTime: host))
+    let directory = try #require(await pipeline.sessionDirectory)
+    let latencyURL = SessionPaths.latencyFile(in: directory)
+    try await waitUntil {
+        let text = (try? String(contentsOf: latencyURL, encoding: .utf8)) ?? ""
+        return text.contains("\"name\":\"live\"") && text.contains("\"t\":\"ui\"")
+    }
+    listener.cancel()
+    await pipeline.stop(source: .recordButton)
+    await listener.value
+    let latency = try String(contentsOf: latencyURL, encoding: .utf8)
+    #expect(latency.contains("\"source\":\"harnessAutoRecord\""))
+    #expect(latency.contains("\"name\":\"stop-requested\""))
+    #expect(latency.contains("\"name\":\"ended\""))
+    let events = try String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)
+    #expect(!events.contains("\"t\":\"tx\""))
+    #expect(!events.contains("\"t\":\"clock\""))
+    #expect(!events.contains("\"t\":\"ui\""))
+    try expectEventShapeUnchanged(events)
 }
 
 @Test func stopWritesEndWhenEngineCloseNeverReturns() async throws {
