@@ -25,11 +25,11 @@ let package = Package(
         ),
         .target(
             name: "TranscriptionEngine",
-            dependencies: ["AudioCapture"]
+            dependencies: ["AudioCapture", "Metering"]
         ),
         .target(
             name: "GrokEngine",
-            dependencies: ["TranscriptionEngine", "AudioCapture", "Diagnostics"]
+            dependencies: ["TranscriptionEngine", "AudioCapture", "Diagnostics", "Metering"]
         ),
         .target(
             name: "Verifier",
@@ -59,7 +59,7 @@ let package = Package(
         ),
         .testTarget(
             name: "GrokEngineTests",
-            dependencies: ["GrokEngine"]
+            dependencies: ["GrokEngine", "Metering"]
         ),
         .testTarget(
             name: "VerifierTests",

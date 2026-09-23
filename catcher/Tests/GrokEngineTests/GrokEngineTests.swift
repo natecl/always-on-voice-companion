@@ -1,6 +1,7 @@
 import AudioCapture
 import Foundation
 import GrokEngine
+import Metering
 import Testing
 import TranscriptionEngine
 
@@ -824,6 +825,106 @@ func handshakeTimeoutClosesParkedReceiveAndEmitsGap(profile: TransportProfile) a
     #expect(String(describing: type(of: engine)).contains("GrokEngine"))
 }
 
+@Test(arguments: TransportProfile.allCases)
+func reconnectMetersWireWithoutShrinkingAndFreezesSocketTimeWhileDead(profile: TransportProfile) async throws {
+    let supply = SocketSupply()
+    let clock = ManualClock()
+    let box = EngineBox()
+    let frozen = FrozenFlag()
+    supply.configure = { index, socket in
+        profile.configure(index, socket)
+        if index == profile.resumeIndex { socket.push(created) }
+    }
+    let engine = GrokEngine(track: .system, configuration: GrokEngineConfiguration(
+        apiKey: "test-key",
+        url: GrokWebSocket.url(),
+        makeTransport: { supply.make() },
+        sleep: { duration in
+            let ms = Int((seconds(duration) * 1_000).rounded())
+            // Backoff is >= 1s and the socket is dead. The post-resume wait is
+            // 50ms on the new socket, which is supposed to keep accruing.
+            if ms >= 1_000 {
+                let before = await box.engine?.meterCounters().socketOpenMs ?? -1
+                clock.advance(ms: ms)
+                let after = await box.engine?.meterCounters().socketOpenMs ?? -2
+                frozen.note(before: before, after: after)
+            } else {
+                clock.advance(ms: ms)
+            }
+        },
+        nowMs: { clock.ms },
+        handshakeTimeout: profile.handshakeTimeout,
+        inboundStall: .seconds(30)
+    ))
+    box.engine = engine
+    let connecting = Task { try await engine.connect(track: .system) }
+    let first = try #require(await supply.awaitSocket(0))
+    first.push(created)
+    try await connecting.value
+    clock.advance(ms: 400)
+    let opened = await engine.meterCounters()
+    #expect(opened.socketOpenMs >= 400)
+    #expect(opened.socketsOpened == 1)
+    try await engine.send(PCMFrame(track: .system, data: Data(count: 3_200), hostTime: 0))
+    try await waitUntil { first.binaryCount == 1 }
+    let sent = await engine.meterCounters().wireBytes
+    #expect(sent == 3_200)
+
+    var iterator = engine.events.makeAsyncIterator()
+    while let event = await iterator.next() {
+        if case .state(.streaming) = event { break }
+    }
+    first.push(.closed(code: 1006, reason: "drop"))
+    var sawDegraded = false
+    var sawStreaming = false
+    for _ in 0..<24 {
+        guard let event = await iterator.next() else { break }
+        if case .state(.degraded) = event { sawDegraded = true }
+        if case .state(.streaming) = event, sawDegraded {
+            sawStreaming = true
+            break
+        }
+    }
+    #expect(sawDegraded)
+    #expect(sawStreaming)
+    #expect(frozen.ok)
+    let mid = await engine.meterCounters()
+    let snap = await engine.snapshot()
+    #expect(mid.replayBytes > 0)
+    #expect(mid.socketsOpened == 2)
+    #expect(mid.wireBytes >= sent)
+    #expect(mid.wireBytes >= snap.bytesSent)
+    await engine.finish()
+    let closed = await engine.meterCounters().socketOpenMs
+    clock.advance(ms: 5_000)
+    let done = await engine.meterCounters()
+    #expect(done.socketOpenMs == closed)
+    #expect(done.wireBytes >= mid.wireBytes)
+    for index in 0..<supply.count {
+        supply.socket(index)?.release()
+    }
+}
+
+@Test func serverAudioCursorTracksTheTranscriptDuration() async throws {
+    let transport = ScriptedTransport()
+    let engine = GrokEngine(track: .system, configuration: testConfig(transport))
+    let connecting = Task { try await engine.connect(track: .system) }
+    transport.push(created)
+    try await connecting.value
+    transport.push(.text(partial(text: "hi", start: 0, duration: 1.25, isFinal: false, speechFinal: false)))
+    var seen = false
+    for _ in 0..<25 {
+        if await engine.meterCounters().serverAudioMs >= 1_250 {
+            seen = true
+            break
+        }
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(seen)
+    await engine.finish()
+    transport.release()
+}
+
 private func stalledEngine(
     supply: SocketSupply,
     clock: ManualClock,
@@ -873,6 +974,29 @@ private final class ProbeFlag: @unchecked Sendable {
     var value = false
 }
 
+private final class EngineBox: @unchecked Sendable {
+    var engine: GrokEngine?
+}
+
+private final class FrozenFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var failed = false
+    private var slept = 0
+
+    func note(before: Int, after: Int) {
+        lock.lock()
+        if before != after { failed = true }
+        slept += 1
+        lock.unlock()
+    }
+
+    var ok: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return slept > 0 && !failed
+    }
+}
+
 final class ManualClock: @unchecked Sendable {
     var ms = 0
     func advance(ms: Int) { self.ms += ms }
@@ -894,6 +1018,14 @@ final class SocketSupply: @unchecked Sendable {
         defer { lock.unlock() }
         guard sockets.indices.contains(index) else { return nil }
         return sockets[index]
+    }
+
+    func awaitSocket(_ index: Int) async -> ScriptedTransport? {
+        for _ in 0..<100 {
+            if let socket = socket(index) { return socket }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return nil
     }
 
     func make() -> ScriptedTransport {

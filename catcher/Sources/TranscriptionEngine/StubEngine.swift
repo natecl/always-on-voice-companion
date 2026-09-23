@@ -1,10 +1,11 @@
 import AudioCapture
 import Foundation
+import Metering
 
 /// Deterministic engine for P5 and unit tests. Emits a partial on every frame
 /// and a canned final every `framesPerFinal` frames. System-track finals carry
 /// speaker `S1`; the mic track does not pretend to diarize "them".
-public actor StubEngine: TranscriptionEngine {
+public actor StubEngine: TranscriptionEngine, MeteredEngine {
     public nonisolated let events: AsyncStream<EngineEvent>
     private let continuation: AsyncStream<EngineEvent>.Continuation
     private var track: AudioTrack
@@ -14,6 +15,9 @@ public actor StubEngine: TranscriptionEngine {
     private var finals = 0
     private let framesPerFinal: Int
     private var finished = false
+    private var meterWireBytes = 0
+    private var meterSocketAttempts = 0
+    private var meterSocketsOpened = 0
 
     public init(track: AudioTrack, framesPerFinal: Int = 4) {
         self.track = track
@@ -23,8 +27,18 @@ public actor StubEngine: TranscriptionEngine {
         self.continuation = pair.continuation
     }
 
+    public func meterCounters() -> MeterCounters {
+        MeterCounters(
+            wireBytes: meterWireBytes,
+            socketAttempts: meterSocketAttempts,
+            socketsOpened: meterSocketsOpened
+        )
+    }
+
     public func connect(track: AudioTrack) async throws {
         self.track = track
+        meterSocketAttempts = 1
+        meterSocketsOpened = 1
         continuation.yield(.state(.connecting))
         continuation.yield(.state(.ready))
         continuation.yield(.state(.streaming))
@@ -33,6 +47,7 @@ public actor StubEngine: TranscriptionEngine {
     public func send(_ frame: PCMFrame) async throws {
         if finished { return }
         frames += 1
+        meterWireBytes += frame.data.count
         let frameSamples = max(frame.sampleCount, frame.data.count / AudioFormat.bytesPerSample)
         let startSamples = samples
         samples += frameSamples

@@ -1,6 +1,7 @@
 import AudioCapture
 import Diagnostics
 import Foundation
+import Metering
 import Synchronization
 import TranscriptionEngine
 
@@ -62,7 +63,7 @@ public enum GrokEngineBootstrap {
 
 /// Streaming STT against `wss://api.x.ai/v1/stt`. No audio leaves until
 /// `transcript.created`. Word times are re-based onto session audio time.
-public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
+public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging, MeteredEngine {
     public nonisolated let events: AsyncStream<EngineEvent>
     private let continuation: AsyncStream<EngineEvent>.Continuation
     private let configuration: GrokEngineConfiguration
@@ -70,6 +71,17 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
     private var transport: (any GrokTransport)?
     private var pending = Data()
     private var bytesSent = 0
+    /// Bytes accepted by `send`, including replays. Never decremented.
+    /// `bytesSent` is an audio cursor and shrinks in `reclaimReplay`.
+    private var wireBytes = 0
+    private var replayedBytes = 0
+    private var tailBytes = 0
+    private var socketAttempts = 0
+    private var socketsOpened = 0
+    private var closedSocketOpenMs = 0
+    private var socketOpenStartedMs: Int?
+    private var closedServerAudioMs = 0
+    private var socketServerHighMs = 0
     private var socketOriginMs = 0
     private var ready = false
     private var hasBeenReady = false
@@ -148,6 +160,22 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
         )
     }
 
+    public func meterCounters() -> MeterCounters {
+        var openMs = closedSocketOpenMs
+        if let started = socketOpenStartedMs {
+            openMs += max(0, currentMs() - started)
+        }
+        return MeterCounters(
+            wireBytes: wireBytes,
+            replayBytes: replayedBytes,
+            tailBytes: tailBytes,
+            socketAttempts: socketAttempts,
+            socketsOpened: socketsOpened,
+            socketOpenMs: openMs,
+            serverAudioMs: closedServerAudioMs + socketServerHighMs
+        )
+    }
+
     public func connect(track: AudioTrack) async throws {
         self.track = track
         continuation.yield(.state(.connecting))
@@ -159,6 +187,7 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
         }
         let transport = configuration.makeTransport()
         self.transport = transport
+        socketAttempts += 1
         handshakeStarted = ContinuousClock.now
         do {
             try await transport.connect(url: configuration.url, authorizationBearer: configuration.apiKey)
@@ -186,6 +215,7 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
     public func finish() async {
         guard !finishRequested else { return }
         finishRequested = true
+        endOpenInterval()
         watchdog?.cancel()
         watchdog = nil
         await flushTail()
@@ -262,6 +292,7 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
             // attempt that is about to yield `gap`. Mark the socket lost so the
             // loop opens a fresh one instead of announcing streaming.
             if recovery != nil {
+                endOpenInterval()
                 ready = false
                 catchUpLost = true
                 return
@@ -283,6 +314,7 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
     /// returns immediately, which is why that handshake test still passed.
     private func socketDied(code: Int, reason: String) {
         guard hasBeenReady, !finishRequested, recovery == nil else { return }
+        endOpenInterval()
         ready = false
         socketGeneration += 1
         pumpOwner = nil
@@ -438,6 +470,7 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
     /// engine already uses for `transcript.created`. A `pf` drop can park
     /// `connect` inside `URLSession`; the loop must not wait for that call.
     private func open(_ transport: any GrokTransport) async throws {
+        socketAttempts += 1
         let url = configuration.url
         let key = configuration.apiKey
         let timeout = configuration.handshakeTimeout
@@ -480,6 +513,9 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
     private func apply(_ message: GrokServerMessage) {
         switch message {
         case .created:
+            endOpenInterval()
+            socketsOpened += 1
+            socketOpenStartedMs = currentMs()
             let audioMs = PCMClock.milliseconds(bytesSent: bytesSent)
             if hasBeenReady {
                 // Wall time moved during the stall; the byte cursor did not.
@@ -497,9 +533,11 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
             utteranceHadChunk = false
             socketEmittedFinal = false
         case .partial(let transcript):
+            noteServerAudio(transcript)
             replay.removeAll(keepingCapacity: true)
             commit(transcript, fromDone: false)
         case .done(let transcript):
+            noteServerAudio(transcript)
             replay.removeAll(keepingCapacity: true)
             commit(transcript, fromDone: true)
         case .error(let message):
@@ -704,6 +742,7 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
                 inFlight.removeAll(keepingCapacity: false)
                 inFlightGeneration = nil
                 bytesSent += chunk.count
+                wireBytes += chunk.count
                 replay.append(chunk)
                 Self.keepTail(&replay, Self.replayCap)
             } catch {
@@ -739,6 +778,8 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
             do {
                 try await transport.sendBinary(tail)
                 bytesSent += tail.count
+                wireBytes += tail.count
+                tailBytes += tail.count
             } catch {
                 sendErrors += 1
                 if lastError == nil { lastError = ErrorDetail.sentence(error) }
@@ -751,6 +792,24 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
             sendErrors += 1
             if lastError == nil { lastError = ErrorDetail.sentence(error) }
             continuation.yield(.error(.socket(String(describing: error))))
+        }
+    }
+
+    /// Close the open-socket interval. Idempotent: a second call in the same
+    /// death (the closed handler and `socketDied`) does not add time twice.
+    private func endOpenInterval() {
+        if let started = socketOpenStartedMs {
+            closedSocketOpenMs += max(0, currentMs() - started)
+            socketOpenStartedMs = nil
+        }
+        closedServerAudioMs += socketServerHighMs
+        socketServerHighMs = 0
+    }
+
+    private func noteServerAudio(_ transcript: GrokTranscript) {
+        let ms = Int(((transcript.start + transcript.duration) * 1_000).rounded())
+        if ms > socketServerHighMs {
+            socketServerHighMs = ms
         }
     }
 
@@ -781,6 +840,7 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
         let replayed = replay
         replay = Data()
         bytesSent = max(0, bytesSent - replayed.count)
+        replayedBytes += replayed.count
         Self.prepend(replayed, to: &pending)
     }
 
