@@ -14,6 +14,8 @@ Pincus's own back-of-the-box line, plus the interjection.
 
 **Jev** (TypeSafe AI) — a decision model, not a text generator. Per-utterance judgment (commitment? deadline? should I speak now?) at $0.042/M input tokens, 70–500ms latency — the Jevons-paradox unlock that makes always-on judgment squanderable at consumer price. The interjection policy is gated by Jev's calibrated confidence; the spike validated it on a real 521-utterance transcript (PASS: 100% recall on commitments/deadlines). See [03-jev.md](03-jev.md).
 
+The v0 transcript foundation is shipped ([09-v0-shipped.md](09-v0-shipped.md)). Jev is not yet in the pipeline; the spike result stands on its own.
+
 ## What it is NOT
 
 - Not a meeting notetaker (Granola and Wispr Flow already won that; it's our wedge, not our company).

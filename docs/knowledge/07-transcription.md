@@ -1,6 +1,6 @@
 # Transcription engine — 2026-09-22
 
-**Decision (Nathan's pick): Grok Voice Transcribe 2.0 for v0.** Chosen over the AssemblyAI-first recommendation on the strength of free diarization. Still to be validated by a bake-off harness on real audio before it's the locked default.
+**Decision (Nathan's pick): Grok Voice Transcribe 2.0 is the v0 engine and passed P1–P6 on the Mac** ([09-v0-shipped.md](09-v0-shipped.md), run `95837a8`). P4 passing does not prove system audio was captured; that proof is P1. Chosen over the AssemblyAI-first recommendation on the strength of free diarization. It is not the locked default until the bake-off.
 
 ## Why Grok 2.0
 - Released Sep 18, 2026 — four days old at pick time.
@@ -9,7 +9,7 @@
 - **Caveat:** every accuracy number above is vendor-reported, not independently reproduced. The 4-day age is the risk.
 
 ## The bake-off (before it locks)
-A transcription harness (same pattern as the Jev spike) runs Grok 2.0 against **AssemblyAI Universal-3.5 Pro** on our own real audio and measures WER + diarization quality + cost. AssemblyAI is the challenger because it has the strongest independent evidence: 8.14% WER / 307ms P50 measured by Hamming.ai across 4M+ production calls, and the most honestly reported diarization (cpWER). Grok earns the default only when the verifier says it wins.
+A transcription harness (same pattern as the Jev spike) runs Grok 2.0 against **AssemblyAI Universal-3.5 Pro** on our own real audio and measures WER + diarization quality + cost. AssemblyAI is the challenger because it has the strongest independent evidence: 8.14% WER / 307ms P50 measured by Hamming.ai across 4M+ production calls, and the most honestly reported diarization (cpWER). Grok earns the default only when the verifier says it wins. Harness-mode `system.pcm` / `microphone.pcm` is the audio the bake-off will replay. The bake-off itself is not built.
 
 ## The lab-dependency read
 Grok is xAI — the same dependency class as Meta's Muse Voice Transcribe. The correction stands: **the engine is a commodity input, not the moat.** Granola already rents transcription from OpenAI/Anthropic. The moat is the context graph + the Jev judgment layer; no lab owns those. So the architecture keeps the engine behind a swappable interface (`TranscriptionEngine`: audio frames in, transcript events out) and lets the labs subsidize accuracy. Great supplier, bad landlord.
@@ -26,8 +26,8 @@ Grok is xAI — the same dependency class as Meta's Muse Voice Transcribe. The c
 - **Don't depend on:** Meta Muse Voice Transcribe (3.1% WER claim is lab marketing, tied to Meta's agent push).
 
 ## v0 wiring
-Grok streaming: `wss://api.x.ai/v1/stt?model=grok-voice-transcribe-2.0&sample_rate=16000&encoding=pcm&interim_results=true` — raw PCM16 binary frames, `endpointing=800` (xAI's 10 ms default chops sentences). Full wire spec in [08-capture-layer.md](08-capture-layer.md).
+Grok streaming: `wss://api.x.ai/v1/stt?model=grok-voice-transcribe-2.0&sample_rate=16000&encoding=pcm&interim_results=true` — raw PCM16 binary frames, `endpointing=800` (xAI's 10 ms default chops sentences). `GrokEngineTests` asserts `endpointing=800`. Reconnect is the [reconnect path](08-capture-layer.md#reconnect-path-shipped) in [08-capture-layer.md](08-capture-layer.md).
 
-Full research: `~/workspace/research_notes/transcription-model-research-20260922-0643/report.md`
+Full research (local, not in repo): `~/workspace/research_notes/transcription-model-research-20260922-0643/report.md`
 
 Related: [08-capture-layer.md](08-capture-layer.md) · [06-strategic-reads.md](06-strategic-reads.md) · [03-jev.md](03-jev.md)

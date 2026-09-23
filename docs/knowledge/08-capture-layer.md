@@ -1,16 +1,21 @@
-# Capture layer — 2026-09-22
+# Capture layer — 2026-09-22, updated at `95837a8`, shipped v0
 
-**Verdict:** solved engineering, not open research. ScreenCaptureKit delivers 16 kHz mono PCM directly — exactly what Grok's streaming endpoint consumes. The provider is the easy part; the OS audio plumbing is the actual build.
+**Verdict:** solved engineering, not open research. ScreenCaptureKit delivers 48 kHz stereo float; the app downmixes and resamples that to 16 kHz mono PCM16 (`SampleBufferPCM`, `PCMFrame`). The provider is the easy part; the OS audio plumbing is the actual build.
 
 ## The v0 pipeline
 ```
-ScreenCaptureKit (system audio + mic, two tracks)
+ScreenCaptureKit (system audio + mic, two tracks; 48 kHz stereo float)
   → CMSampleBuffer float32, often non-interleaved, at the configured rate
-  → convert to PCM16 @ 16 kHz mono
+  → convert to PCM16 @ 16 kHz mono (SampleBufferPCM, PCMFrame)
+  → one engine stream per track
   → WebSocket binary frames (~100 ms chunks)
   → Grok Voice Transcribe 2.0 streaming
   → transcript.partial / transcript.done events
   → verified transcript on disk
+
+Verifier taps frames, engine state, events, and the store, and writes
+annotations into the same JSONL. It drives UI status and does not sit
+in the data path.
 ```
 
 ## ScreenCaptureKit config
@@ -29,11 +34,37 @@ config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 - **Audio-only is undocumented but works** — validated across macOS 14/15/26 in shipping apps. The video pipeline still runs internally; the 2×2 @ 1 fps stub keeps it cheap. Console noise ("stream output NOT found. Dropping frame") is cosmetic.
 - macOS 13+ for audio capture; 15+ for in-stream mic.
 
+## Two tracks, shipped
+
+`.audio` is system ("them") and `.microphone` is the mic ("me"). `transcript.txt` prefixes each line `[them]` or `[me]`. Each `seg` row has a `track` field, `system` or `microphone`.
+
+## Reconnect path (shipped)
+
+1. A socket stall marks the session `degraded`.
+2. The next socket opens without waiting for a parked `URLSession` close. Backoff is 1, 2, 4, 8, 16 s, then capped at 30 s.
+3. The new socket's origin carries `gap{fromMs,toMs}`.
+4. `resumed` is sent only after a post-resume final is queued, or the catch-up budget ends.
+5. Word times are rebased by `originMs`.
+
+P3 on the Mac run at `95837a8` grades this path. Pass conditions are the gate table in [v0 grading](../qa/v0-grading.md#gates).
+
+Two bugs blocked P3 until they were fixed:
+
+- A pf-dropped `URLSessionWebSocketTask` never finishes `cancel()`, so reconnect must not wait for it.
+- Receive must be armed before replaying buffered audio, or the post-resume final is lost.
+
+## noAudio detection (shipped)
+
+`noAudio` uses AC RMS with DC removed. The floor is `rmsEpsilon = 0.05` (about −26 dBFS), the speech hold is 300 ms, and the limit is 10 s. A resting mic (DC offset, room tone) counts as silence. The annotation fires even when zero frames arrived.
+
+A resting mic's DC offset and room tone kept the plain-RMS silence clock resetting, so `noAudio` never landed inside 10 s. AC RMS is what makes the 10 s clock run on that rest energy.
+
+P4 passing does not prove system audio was captured. P1's `system.pcm` peak/RMS and system `seg` text do. Pass conditions: [v0 grading](../qa/v0-grading.md#gates).
+
 ## Permission UX
 - **Screen capture is purely TCC-gated — no entitlement, no Apple approval.** `NSScreenCaptureUsageDescription` in Info.plist (missing = app terminated).
 - **Microphone is not, once the hardened runtime is on:** a hardened binary needs `com.apple.security.device.audio-input` or TCC opens no microphone case — no Allow, no row in the Microphone pane, and `AVCaptureDevice.authorizationStatus` is not a grant. Catcher.app is hardened; the entitlement lives in `Catcher.entitlements`.
-- User grants once: System Settings → Privacy & Security → Screen & System Audio Recording, and Microphone.
-- Dev gotcha: TCC bills the *responsible process*. A binary exec'd from a shell inherits Terminal/Cursor/Xcode as that process, so the grant and the prompt belong to them, not the app. Launch through LaunchServices (`open -n`, Finder, `NSWorkspace.openApplication`). `responsibility_get_pid_responsible_for_pid(getpid()) == getpid()` is the check.
+- The LaunchServices grant procedure is setup step 3 in [v0 grading](../qa/v0-grading.md#one-time-setup).
 - Verifier hook: attempt `startCapture()` at launch — no grant → loud onboarding block, never a fake "recording" state.
 
 ## Grok streaming wire format
@@ -47,18 +78,22 @@ config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 1. Extract SCK audio with `CMSampleBufferCopyPCMDataIntoAudioBufferList` into a list sized from the buffer's own format (float32, one `AudioBuffer` per channel when non-interleaved), then convert to 16 kHz mono PCM16. `-12737` is `kCMSampleBufferError_ArrayTooSmall`: the list had one buffer and the system track is non-interleaved multi-channel. A PCM16-sized destination fails the copy too; discarding that error yields zero frames and no `system.pcm`. A copy that succeeds can still be all zeros if the channels are then averaged. If that copy is silent, read the contiguous planar float block (channel `c` at sample `c * frameCount`) before accepting silence.
 2. `updateConfiguration` **replaces**, never merges — always pass the complete config or sample rate/channels/audio flags silently reset.
 3. Write segments continuously, assemble on clean stop (crash-safe recording).
+4. `Data.removeFirst` / `insert(at: 0)` on a slice traps once reconnect runs; rebuild buffers.
+5. Keep the Grok socket's unfair lock out of async contexts (`f3a68b4`).
 
 ## Failure modes → verifier hooks
-| Failure | Detection | Behavior |
-|---|---|---|
-| No TCC permission | `startCapture()` throws | Loud onboarding gate |
-| Stream alive, silent buffers | RMS energy ≈ 0 > 10 s | Loud "no audio detected" |
-| WebSocket drop | connection loss | Reconnect + backoff; gap timestamped |
-| No `transcript.created` | handshake timeout | Fail loud — never buffer silently |
-| Permission revoked mid-session | stream delegate error | Stop, surface, re-gate |
+Rows below name the failure. Pass conditions live only in the gate table in [v0 grading](../qa/v0-grading.md#gates).
+
+| Failure | Detection | Behavior | Graded by |
+|---|---|---|---|
+| No TCC permission | `startCapture()` throws | Loud onboarding gate | none |
+| Stream alive, silent buffers | RMS energy ≈ 0 > 10 s | Loud "no audio detected" | P4 |
+| WebSocket drop | connection loss | Reconnect + backoff; gap timestamped | P3 |
+| No `transcript.created` | handshake timeout | Fail loud — never buffer silently | none |
+| Permission revoked mid-session | stream delegate error | Stop, surface, re-gate | P2 |
 
 This is the anti-Granola layer: silent capture failure is the category's most-hated property, and the verifier exists so it's impossible in v0.
 
-Full brief: `~/workspace/research_notes/capture-layer-brief-20260922/report.md`
+Full brief (local, not in repo): `~/workspace/research_notes/capture-layer-brief-20260922/report.md`
 
-Related: [07-transcription.md](07-transcription.md) · [06-strategic-reads.md](06-strategic-reads.md) · [02-granola.md](02-granola.md)
+Related: [07-transcription.md](07-transcription.md) · [09-v0-shipped.md](09-v0-shipped.md) · [06-strategic-reads.md](06-strategic-reads.md) · [02-granola.md](02-granola.md)
