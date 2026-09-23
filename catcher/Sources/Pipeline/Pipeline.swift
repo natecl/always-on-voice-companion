@@ -108,8 +108,7 @@ public actor Pipeline {
     private var closing = false
     private var pcmError: String?
     /// Set when system streaming reports a post-reconnect backlog. Harness
-    /// shutdown holds the host clock until `end` reaches this, without writing
-    /// another seg or annotation.
+    /// shutdown keeps the session live until the host clock reaches this.
     private var systemTailFloorMs: Int?
     private let liveTailFloor: LiveTailFloor
 
@@ -300,18 +299,33 @@ public actor Pipeline {
     }
 
     public func stop() async {
-        await halt(clean: true, holdLiveTail: false)
+        await halt(clean: true)
     }
 
-    /// Harness SIGTERM. Capture has to stop (a hung socket must not block `end`),
-    /// then the host clock has to reach the system live-tail floor before `end`
-    /// is stamped. Holding earlier, while the engines are still up, can write a
-    /// new degrade and fail no-relapse.
+    /// Harness SIGTERM. When the signal lands before the system live-tail floor,
+    /// the session stays fully live (capture, engines, heartbeat) until the host
+    /// clock reaches it, then stops normally. Holding after capture stopped moved
+    /// `end` with no audio behind it: the tail cleared on an idle clock while the
+    /// live window got no speech, and a real relapse in that window went unwritten.
     public func stopAfterLiveTail() async {
-        await halt(clean: true, holdLiveTail: true)
+        await holdSessionUntilLiveTail()
+        await halt(clean: true)
     }
 
-    private func halt(clean: Bool, holdLiveTail: Bool = false) async {
+    private func holdSessionUntilLiveTail() async {
+        let started = nowMs()
+        while sessionOpen, !halting, !ended, let floor = systemTailFloorMs {
+            // Past the bar by a few hundred ms so `end >= floor` after the drain.
+            let remaining = floor + 250 - nowMs()
+            if remaining <= 0 || nowMs() - started >= Self.liveTailHoldCapMs { return }
+            try? await Task.sleep(for: .milliseconds(min(remaining, 100)))
+        }
+    }
+
+    /// The harness waits for exit longer than this. A wild backlog must not stick shutdown.
+    static let liveTailHoldCapMs = 30_000
+
+    private func halt(clean: Bool) async {
         if halting {
             while !ended {
                 try? await Task.sleep(for: .milliseconds(10))
@@ -324,19 +338,8 @@ public actor Pipeline {
         let wasOpen = sessionOpen
         sessionOpen = false
         // `finish` waits on socket close. A pf-parked URLSession close does not
-        // return, so that wait is bounded. The harness grades after the process
-        // exits; a live-tail hold below still has to finish before `end`.
+        // return, so that wait is bounded and `end` still reaches disk.
         await drainShutdown(budget: .milliseconds(400))
-        if holdLiveTail, let floor = systemTailFloorMs {
-            let deficit = floor - nowMs()
-            if deficit > 0 {
-                // A few hundred milliseconds past the bar. `end >= floor`, and
-                // the harness grades after this process exits, not one second
-                // after the signal. Cap so a wild backlog cannot stick shutdown.
-                let bounded = min(deficit + 250, 20_000)
-                try? await Task.sleep(for: .milliseconds(bounded))
-            }
-        }
         if !ended {
             await closeSession(clean: clean && wasOpen)
         }

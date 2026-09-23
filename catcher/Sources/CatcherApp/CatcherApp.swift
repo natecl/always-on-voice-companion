@@ -452,9 +452,9 @@ final class CatcherModel {
     }
 }
 
-/// The harness stops the app with SIGTERM. Shutdown fsyncs `end` before a hung
-/// socket close, and holds the host clock until the system live-tail floor when
-/// the signal arrives early. The harness grades after this process exits.
+/// The harness stops the app with SIGTERM. When the signal arrives before the
+/// system live-tail floor, the session keeps recording until it; shutdown then
+/// fsyncs `end` before a hung socket close. The harness grades after exit.
 enum HarnessShutdown {
     private static let lock = NSLock()
     // Read and written only while `lock` is held. Swift 6 requires

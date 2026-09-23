@@ -315,7 +315,7 @@ import TranscriptionEngine
     try expectEventShapeUnchanged(events)
 }
 
-@Test func harnessStopHoldsTheClockUntilTheLiveTailFloor() async throws {
+@Test func harnessStopKeepsRecordingUntilTheLiveTailFloor() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("catcher-tail-\(UUID().uuidString)", isDirectory: true)
     let capture = FakeCapture()
     let engines = LockedEngines()
@@ -336,10 +336,25 @@ import TranscriptionEngine
         let text = (try? String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)) ?? ""
         return text.contains("backlogMs=100")
     }
-    await pipeline.stopAfterLiveTail()
+    let stopping = Task { await pipeline.stopAfterLiveTail() }
+    try await Task.sleep(for: .milliseconds(200))
+    // Still recording inside the hold: capture reaches the engine and a live
+    // final is stored, so the tail window has speech and not an idle clock.
+    #expect(await pipeline.isRunning)
+    let system = try #require(engines.engine(.system))
+    let sentBefore = system.sentFrames
+    capture.emit(PCMFrame(track: .system, data: Data(repeating: 1, count: 3_200), hostTime: HostClock.now()))
+    try await waitUntil { system.sentFrames > sentBefore }
+    system.speakFinal("live words after the backlog", startMs: 2_500)
+    try await waitUntil {
+        let text = (try? String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)) ?? ""
+        return text.contains("live words after the backlog")
+    }
+    await stopping.value
     let events = try String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)
     let endAt = try endAtMs(events)
     #expect(endAt >= 2_900)
+    #expect(await pipeline.isRunning == false)
     #expect(events.contains("transport resumed track=system backlogMs=100"))
     // Holding must not open another degrade after the resume.
     let resumed = events.range(of: "backlogMs=100")
@@ -387,6 +402,9 @@ private final class ReconnectingEngine: TranscriptionEngine, EngineDiagnostics, 
     private let continuation: AsyncStream<EngineEvent>.Continuation
     private let lock = NSLock()
     private var backlog = 0
+    private var sent = 0
+    private var track = AudioTrack.system
+    private var seq = 0
 
     init() {
         let pair = AsyncStream<EngineEvent>.makeStream()
@@ -394,13 +412,34 @@ private final class ReconnectingEngine: TranscriptionEngine, EngineDiagnostics, 
         continuation = pair.continuation
     }
 
+    var sentFrames: Int { lock.withLock { sent } }
+
     func connect(track: AudioTrack) async throws {
+        lock.withLock { self.track = track }
         continuation.yield(.state(.connecting))
         continuation.yield(.state(.ready))
         continuation.yield(.state(.streaming))
     }
 
-    func send(_ frame: PCMFrame) async throws {}
+    func send(_ frame: PCMFrame) async throws {
+        lock.withLock { sent += 1 }
+    }
+
+    func speakFinal(_ text: String, startMs: Int) {
+        let (track, seq) = lock.withLock { () -> (AudioTrack, Int) in
+            self.seq += 1
+            return (self.track, self.seq)
+        }
+        continuation.yield(.transcript(TranscriptEvent(
+            track: track,
+            kind: .final,
+            text: text,
+            words: [],
+            seq: seq,
+            startMs: startMs,
+            endMs: startMs + 1_000
+        )))
+    }
 
     func finish() async {
         continuation.yield(.state(.closed))
