@@ -89,7 +89,9 @@ append_harness_field "$SESSION" pfOffWallMs "$(wall_ms)"
 sudo -n /sbin/pfctl -a catcher -F all >/dev/null 2>&1 || true
 echo "Network restored. Waiting for the system resume grade.py will grade."
 TARGET="$(resolve_session "$SESSION")"
-NEED="$(python3 - "$TARGET" "$ROOT" "$SESSION/harness_run.json" <<'PY'
+# The heredoc must not sit inside "$(...)". macOS bash 3.2 parses that as an
+# open quote, and the apostrophe in the Python comment is then unexpected EOF.
+python3 - "$TARGET" "$ROOT" "$SESSION/harness_run.json" >"$SESSION/p3-need.txt" <<'PY'
 import json, sys, time
 
 session, root, run_path = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -141,7 +143,7 @@ while time.time() < cap and int(time.time() * 1000) - started < target:
     time.sleep(0.25)
 print(need)
 PY
-)"
+NEED="$(tr -d '[:space:]' <"$SESSION/p3-need.txt")"
 if [[ "$NEED" == "0" ]]; then
   echo "No system resume for the pf block within the resume window. Stopping; the grade will say why." >&2
 else

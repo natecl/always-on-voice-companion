@@ -227,6 +227,15 @@ if pf.count("sudo -n /sbin/pfctl") < 5:
     raise SystemExit("p3 pfctl wrap regressed")
 if "CATCHER_ALLOW_PF" not in pf:
     raise SystemExit("CATCHER_ALLOW_PF gate missing")
+if "python3 - " in pf and '<<\'PY\'' in pf:
+    py_at = pf.index("<<'PY'")
+    window = pf[max(0, py_at - 180):py_at]
+    if 'NEED="$(' in window or window.rstrip().endswith('"$('):
+        raise SystemExit("p3 heredoc is still inside a double-quoted substitution")
+else:
+    raise SystemExit("p3 python body is not a quoted heredoc")
+if '>"$SESSION/p3-need.txt" <<\'PY\'' not in pf:
+    raise SystemExit("p3 python body is not written outside $(...)")
 pre = (root / "preflight.sh").read_text(encoding="utf-8")
 if "open -n -W" in pre:
     raise SystemExit("preflight still waits on open -W")
