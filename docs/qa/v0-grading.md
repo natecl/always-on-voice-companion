@@ -87,3 +87,4 @@ python3 catcher/harness/wer.py --ref catcher/harness/fixtures/known-60s.ref.txt 
 ## What a pass is not
 
 `swift test` passing, a stub session, or this document existing does not grade v0. QA copies `grade.json` out of the session directory from the Mac that ran the six gates. Until those six results are `pass`, v0 is red.
+When a Mac run passes, update the Status column in [`../FEATURE_MAP.md`](../FEATURE_MAP.md).

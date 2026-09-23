@@ -28,3 +28,4 @@ Jevons-paradox unlock that makes always-on judgment squanderable at consumer pri
 - `docs/knowledge/jev.md` — Jev model facts, pricing, access
 - `docs/knowledge/pincus-tan-takeaways.md` — distilled takeaways from the Pincus/Tan conversation
 - `docs/knowledge/granola-baseline.md` — the proven Granola mechanics we're copying
+- `docs/FEATURE_MAP.md` — v0 surfaces, owners, prove commands, last Mac grade
