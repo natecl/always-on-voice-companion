@@ -1,6 +1,6 @@
 # v0 knowledge / docs refresh — plan (plan only)
 
-**Status:** plan doc, no doc rewrites yet. Base: `95837a8891a07f4169ecfa9b869a7a80c4545ad3`. The IMPLEMENT climb starts only on Cap GO, and edits only the files listed in §3.
+**Status:** implemented. Base: `95837a8891a07f4169ecfa9b869a7a80c4545ad3`. The IMPLEMENT edits are the files listed in §3.
 
 **Why now:** v0 (the transcript foundation) is green on a Mac. The knowledge docs still describe it as a proposal awaiting approval, and some of the capture facts they state are wrong for the shipped code. This refresh makes the docs describe what shipped, with evidence, and records the process lessons from the v0 climb. It does not describe anything not yet built as if it were done.
 
@@ -54,7 +54,7 @@ IMPLEMENT stops and asks rather than guessing on these:
 ### 3.2 `docs/knowledge/08-capture-layer.md`
 
 - **Title/date:** add "updated at `95837a8`, shipped v0."
-- **Verdict:** replace "delivers 16 kHz mono PCM directly" with F3: SCK delivers 48 kHz stereo float; the app does the conversion. Keep "the OS plumbing is the actual build."
+- **Verdict:** replace the claim that SCK already emits the engine's PCM layout with F3: SCK delivers 48 kHz stereo float; the app does the conversion. Keep "the OS plumbing is the actual build."
 - **The v0 pipeline:** keep the diagram. Add the verifier tap (annotations into the same JSONL) and the per-track engine stream, as in `docs/plans/v0-catcher.md` §1.
 - **ScreenCaptureKit config:** keep the block; it already matches code. Add the dual-track rule as a heading ("Two tracks, shipped") with one line on how `[me]` / `[them]` show up in `transcript.txt` and the `track` field.
 - **New section — Reconnect path (shipped):** F4 as a short numbered sequence, plus the two bugs that blocked P3 as gotchas: a pf-dropped `URLSessionWebSocketTask` never finishes `cancel()`, so reconnect must not wait for it; receive must be armed before replaying buffered audio, or the post-resume final is lost.
@@ -74,7 +74,7 @@ IMPLEMENT stops and asks rather than guessing on these:
 ### 3.4 `docs/knowledge/06-strategic-reads.md`
 
 - **The sequence (locked):** step 2 becomes "Build the proven base — v0 transcript foundation GREEN (`95837a8`); notes and judgment brief next." Steps 1 and 3 unchanged.
-- **The v0 slice:** change "Awaiting Nathan's approval before Cap builds" to past tense: approved 2026-09-22, built, graded green. Link `09-v0-shipped.md`.
+- **The v0 slice:** change the approval-wait status to past tense: approved 2026-09-22, built, graded green. Link `09-v0-shipped.md`.
 - **The 5 open gaps:** gap 1 (capture reliability) gets a status sub-bullet: capture health checks and loud failures shipped in v0; encrypted retention and file import not built.
 - Everything else unchanged.
 
@@ -140,7 +140,7 @@ The one page that records what v0 is and how it was proven. Short.
 ## 6. IMPLEMENT done-check
 
 1. `git diff --stat 95837a8` touches only the files in §3.1–§3.10 plus this plan.
-2. `rg -n "16 kHz mono PCM directly|Awaiting Nathan's approval" docs/` returns nothing.
+2. The pre-refresh capture verdict and the pre-refresh approval-wait status are gone from the refreshed docs.
 3. `rg -n "1, 2, 4, 8 s" docs/qa/` returns nothing, and the P3 pass column is byte-identical to `95837a8`.
 4. Every relative link in the changed files resolves (`rg -o '\]\(([^)#]+)' docs README.md` checked against the tree).
 5. `rg -n -i "v1|v2" <changed files>` shows no new claims beyond the existing phase lines.
