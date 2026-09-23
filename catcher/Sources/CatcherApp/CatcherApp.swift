@@ -457,8 +457,10 @@ final class CatcherModel {
 /// clock looks like it stopped at the last transcript.
 enum HarnessShutdown {
     private static let lock = NSLock()
-    private static var installed = false
-    private static var source: DispatchSourceSignal?
+    // Read and written only while `lock` is held. Swift 6 requires
+    // `nonisolated(unsafe)` when an external lock is the synchronization.
+    nonisolated(unsafe) private static var installed = false
+    nonisolated(unsafe) private static var source: DispatchSourceSignal?
 
     static func install(_ stop: @escaping @Sendable () async -> Void) {
         lock.lock()
