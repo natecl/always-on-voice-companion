@@ -7,7 +7,7 @@ export CATCHER_APP=/path/to/Catcher.app
 export XAI_API_KEY=...          # P1, P3, P6
 ./harness/run.sh p1 /tmp/catcher-p1
 ./harness/run.sh p2 /tmp/catcher-p2          # also CATCHER_ALLOW_TCC_RESET=1
-./harness/run.sh p3 /tmp/catcher-p3          # root + CATCHER_ALLOW_PF=1; loops the fixture, no enter
+./harness/run.sh p3 /tmp/catcher-p3          # CATCHER_ALLOW_PF=1; preferred: sudo -n env … run.sh p3; see docs/qa/v0-diagnostics.md
 ./harness/run.sh p4 /tmp/catcher-p4
 ./harness/run.sh p5 /tmp/catcher-p5 /tmp/catcher-p1
 ./harness/run.sh p6 /tmp/catcher-p6

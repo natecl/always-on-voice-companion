@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # Block api.x.ai for 15s mid-session. Requires CATCHER_ALLOW_PF=1.
 # Every pfctl call is `sudo -n /sbin/pfctl` so NOPASSWD matches the absolute
-# path and a missing sudoers rule fails closed (no password prompt). Nathan
-# installs /etc/sudoers.d/catcher-p3 with:
+# path and a missing sudoers rule fails closed (no password prompt). That
+# wrap is required when this script is not root. Preferred Mac invoke is a
+# root session, after which these same calls run as root:
+#   sudo -n env CATCHER_APP=… CATCHER_ALLOW_PF=1 … run.sh p3 <session>
+# Nathan installs /usr/local/bin/catcher-p3-gate and /etc/sudoers.d/catcher-p3
+# with NOPASSWD for /sbin/pfctl and that gate only:
 #   n.chinlue ALL=(root) NOPASSWD: /sbin/pfctl
+#   n.chinlue ALL=(root) NOPASSWD: /usr/local/bin/catcher-p3-gate
+# /usr/bin/env is not a sudoers command.
 # The fixture loops the whole time so there is live speech before, during,
 # and after the block. pf on/off wall times go into harness_run.json. After
 # the rule clears the script waits for the system resume grade.py will grade

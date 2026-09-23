@@ -118,12 +118,22 @@ First match wins. `TRACE error=` is the underlying error (domain and code, OSSta
 
 ## P3 packet filter
 
-`catcher/harness/p3_net_kill.sh` loads and clears the `catcher` anchor only when `CATCHER_ALLOW_PF=1`. Every `pfctl` invocation is `sudo -n /sbin/pfctl` (absolute path). `-n` means a missing sudoers rule exits instead of waiting for a password. Nathan installs `/etc/sudoers.d/catcher-p3` with:
+`catcher/harness/p3_net_kill.sh` loads and clears the `catcher` anchor only when `CATCHER_ALLOW_PF=1`. Every `pfctl` invocation in that script is `sudo -n /sbin/pfctl` (absolute path). `-n` exits when the sudoers rule is missing, so the script does not wait for a password. Those calls are required when the script is not root. In a root session they still run, and pfctl is root.
+
+Preferred Mac invoke:
+
+```bash
+sudo -n env CATCHER_APP=… CATCHER_ALLOW_PF=1 XAI_API_KEY=… \
+  ./catcher/harness/run.sh p3 <session>
+```
+
+Nathan installs a wrapper binary or script at `/usr/local/bin/catcher-p3-gate` and `/etc/sudoers.d/catcher-p3`. Sudoers allows that gate and `/sbin/pfctl`. `/usr/bin/env` is not a sudoers command: NOPASSWD on `env` can run any program.
 
 ```
 n.chinlue ALL=(root) NOPASSWD: /sbin/pfctl
+n.chinlue ALL=(root) NOPASSWD: /usr/local/bin/catcher-p3-gate
 ```
 
-The sudoers command must be `/sbin/pfctl`. A different path does not match NOPASSWD.
+The `/sbin/pfctl` path must match the script. A different pfctl path does not match NOPASSWD. The gate path is the narrow root entry for the preferred invoke above.
 
 Mid-session Screen Recording revoke and socket reconnect are graded from `blocked`, `degraded`, `gap`, and `resumed` annotations. They do not add a stage line. `degraded` and `resumed` detail text ends in `track=<t>`, and `resumed` carries `backlogMs=<n>` (audio the new socket replays before live). `noAudio` and heartbeat/handshake `degraded` carry `emittedAtMs=`; `noAudio` also carries `observedFromMs=` (capture start). `stages.log` is still never read by `grade.py`; provenance comes from `harness_run.json`, not from stage lines.
