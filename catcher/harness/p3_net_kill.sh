@@ -33,8 +33,8 @@ launch_catcher "$SESSION" 1
 (while afplay "$ROOT/fixtures/known-60s.wav"; do :; done) &
 PLAYER=$!
 sleep 5
-IPS="$(dig +short api.x.ai A | tr '\n' ' ')"
-if [[ -z "$IPS" ]]; then
+IPS="$( { dig +short api.x.ai A; dig +short api.x.ai AAAA; } | tr '\n' ' ')"
+if [[ -z "${IPS// /}" ]]; then
   echo "dig did not resolve api.x.ai" >&2
   exit 1
 fi
@@ -44,6 +44,13 @@ RULE="$(mktemp)"
   echo "block drop out proto tcp from any to <catcher_xai> port 443"
 } > "$RULE"
 pfctl -a catcher -f "$RULE"
+# pf passes a packet that matches an existing state without reading the rule.
+# Drop the open sockets' states so the block takes them at pfOn, not whenever
+# they next reconnect.
+for ip in $IPS; do
+  pfctl -k 0.0.0.0/0 -k "$ip" >/dev/null 2>&1 || true
+  pfctl -k ::/0 -k "$ip" >/dev/null 2>&1 || true
+done
 append_harness_field "$SESSION" pfOnWallMs "$(wall_ms)"
 sleep 15
 pfctl -a catcher -F all || true
