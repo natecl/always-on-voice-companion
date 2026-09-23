@@ -309,6 +309,44 @@ func reconnectSendsTheShortTailTheChunkPumpLeftBehind(profile: TransportProfile)
 }
 
 @Test(arguments: TransportProfile.allCases)
+func hungReplaySendStillEmitsTheGapOnTheNextSocket(profile: TransportProfile) async throws {
+    // The socket that finishes the handshake but never completes a send is the
+    // Mac replay after a real pf drop. The gap has to come from the next one.
+    let rig = ReconnectRig(profile: profile, handshakeTimeout: .milliseconds(200)) { index, socket in
+        if index == profile.resumeIndex {
+            socket.push(created)
+            socket.hangSendsAfter = 0
+        }
+        if index == profile.resumeIndex + 1 {
+            socket.push(created)
+        }
+    }
+    let first = try await rig.connected()
+    try await rig.engine.send(PCMFrame(track: .system, data: Data(count: 3_200), hostTime: 0))
+    try await waitUntil { first.binaryCount == 1 }
+
+    var iterator = rig.engine.events.makeAsyncIterator()
+    first.push(.closed(code: 1006, reason: "drop"))
+    var sawGap = false
+    var sawStreaming = false
+    for _ in 0..<32 {
+        guard let event = await iterator.next() else { break }
+        if case .gap = event { sawGap = true }
+        if case .state(.streaming) = event, sawGap {
+            sawStreaming = true
+            break
+        }
+    }
+    #expect(sawGap)
+    #expect(sawStreaming)
+    let next = try await rig.socket(profile.resumeIndex + 1)
+    try await waitUntil { next.binaryCount >= 1 }
+    #expect(next.binary(at: 0) == Data(count: 3_200))
+    await rig.engine.finish()
+    rig.releaseAll()
+}
+
+@Test(arguments: TransportProfile.allCases)
 func stalledSocketReconnectsReplaysAudioAndEmitsAGap(profile: TransportProfile) async throws {
     let rig = ReconnectRig(profile: profile, inboundStall: .milliseconds(80)) { index, socket in
         if index == profile.resumeIndex { socket.push(created) }

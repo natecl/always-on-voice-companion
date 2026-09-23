@@ -369,7 +369,11 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
                     if catchUpLost || !ready { break }
                     await Task.yield()
                 }
-                await pump(minimumBytes: 1)
+                // A parked replay send must not sit in front of `gap`. A real
+                // `pf` drop replays up to 30s; `URLSession` send does not
+                // return while that write is stuck, and the chain was never
+                // written. Bound it and let the next socket emit the gap.
+                await pump(minimumBytes: 1, sendTimeout: configuration.handshakeTimeout)
                 if finishRequested { return }
                 if !ready || catchUpLost {
                     stopCatchUpReader()
@@ -670,7 +674,9 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
             await configuration.sleep(.milliseconds(50))
             waited += 50
             if !ready || catchUpLost || finishRequested || Task.isCancelled { return }
-            await pump()
+            // Same bound as the backlog send. A replay that starts moving and
+            // then stalls must not sit in front of `gap` for the rest of the block.
+            await pump(sendTimeout: configuration.handshakeTimeout)
         }
     }
 
@@ -681,7 +687,7 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
         socketGeneration += 1
     }
 
-    private func pump(minimumBytes: Int? = nil) async {
+    private func pump(minimumBytes: Int? = nil, sendTimeout: Duration? = nil) async {
         guard pumpOwner == nil, ready, let transport else { return }
         let generation = socketGeneration
         let minimum = minimumBytes ?? configuration.chunkBytes
@@ -696,7 +702,15 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
             inFlight = chunk
             inFlightGeneration = generation
             do {
-                try await transport.sendBinary(chunk)
+                if let sendTimeout {
+                    try await firstToFinish(timeout: sendTimeout, onTimeout: {
+                        abandonSocket(transport)
+                    }) {
+                        try await transport.sendBinary(chunk)
+                    }
+                } else {
+                    try await transport.sendBinary(chunk)
+                }
                 if generation != socketGeneration {
                     restoreInFlight(chunk, generation: generation)
                     return
