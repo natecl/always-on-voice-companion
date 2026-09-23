@@ -14,20 +14,22 @@ let package = Package(
         .library(name: "SessionStore", targets: ["SessionStore"]),
         .library(name: "Pipeline", targets: ["Pipeline"]),
         .library(name: "Diagnostics", targets: ["Diagnostics"]),
+        .library(name: "Metering", targets: ["Metering"]),
     ],
     targets: [
         .target(name: "Diagnostics"),
+        .target(name: "Metering"),
         .target(
             name: "AudioCapture",
             dependencies: ["Diagnostics"]
         ),
         .target(
             name: "TranscriptionEngine",
-            dependencies: ["AudioCapture"]
+            dependencies: ["AudioCapture", "Metering"]
         ),
         .target(
             name: "GrokEngine",
-            dependencies: ["TranscriptionEngine", "AudioCapture", "Diagnostics"]
+            dependencies: ["TranscriptionEngine", "AudioCapture", "Diagnostics", "Metering"]
         ),
         .target(
             name: "Verifier",
@@ -45,6 +47,7 @@ let package = Package(
                 "Verifier",
                 "SessionStore",
                 "Diagnostics",
+                "Metering",
             ]
         ),
         .testTarget(
@@ -57,7 +60,7 @@ let package = Package(
         ),
         .testTarget(
             name: "GrokEngineTests",
-            dependencies: ["GrokEngine"]
+            dependencies: ["GrokEngine", "Metering"]
         ),
         .testTarget(
             name: "VerifierTests",
@@ -69,11 +72,15 @@ let package = Package(
         ),
         .testTarget(
             name: "PipelineTests",
-            dependencies: ["Pipeline", "TranscriptionEngine", "AudioCapture", "SessionStore", "Diagnostics"]
+            dependencies: ["Pipeline", "TranscriptionEngine", "AudioCapture", "SessionStore", "Diagnostics", "Metering"]
         ),
         .testTarget(
             name: "DiagnosticsTests",
             dependencies: ["Diagnostics"]
+        ),
+        .testTarget(
+            name: "MeteringTests",
+            dependencies: ["Metering"]
         ),
     ]
 )

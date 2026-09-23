@@ -1,6 +1,7 @@
 import AudioCapture
 import Diagnostics
 import Foundation
+import Metering
 import SessionStore
 import TranscriptionEngine
 import Verifier
@@ -67,7 +68,11 @@ private final class ResumeOnce: @unchecked Sendable {
 /// Capture → one engine stream per track → JSONL. The verifier only observes.
 public actor Pipeline {
     public nonisolated let ui: AsyncStream<PipelineUIEvent>
+    /// Per-minute cost samples and the close snapshot. Never finished: the
+    /// same pipeline records more than one session.
+    public nonisolated let cost: AsyncStream<CostSnapshot>
     private let uiContinuation: AsyncStream<PipelineUIEvent>.Continuation
+    private let costContinuation: AsyncStream<CostSnapshot>.Continuation
     private let sessionRoot: URL
     private let makeCapture: @Sendable () -> any AudioCapturing
     private let makeEngine: @Sendable (AudioTrack) throws -> any TranscriptionEngine
@@ -104,6 +109,15 @@ public actor Pipeline {
     private var sink: (any StageSink)?
     private let ledger = StageLedger()
     private var checkpointTask: Task<Void, Never>?
+    private var meter: CostMeter
+    private var costFile: CostLog?
+    private let meterIntervalMs: Int
+    private let costLogFactory: @Sendable (URL) -> CostLog?
+    private var meterTask: Task<Void, Never>?
+    /// Held across a minute sample and its fsync so `closeSession` cannot
+    /// roll up between those two steps. The wait sleeps, so the actor is free.
+    private var meterBusy = false
+    private var meterLoopDone = true
     private var gatingFailed = false
     private var closing = false
     private var pcmError: String?
@@ -129,7 +143,9 @@ public actor Pipeline {
         probeInterval: Duration = .seconds(1),
         clock: any SessionClock = HostSessionClock(),
         liveTailFloor: LiveTailFloor = .grader,
-        stages: (@Sendable (URL?) -> any StageSink)? = nil
+        stages: (@Sendable (URL?) -> any StageSink)? = nil,
+        meterIntervalMs: Int = 60_000,
+        costLog: (@Sendable (URL) -> CostLog?)? = nil
     ) {
         self.sessionRoot = sessionRoot
         self.makeCapture = makeCapture
@@ -141,6 +157,16 @@ public actor Pipeline {
         self.probeInterval = probeInterval
         self.clock = clock
         self.liveTailFloor = liveTailFloor
+        self.meterIntervalMs = meterIntervalMs
+        if let costLog {
+            self.costLogFactory = costLog
+        } else {
+            self.costLogFactory = { directory in try? CostLog(directory: directory) }
+        }
+        self.meter = CostMeter(
+            component: MeterComponent.stt(engineLabel: engineLabel),
+            intervalMs: meterIntervalMs
+        )
         if let stages {
             self.stageFactory = stages
         } else {
@@ -155,13 +181,27 @@ public actor Pipeline {
         let pair = AsyncStream<PipelineUIEvent>.makeStream()
         self.ui = pair.stream
         self.uiContinuation = pair.continuation
+        let costPair = AsyncStream<CostSnapshot>.makeStream()
+        self.cost = costPair.stream
+        self.costContinuation = costPair.continuation
     }
 
     public var isRunning: Bool { sessionOpen }
     public var sessionDirectory: URL? { directory }
 
+    /// Live totals from the engine counters, including the open minute.
+    public func costSnapshot() async -> CostSnapshot? {
+        guard directory != nil else { return nil }
+        return await meter.snapshot(atMs: nowMs(), counters: await gatherCounters())
+    }
+
     public func start() async {
         if sessionOpen || halting { return }
+        meter = CostMeter(
+            component: MeterComponent.stt(engineLabel: engineLabel),
+            intervalMs: meterIntervalMs
+        )
+        costFile = nil
         ended = false
         failing = false
         halting = false
@@ -182,13 +222,22 @@ public actor Pipeline {
             let store = try SessionStore(directory: directory)
             self.store = store
             self.directory = directory
+            let startedAt = ISO8601.string(from: Date())
             try await store.begin(SessionHeader(
                 id: id.uuidString,
-                startedAt: ISO8601.string(from: Date()),
+                startedAt: startedAt,
                 engine: engineLabel,
                 tracks: AudioTrack.allCases.map(\.rawValue),
                 app: CatcherMetadata.headerApp
             ))
+            costFile = costLogFactory(directory)
+            let session = await meter.sessionRow(
+                id: id.uuidString,
+                app: CatcherMetadata.headerApp,
+                engine: engineLabel,
+                startedAt: startedAt
+            )
+            await writeCost([.session(session)], fsync: true)
         } catch {
             let sentence = ErrorDetail.sentence(error)
             StageMirror.note("store create \(sentence)")
@@ -303,6 +352,8 @@ public actor Pipeline {
         tickTask = Task { await self.tickLoop() }
         probeTask = Task { await self.probeLoop() }
         checkpointTask = Task { await self.checkpointLoop() }
+        meterLoopDone = false
+        meterTask = Task { await self.meterLoop() }
     }
 
     public func stop() async {
@@ -516,6 +567,7 @@ public actor Pipeline {
     private func ingest(_ frame: PCMFrame) async {
         let at = max(0, clock.milliseconds(from: origin, to: frame.hostTime))
         await emit(await verifier.observeFrame(frame, atMs: at))
+        await meter.observeFrame(track: frame.track.rawValue, pcm16: frame.data, atMs: at)
         appendPCM(frame)
         await ledger.frameExtracted(track: frame.track.rawValue, energy: StageLedger.hasEnergy(frame.data))
         guard let engine = engines[frame.track] else { return }
@@ -626,11 +678,13 @@ public actor Pipeline {
         guard !ended else { return }
         closing = true
         checkpointTask?.cancel()
+        await stopMeterLoop()
         closePCM()
         if let pcmError {
             await ledger.notePCMError(pcmError)
         }
         let at = nowMs()
+        await finalizeCost(atMs: at, clean: clean)
         var endError: String?
         do {
             try await store?.end(atMs: at, clean: clean)
@@ -705,6 +759,100 @@ public actor Pipeline {
 
     private func nowMs() -> Int {
         max(0, clock.milliseconds(from: origin, to: clock.now()))
+    }
+
+    private enum MeterCommand {
+        case stop
+        case wait(Int)
+        case write([CostRow], CostSnapshot)
+    }
+
+    /// Sleeps on the wall clock in ≤1s slices so an injected session clock is
+    /// noticed. Writes happen once a minute, off the frame path.
+    private func meterLoop() async {
+        defer {
+            meterBusy = false
+            meterLoopDone = true
+        }
+        while !Task.isCancelled {
+            meterBusy = true
+            let command = await meterCommand()
+            switch command {
+            case .stop:
+                return
+            case .wait(let milliseconds):
+                meterBusy = false
+                do {
+                    try await Task.sleep(for: .milliseconds(milliseconds))
+                } catch {
+                    return
+                }
+            case .write(let rows, let snapshot):
+                await writeCost(rows, fsync: true)
+                meterBusy = false
+                costContinuation.yield(snapshot)
+            }
+        }
+    }
+
+    private func meterCommand() async -> MeterCommand {
+        if closing || ended || !sessionOpen { return .stop }
+        let now = nowMs()
+        let counters = await gatherCounters()
+        let due = await meter.takeDueMinute(atMs: now, counters: counters)
+        if due.isEmpty {
+            let wait = await meter.millisecondsUntilDue(now: now)
+            if wait <= 0 { return .stop }
+            return .wait(min(max(wait, 1), 1_000))
+        }
+        let snapshot = await meter.snapshot(atMs: now, counters: counters)
+        return .write(due.map { .minute($0) }, snapshot)
+    }
+
+    private func gatherCounters() async -> [String: MeterCounters] {
+        var counters: [String: MeterCounters] = [:]
+        for track in AudioTrack.allCases {
+            if let metered = engines[track] as? any MeteredEngine {
+                counters[track.rawValue] = await metered.meterCounters()
+            } else {
+                counters[track.rawValue] = .zero
+            }
+        }
+        return counters
+    }
+
+    private func stopMeterLoop() async {
+        guard let task = meterTask else { return }
+        task.cancel()
+        while !meterLoopDone {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        _ = task
+        meterTask = nil
+    }
+
+    /// Remainder and rollup share `atMs` with the session `end` row. A write
+    /// failure is logged and does not fail the recording.
+    private func finalizeCost(atMs: Int, clean: Bool) async {
+        guard costFile != nil else { return }
+        let counters = await gatherCounters()
+        let remainder = await meter.takeRemainder(atMs: atMs, counters: counters)
+        let rollup = await meter.rollup(wallMs: atMs, clean: clean, recovered: false)
+        var rows = remainder.map { CostRow.minute($0) }
+        rows.append(.rollup(rollup))
+        await writeCost(rows, fsync: true)
+        costContinuation.yield(await meter.snapshot(atMs: atMs, counters: counters))
+    }
+
+    private func writeCost(_ rows: [CostRow], fsync: Bool) async {
+        guard let costFile, !rows.isEmpty else { return }
+        await Task.detached(priority: .utility) {
+            do {
+                try costFile.append(rows, fsync: fsync)
+            } catch {
+                StageMirror.note("cost \(ErrorDetail.sentence(error))")
+            }
+        }.value
     }
 
     private func checkpointLoop() async {

@@ -31,6 +31,8 @@ targets:
         product: GrokEngine
       - package: Catcher
         product: Diagnostics
+      - package: Catcher
+        product: Metering
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.catcher.app

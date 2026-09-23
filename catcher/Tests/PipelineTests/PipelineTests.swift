@@ -1,6 +1,7 @@
 import AudioCapture
 import Diagnostics
 import Foundation
+import Metering
 import Pipeline
 import SessionStore
 import Testing
@@ -76,6 +77,98 @@ import TranscriptionEngine
     let pcm = try Data(contentsOf: SessionPaths.pcmFile(track: "system", in: directory))
     #expect(pcm.count == 3_200)
     #expect(await pipeline.isRunning == false)
+}
+
+@Test func stubSessionWritesCostJSONLWithoutTouchingEventShape() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("catcher-cost-\(UUID().uuidString)", isDirectory: true)
+    let capture = FakeCapture()
+    let clock = ManualSessionClock()
+    let pipeline = Pipeline(
+        sessionRoot: root,
+        makeCapture: { capture },
+        makeEngine: { track in StubEngine(track: track, framesPerFinal: 1) },
+        launchProbe: { .granted },
+        recheckProbe: { .granted },
+        recordPCM: true,
+        engineLabel: "stub",
+        clock: clock,
+        meterIntervalMs: 50
+    )
+    await pipeline.start()
+    let directory = try #require(await pipeline.sessionDirectory)
+    let frame = Data(repeating: 1, count: 3_200)
+    capture.emit(PCMFrame(track: .system, data: frame, hostTime: clock.now()))
+    capture.emit(PCMFrame(track: .microphone, data: Data(repeating: 2, count: 3_200), hostTime: clock.now()))
+    try await waitUntil {
+        let text = (try? String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)) ?? ""
+        return text.contains("\"track\":\"microphone\"") && text.contains("\"track\":\"system\"")
+    }
+    clock.set(50)
+    try await waitLong {
+        await minuteEnds(in: directory).contains(50)
+    }
+    let live = try #require(await pipeline.costSnapshot())
+    #expect(live.calibrated == false)
+    #expect(live.billingModel == "uncalibrated")
+    #expect(live.rateCardID == "xai-stt-2026-09-18")
+    #expect(live.usd == 0)
+    clock.set(100)
+    try await waitLong {
+        await minuteEnds(in: directory).contains(100)
+    }
+    await pipeline.stop()
+
+    let events = try String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)
+    try expectEventShapeUnchanged(events)
+    #expect(!events.contains("cost."))
+    #expect(!events.contains("wireBytes"))
+    let pcm = try Data(contentsOf: SessionPaths.pcmFile(track: "system", in: directory))
+    #expect(pcm == frame)
+
+    let read = try CostLog.read(url: CostLog.fileURL(in: directory))
+    #expect(read.droppedTruncatedTail == false)
+    let rows = read.rows
+    guard case .session(let session) = rows.first else {
+        Issue.record("missing cost.session")
+        return
+    }
+    #expect(session.v == 1)
+    #expect(session.engine == "stub")
+    #expect(session.billingModel == "uncalibrated")
+    #expect(session.rateCard == "xai-stt-2026-09-18")
+    guard case .rollup(let rollup) = rows.last else {
+        Issue.record("missing cost.rollup")
+        return
+    }
+    #expect(rollup.clean == true)
+    #expect(rollup.recovered == false)
+    #expect(rollup.usd == 0)
+    let endAt = try endAtMs(events)
+    #expect(rollup.wallMs == endAt)
+
+    let minutes = rows.compactMap { row -> CostMinuteRow? in
+        if case .minute(let minute) = row { return minute }
+        return nil
+    }
+    let ordinals = Set(minutes.map(\.m)).sorted()
+    #expect(ordinals == Array(0..<ordinals.count))
+    #expect(ordinals.count >= 2)
+    for ordinal in ordinals {
+        let slice = minutes.filter { $0.m == ordinal }
+        #expect(Set(slice.map(\.track)) == ["system", "microphone"])
+        #expect(Set(slice.map(\.component)) == ["stt.stub"])
+        #expect(Set(slice.map(\.fromMs)).count == 1)
+        #expect(Set(slice.map(\.toMs)).count == 1)
+    }
+    for index in ordinals.dropFirst() {
+        let previous = try #require(minutes.first { $0.m == index - 1 })
+        let current = try #require(minutes.first { $0.m == index })
+        #expect(previous.toMs == current.fromMs)
+    }
+    for track in ["system", "microphone"] {
+        let summed = minutes.filter { $0.track == track }.reduce(0) { $0 + $1.wireBytes }
+        #expect(rollup.units[track]?.wireBytes == summed)
+    }
 }
 
 @Test func stopWritesEndWhenEngineCloseNeverReturns() async throws {
@@ -515,6 +608,47 @@ private func waitUntil(_ predicate: @Sendable () async throws -> Bool) async thr
         try await Task.sleep(for: .milliseconds(20))
     }
     Issue.record("timed out")
+}
+
+private func waitLong(_ predicate: @Sendable () async throws -> Bool) async throws {
+    for _ in 0..<200 {
+        if try await predicate() { return }
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    Issue.record("timed out")
+}
+
+private func minuteEnds(in directory: URL) async -> Set<Int> {
+    guard let read = try? CostLog.read(url: CostLog.fileURL(in: directory)) else { return [] }
+    var ends: Set<Int> = []
+    for case .minute(let row) in read.rows {
+        ends.insert(row.toMs)
+    }
+    return ends
+}
+
+/// Session time the test moves by hand. `now` is milliseconds × 1_000_000 so
+/// `milliseconds(from:to:)` is a plain difference.
+private final class ManualSessionClock: SessionClock, @unchecked Sendable {
+    private let lock = NSLock()
+    private var milliseconds = 0
+
+    func now() -> UInt64 {
+        lock.lock()
+        let milliseconds = milliseconds
+        lock.unlock()
+        return UInt64(milliseconds) * 1_000_000
+    }
+
+    func milliseconds(from start: UInt64, to end: UInt64) -> Int {
+        Int(end / 1_000_000) - Int(start / 1_000_000)
+    }
+
+    func set(_ milliseconds: Int) {
+        lock.lock()
+        self.milliseconds = milliseconds
+        lock.unlock()
+    }
 }
 
 private final class LockedFlag: @unchecked Sendable {
