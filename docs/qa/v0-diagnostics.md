@@ -17,7 +17,7 @@ grep -E '^(STAGE|TRACE)' <uuid>/stages.log
 log stream --predicate 'subsystem == "com.catcher.app" AND category == "stage"'
 ```
 
-Count stages are written at a 10 s checkpoint and again at close. The last line for a stage is its verdict (`api-connect` keeps one line per `track=`). A stage that was never written is `not-reached`. A FAIL at `tcc-check`, `capture-start`, or `api-connect` means later stages are not written. `zeroEnergy` is informational and leaves `pcm-extract` at OK, because P4 is a legitimate silence run.
+Count stages are written at a 10 s checkpoint and again at close. The last line for a stage is its verdict (`api-connect` keeps one line per `track=`). A stage that was never written is `not-reached`. A FAIL at `tcc-check`, `capture-start`, or `api-connect` means later stages are not written. `zeroEnergy` is informational and leaves `pcm-extract` at OK, because P4 is a legitimate silence run. `micGain` (latest) and `micGainMax` (session high) are the microphone gain factors from `MicrophoneGain`; `1.00` means the mic track was passed through unchanged.
 
 ## Line grammar
 
