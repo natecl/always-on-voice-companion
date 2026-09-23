@@ -237,6 +237,14 @@ if '"$helper" "$pid" "$session"' not in lib:
     raise SystemExit("ensure_window is not passed the session")
 if "require_fixture_play \"$session\"" not in lib.split("launch_catcher()")[1].split("resolve_session()")[0]:
     raise SystemExit("launch_catcher returns before the content window is raised")
+helper_src = (root / "ensure_window.swift").read_text(encoding="utf-8")
+if "listedOnScreen()" in helper_src:
+    raise SystemExit("raise=OK must require window_front, not a window list")
+app = (root.parent / "Sources" / "CatcherApp" / "CatcherApp.swift").read_text(encoding="utf-8")
+if "assumeIsolated" in app:
+    raise SystemExit("harness Timer still calls assumeIsolated")
+if "applicationShouldTerminateAfterLastWindowClosed" not in app:
+    raise SystemExit("harness launch can still quit when the window closes")
 PY
 
 echo "cycle guard ok"

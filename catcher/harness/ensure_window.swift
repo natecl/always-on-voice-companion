@@ -1,5 +1,4 @@
 import AppKit
-import CoreGraphics
 import Foundation
 
 // Raise Catcher's content window before a gate continues.
@@ -7,9 +6,9 @@ import Foundation
 // stdout: raise=OK | raise=NO_PROCESS | raise=NOT_FRONTMOST | raise=NOT_VISIBLE
 //
 // This binary is not Catcher.app, so Screen Recording does not let it list
-// Catcher's windows. Catcher writes <session>/window_front when its own
-// content window is key, on a screen, and the app is active. Frontmost is
-// still read here from NSWorkspace.
+// Catcher's windows. A CG window list is not a pass. Catcher rewrites
+// <session>/window_front while its content window is key, on a screen, and
+// the app is active. Frontmost is still read here from NSWorkspace.
 
 let arguments = CommandLine.arguments
 guard arguments.count == 3, let pid = Int32(arguments[1]) else {
@@ -41,23 +40,6 @@ func frontmost() -> Bool {
     NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
 }
 
-func listedOnScreen() -> Bool {
-    let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-    guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
-        return false
-    }
-    for window in info {
-        let owner = (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value ?? -1
-        let layer = (window[kCGWindowLayer as String] as? NSNumber)?.intValue ?? -1
-        let bounds = window[kCGWindowBounds as String] as? [String: Any]
-        let height = (bounds?["Height"] as? NSNumber)?.doubleValue ?? 0
-        if owner == pid && layer == 0 && height >= 20 {
-            return true
-        }
-    }
-    return false
-}
-
 func stamp() -> String {
     let url = URL(fileURLWithPath: session, isDirectory: true).appendingPathComponent("window_front")
     guard let text = try? String(contentsOf: url, encoding: .utf8) else { return "missing" }
@@ -71,7 +53,6 @@ func stamp() -> String {
 
 func raised() -> Bool {
     guard processAlive(), frontmost() else { return false }
-    if listedOnScreen() { return true }
     return stamp() == "fresh"
 }
 

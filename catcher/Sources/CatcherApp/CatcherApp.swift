@@ -33,37 +33,35 @@ final class HarnessAppDelegate: NSObject, NSApplicationDelegate {
         guard launch.harness, !launch.preflight else { return }
         let root = SessionPaths.root(environment: launch.mergedEnvironment())
         HarnessWindow.present(sessionRoot: root)
-        // `timer` stays in this callback. Moving it into `assumeIsolated` sends
-        // a non-Sendable Timer across the main-actor boundary and the build fails.
-        ticker = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { timer in
-            let stop = MainActor.assumeIsolated {
-                HarnessWindow.noteTick()
-            }
-            if stop {
-                timer.invalidate()
-                return
-            }
-            MainActor.assumeIsolated {
+        // A Timer block is not a MainActor task. Hopping with that assumption
+        // traps, the process exits, and the gate sees raise=NO_PROCESS with
+        // no stamp. This hop does not capture the Timer. It runs until the
+        // gate stops the process.
+        ticker = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
+            Task { @MainActor in
                 HarnessWindow.present(sessionRoot: root)
             }
         }
+    }
+
+    /// SwiftUI quits when the last window closes. A harness gate still needs
+    /// this process after the content window is ordered front.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        let launch = LaunchConfiguration.resolve()
+        return !(launch.harness && !launch.preflight)
     }
 }
 
 /// Orders the content window front and records that it is on screen.
 @MainActor
 enum HarnessWindow {
-    private static var ticks = 0
-
-    /// True when the launch-time raise loop should stop.
-    static func noteTick() -> Bool {
-        ticks += 1
-        return ticks > 60
-    }
-
     static func present(sessionRoot: URL) {
         NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
+        if NSApp.isHidden {
+            NSApp.unhide(nil)
+        }
+        NSApp.activate()
+        NSRunningApplication.current.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
         if contentWindows.isEmpty {
             NSApp.sendAction(Selector(("newWindowForTab:")), to: nil, from: nil)
         }
