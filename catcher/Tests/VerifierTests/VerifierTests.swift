@@ -114,6 +114,7 @@ import Verifier
     _ = await verifier.beginSession(atMs: 0)
     let loud = tone(track: .system, amplitude: 8_000, sampleCount: 80)
     _ = await verifier.observeFrame(loud, atMs: 1_000)
+    _ = await verifier.observeFrame(loud, atMs: 1_000 + AudioFlowCheck.speechHoldMs)
     let tooSoon = await verifier.tick(atMs: 19_000)
     #expect(tooSoon.annotations.isEmpty)
     let flagged = await verifier.tick(atMs: 20_000)
@@ -258,6 +259,104 @@ import Verifier
     if case .degraded = later.snapshot.status {} else {
         Issue.record("expected degraded while speech is flowing, got \(later.snapshot.status)")
     }
+}
+
+@Test func silenceIsMeasuredFromCaptureStartNotSessionOpen() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    _ = await verifier.captureStarted(atMs: 4_000)
+    _ = await verifier.observeFrame(PCMFrame.silence(track: .system, sampleCount: 160, hostTime: 0), atMs: 4_000)
+    _ = await verifier.observeFrame(tone(track: .microphone, amplitude: 600), atMs: 4_000)
+    let early = await verifier.tick(atMs: 13_999)
+    #expect(!early.annotations.contains { $0.kind == "noAudio" })
+    let tripped = await verifier.tick(atMs: 14_000)
+    let noAudio = tripped.annotations.first { $0.kind == "noAudio" }
+    #expect(noAudio?.atMs == 14_000)
+    #expect(text(noAudio).contains("emittedAtMs=14000"))
+    #expect(text(noAudio).contains("observedFromMs=4000"))
+}
+
+@Test func noAudioCarriesTheTimeItActuallyFired() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    _ = await verifier.captureStarted(atMs: 0)
+    _ = await verifier.observeFrame(PCMFrame.silence(track: .system, sampleCount: 160, hostTime: 0), atMs: 0)
+    _ = await verifier.observeFrame(PCMFrame.silence(track: .microphone, sampleCount: 160, hostTime: 0), atMs: 0)
+    // A stalled tick loop: the boundary is still 10s, the emission is not.
+    let late = await verifier.tick(atMs: 25_000)
+    let noAudio = late.annotations.first { $0.kind == "noAudio" }
+    #expect(noAudio?.atMs == 10_000)
+    #expect(text(noAudio).contains("emittedAtMs=25000"))
+}
+
+@Test func noFramesNoAudioStartsAtCaptureStartAndSaysSo() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    _ = await verifier.captureStarted(atMs: 3_000)
+    #expect(await verifier.tick(atMs: 12_999).annotations.isEmpty)
+    let tripped = await verifier.tick(atMs: 13_000)
+    let noAudio = tripped.annotations.first { $0.kind == "noAudio" }
+    #expect(noAudio?.atMs == 13_000)
+    #expect(text(noAudio).hasPrefix("no frames for >10s"))
+}
+
+@Test func syllabicSpeechWithShortDipsIsFlowingNotNoAudio() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    _ = await verifier.captureStarted(atMs: 0)
+    let burst = tone(track: .microphone, amplitude: Int16(0.08 * 32_768))
+    let dip = PCMFrame.silence(track: .microphone, sampleCount: 160, hostTime: 0)
+    let system = PCMFrame.silence(track: .system, sampleCount: 160, hostTime: 0)
+    var annotations: [Annotation] = []
+    var at = 0
+    while at <= 12_000 {
+        // 250 ms at 0.08, then an 80 ms syllable gap. No single burst holds 300 ms.
+        let frame = at % 330 < 250 ? burst : dip
+        annotations += await verifier.observeFrame(frame, atMs: at).annotations
+        annotations += await verifier.observeFrame(system, atMs: at).annotations
+        if at % 1_000 == 0 {
+            annotations += await verifier.tick(atMs: at).annotations
+        }
+        at += 10
+    }
+    #expect(!annotations.contains { $0.kind == "noAudio" })
+    let effect = await verifier.tick(atMs: 12_000)
+    if case .noAudio = effect.snapshot.status {
+        Issue.record("syllabic speech was treated as silence")
+    }
+}
+
+@Test func oneLoudFrameAtATickIsNotAFlowingHeartbeat() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    _ = await verifier.captureStarted(atMs: 0)
+    _ = await verifier.observeEngine(.state(.ready), track: .microphone, atMs: 300, storedCount: 0)
+    _ = await verifier.observeFrame(PCMFrame.silence(track: .system, sampleCount: 160, hostTime: 0), atMs: 0)
+    _ = await verifier.observeFrame(PCMFrame.silence(track: .microphone, sampleCount: 160, hostTime: 0), atMs: 0)
+    _ = await verifier.observeFrame(tone(track: .microphone, amplitude: 12_000), atMs: 8_400)
+    let tick = await verifier.tick(atMs: 8_500)
+    #expect(!tick.annotations.contains { text($0).contains("audio is flowing") })
+}
+
+@Test func thresholdsFileMatchesTheVerifierConstants() throws {
+    // Drift guard for grade.py. Not P evidence.
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("harness/thresholds.json")
+    let object = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
+    let thresholds = try #require(object)
+    #expect((thresholds["verifierRmsFloor"] as? Double).map(Float.init) == AudioFlowCheck.rmsEpsilon)
+    #expect(thresholds["speechHoldMs"] as? Int == AudioFlowCheck.speechHoldMs)
+    #expect(thresholds["speechDipMs"] as? Int == AudioFlowCheck.speechDipMs)
+    #expect(thresholds["silenceLimitMs"] as? Int == AudioFlowCheck.silenceLimitMs)
+    #expect(thresholds["grokEngine"] as? String == EngineFactory.grokModelName)
+}
+
+private func text(_ annotation: Annotation?) -> String {
+    if case .text(let value) = annotation?.detail { return value }
+    return ""
 }
 
 private func tone(track: AudioTrack, amplitude: Int16, sampleCount: Int = 160) -> PCMFrame {

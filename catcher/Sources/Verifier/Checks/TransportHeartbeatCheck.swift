@@ -98,13 +98,13 @@ public struct TransportHeartbeatCheck: Sendable {
             handshakeEmitted = true
             degraded = true
             reason = "no transcript.created within \(Self.handshakeLimitMs)ms"
-            return [Annotation(atMs: connectingSince + Self.handshakeLimitMs, kind: "degraded", detail: .text(reason))]
+            return [Annotation(atMs: connectingSince + Self.handshakeLimitMs, kind: "degraded", detail: .text("\(reason) emittedAtMs=\(atMs)"))]
         }
         if ready, audioFlowing, let lastEventAt, atMs - lastEventAt >= Self.eventLimitMs, !heartbeatEmitted {
             heartbeatEmitted = true
             degraded = true
             reason = "no engine event for \(Self.eventLimitMs)ms while audio is flowing"
-            return [Annotation(atMs: lastEventAt + Self.eventLimitMs, kind: "degraded", detail: .text(reason))]
+            return [Annotation(atMs: lastEventAt + Self.eventLimitMs, kind: "degraded", detail: .text("\(reason) emittedAtMs=\(atMs)"))]
         }
         return []
     }

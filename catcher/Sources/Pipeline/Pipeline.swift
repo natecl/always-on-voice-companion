@@ -189,6 +189,7 @@ public actor Pipeline {
         self.capture = capture
         do {
             try await capture.start()
+            await emit(await verifier.captureStarted(atMs: nowMs()))
             await persist([StageBuilders.captureStart(display: displayID(of: capture), error: nil)])
         } catch {
             await persist([StageBuilders.captureStart(display: displayID(of: capture), error: error)])

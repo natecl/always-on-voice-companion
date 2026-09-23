@@ -37,6 +37,12 @@ public actor Verifier {
         return publish(annotations: [], atMs: atMs)
     }
 
+    /// Call right after capture starts. Silence is measured from here.
+    public func captureStarted(atMs: Int) -> VerifierEffect {
+        audio.captureStarted(atMs: atMs)
+        return publish(annotations: [], atMs: atMs)
+    }
+
     public func endSession() -> VerifierEffect {
         recording = false
         return publish(annotations: [], atMs: 0)
@@ -72,7 +78,7 @@ public actor Verifier {
         guard recording else { return VerifierEffect(snapshot: snapshot, annotations: []) }
         let rms = PCMEnergy.acRMS(frame.data)
         let annotation = audio.observe(track: frame.track, rms: rms, atMs: atMs)
-        sanity.setAudioFlowing(!audio.allSilent && rms > AudioFlowCheck.rmsEpsilon)
+        sanity.setAudioFlowing(audio.audioFlowing)
         return publish(annotations: annotation.map { [$0] } ?? [], atMs: atMs)
     }
 
@@ -104,7 +110,7 @@ public actor Verifier {
         if let audioAnn = audio.tick(atMs: atMs) {
             annotations.append(audioAnn)
         }
-        sanity.setAudioFlowing(!audio.allSilent)
+        sanity.setAudioFlowing(audio.audioFlowing)
         if let sanityAnn = sanity.tick(atMs: atMs) {
             annotations.append(sanityAnn)
         }

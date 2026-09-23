@@ -9,6 +9,9 @@ import AudioCapture
 /// silence clock so `noAudio` landed after the 10s gate (or not at all). The
 /// floor treats that rest energy as silence. Only energy that holds counts as
 /// audio and moves the clock.
+///
+/// Numbers are mirrored in `catcher/harness/thresholds.json`; a test fails if
+/// they drift.
 public struct AudioFlowCheck: Sendable {
     public static let silenceLimitMs = 10_000
     /// About -26 dBFS. Full scale is 1. Resting-mic energy sits under this; the
@@ -16,19 +19,23 @@ public struct AudioFlowCheck: Sendable {
     public static let rmsEpsilon: Float = 0.05
     /// One loud buffer must not push `noAudio` past the harness window.
     public static let speechHoldMs = 300
+    /// Syllable gaps inside speech. Sub-floor frames shorter than this do not
+    /// restart the hold, so syllabic speech still counts as sustained.
+    public static let speechDipMs = 120
 
     public private(set) var noAudio = false
     public private(set) var detail = ""
     public private(set) var allSilent = false
-    /// Latest frame on some track is above the floor. Distinct from `allSilent`,
-    /// which stays false for the whole 10s silence window.
-    public private(set) var audioFlowing = false
+    /// Tracks that have held audio above the floor and are not currently quiet.
+    public private(set) var sustainedTracks: Set<AudioTrack> = []
+    public var audioFlowing: Bool { !sustainedTracks.isEmpty }
     private var seen: Set<String> = []
     private var quietSince: [String: Int] = [:]
     private var silent: Set<String> = []
     private var everLoud: Set<String> = []
     private var above: Set<String> = []
     private var pendingLoudSince: [String: Int] = [:]
+    private var dipSince: [String: Int] = [:]
     private var recordingStartedMs: Int?
     private var trippedAtMs: Int?
 
@@ -38,13 +45,14 @@ public struct AudioFlowCheck: Sendable {
         noAudio = false
         detail = ""
         allSilent = false
-        audioFlowing = false
+        sustainedTracks = []
         seen = []
         quietSince = [:]
         silent = []
         everLoud = []
         above = []
         pendingLoudSince = [:]
+        dipSince = [:]
         recordingStartedMs = nil
         trippedAtMs = nil
     }
@@ -54,6 +62,13 @@ public struct AudioFlowCheck: Sendable {
         recordingStartedMs = atMs
     }
 
+    /// Capture is delivering (or about to deliver) frames. The never-loud and
+    /// no-frames silence clocks start here, not at session open: the launch
+    /// probe and engine setup run in between and nothing is observed then.
+    public mutating func captureStarted(atMs: Int) {
+        begin(atMs: atMs)
+    }
+
     @discardableResult
     public mutating func observe(track: AudioTrack, rms: Float, atMs: Int) -> Annotation? {
         let key = track.rawValue
@@ -61,36 +76,55 @@ public struct AudioFlowCheck: Sendable {
         if rms > Self.rmsEpsilon {
             above.insert(key)
             silent.remove(key)
-            if pendingLoudSince[key] == nil {
-                pendingLoudSince[key] = atMs
-            }
-            if let started = pendingLoudSince[key], atMs - started >= Self.speechHoldMs {
+            dipSince[key] = nil
+            let started = pendingLoudSince[key] ?? atMs
+            pendingLoudSince[key] = started
+            if atMs - started >= Self.speechHoldMs {
                 everLoud.insert(key)
                 quietSince[key] = nil
             }
         } else {
-            pendingLoudSince[key] = nil
             above.remove(key)
-            if quietSince[key] == nil {
-                // Never-sustained audio is quiet from the session start. Dating
-                // silence from the first frame, or from a one-buffer spike,
-                // pushes noAudio past the 10s gate.
-                quietSince[key] = everLoud.contains(key) ? atMs : (recordingStartedMs ?? atMs)
+            if dipSince[key] == nil {
+                dipSince[key] = atMs
             }
-            if let since = quietSince[key], atMs - since >= Self.silenceLimitMs {
-                silent.insert(key)
-            }
+            settle(key, atMs: atMs)
         }
-        audioFlowing = !above.isEmpty
+        refreshFlow()
         return evaluate(atMs: atMs)
     }
 
     @discardableResult
     public mutating func tick(atMs: Int) -> Annotation? {
-        for (track, since) in quietSince where !above.contains(track) && atMs - since >= Self.silenceLimitMs {
-            silent.insert(track)
+        for key in seen {
+            settle(key, atMs: atMs)
         }
+        refreshFlow()
         return evaluate(atMs: atMs)
+    }
+
+    /// A sub-floor run shorter than `speechDipMs` inside a pending burst is a
+    /// syllable gap. Longer, the burst is over and the track is quiet: from
+    /// the dip for a track that held speech, from capture start for one that
+    /// never did (a one-buffer spike must not move the clock).
+    private mutating func settle(_ key: String, atMs: Int) {
+        guard !above.contains(key), let dipStart = dipSince[key] else { return }
+        if pendingLoudSince[key] != nil {
+            guard atMs - dipStart >= Self.speechDipMs else { return }
+            pendingLoudSince[key] = nil
+        }
+        if quietSince[key] == nil {
+            quietSince[key] = everLoud.contains(key) ? dipStart : (recordingStartedMs ?? dipStart)
+        }
+        if let since = quietSince[key], atMs - since >= Self.silenceLimitMs {
+            silent.insert(key)
+        }
+    }
+
+    private mutating func refreshFlow() {
+        sustainedTracks = Set(AudioTrack.allCases.filter { track in
+            everLoud.contains(track.rawValue) && quietSince[track.rawValue] == nil
+        })
     }
 
     private mutating func evaluate(atMs: Int) -> Annotation? {
@@ -122,6 +156,9 @@ public struct AudioFlowCheck: Sendable {
         noAudio = true
         guard trippedAtMs == nil else { return nil }
         trippedAtMs = when
-        return Annotation(atMs: when, kind: "noAudio", detail: .text(detail))
+        // `atMs` is the silence boundary. The grader needs the time the
+        // detector actually fired and where observation began to prove it.
+        let stamped = "\(detail) emittedAtMs=\(atMs) observedFromMs=\(recordingStartedMs ?? 0)"
+        return Annotation(atMs: when, kind: "noAudio", detail: .text(stamped))
     }
 }
