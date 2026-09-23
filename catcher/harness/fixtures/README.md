@@ -1,6 +1,6 @@
-`known-60s.ref.txt` is the P1 word-error-rate target. Do not edit it to match a recording.
+`known-60s.ref.txt` is the P1 word-error-rate target. The wav speaks the passage three times, and the ref is three copies of that passage, in order, for WER.
 
-`known-60s.wav` is a 16 kHz mono PCM16 reading of that text (59.99 s). It replaced the quiet tone loop, git blob `62faa201cfec9ccde054d907eccb34ea9615fc18`. Periods were added between the reference lines so the synthesizer could pause; they are not extra words. One clear pass is about 18.6 s, so the passage is spoken three times and the file stops, which fills the minute with no silent gap over two seconds.
+`known-60s.wav` is a 16 kHz mono PCM16 file (59.99 s) that speaks the passage three times. It replaced the quiet tone loop, git blob `62faa201cfec9ccde054d907eccb34ea9615fc18`. Periods were added between the reference lines so the synthesizer could pause; they are not extra words. One clear pass is about 18.6 s, so three readings fill the minute with no silent gap over two seconds.
 
 Generated with Piper 1.8.0, voice `en_US-lessac-medium`:
 
