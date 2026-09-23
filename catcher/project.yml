@@ -1,0 +1,59 @@
+name: CatcherApp
+options:
+  bundleIdPrefix: com.catcher
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+packages:
+  Catcher:
+    path: .
+targets:
+  CatcherApp:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/CatcherApp
+        excludes:
+          - Info.plist
+          - Catcher.entitlements
+    dependencies:
+      - package: Catcher
+        product: Pipeline
+      - package: Catcher
+        product: Verifier
+      - package: Catcher
+        product: SessionStore
+      - package: Catcher
+        product: AudioCapture
+      - package: Catcher
+        product: TranscriptionEngine
+      - package: Catcher
+        product: GrokEngine
+      - package: Catcher
+        product: Diagnostics
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.catcher.app
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Sources/CatcherApp/Info.plist
+        MARKETING_VERSION: "0.0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        # build-app.sh overrides this with `git rev-parse HEAD` (+ -dirty).
+        # The grader rejects `unknown` and `-dirty` as provenance.
+        CATCHER_GIT_SHA: unknown
+        SWIFT_VERSION: "6.0"
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        # Manual identity. Automatic with no team becomes ad-hoc, and TCC then
+        # keys the grant to the cdhash, which changes on every rebuild.
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Catcher Development"
+        CODE_SIGNING_REQUIRED: YES
+        CODE_SIGNING_ALLOWED: YES
+        CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+        # Hardened runtime without com.apple.security.device.audio-input means
+        # TCC never opens a microphone case for the app: no Allow, no row in the
+        # Microphone pane, and authorizationStatus is not a grant.
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_ENTITLEMENTS: Sources/CatcherApp/Catcher.entitlements
+        OTHER_CODE_SIGN_FLAGS: "--timestamp=none"
+        COMBINE_HIDPI_IMAGES: YES

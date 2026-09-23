@@ -1,0 +1,30 @@
+name: catcher
+
+on:
+  push:
+    paths:
+      - "catcher/**"
+      - ".github/workflows/catcher-ci.yml"
+  pull_request:
+    paths:
+      - "catcher/**"
+      - ".github/workflows/catcher-ci.yml"
+
+jobs:
+  # Tier L regression only. No display, TCC, audio, or pf: these jobs cannot
+  # run P1–P6 and their results are never gate evidence.
+  library-tests-not-p1-p6:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test library targets (not P1–P6)
+        working-directory: catcher
+        run: |
+          swift build
+          swift test
+  harness-grader:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Grader logic on synthetic sessions (not P1–P6)
+        run: python3 -m unittest discover -s catcher/harness/tests -v

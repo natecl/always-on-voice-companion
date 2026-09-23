@@ -1,6 +1,6 @@
 # Transcription engine — 2026-09-22
 
-**Decision (Nathan's pick): Grok Voice Transcribe 2.0 for v0.** Chosen over the AssemblyAI-first recommendation on the strength of free diarization. Still to be validated by a bake-off harness on real audio before it's the locked default.
+**Decision (Nathan's pick): Grok Voice Transcribe 2.0 is the v0 engine and passed P1–P6 on the Mac** ([09-v0-shipped.md](09-v0-shipped.md), hardened GREEN `b14e31a`, CDHash `57250034b55e54e3ad6798983edf6e62c1553653`, board `/tmp/catcher-auto/b14e31a-20260923-055848/board.json`). P4 passing does not prove system audio was captured; that proof is P1. `MicrophoneGain` on the mic path (floor 0.05 unchanged) is why held speech clears median ≥ 0.1000 (P6 p50 0.2039, micGainMax 16). Chosen over the AssemblyAI-first recommendation on the strength of free diarization. It is not the locked default until the bake-off.
 
 ## Why Grok 2.0
 - Released Sep 18, 2026 — four days old at pick time.

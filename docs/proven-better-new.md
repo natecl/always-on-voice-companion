@@ -41,7 +41,8 @@ copy the mechanics at pixel level. Zero innovation budget, zero testing budget h
 **Better — kill all friction.**
 No bot to invite, no setup dance, just on. Near-zero latency responses (Pincus and Tan put
 zero-latency in *better*, not new — everyone says yes to it). Consumer-cheap via Jev
-judgment instead of frontier-model spend.
+judgment instead of frontier-model spend. Loud capture — never a silent blank session —
+is in the hardened GREEN grade at `b14e31a` ([09-v0-shipped.md](knowledge/09-v0-shipped.md)).
 
 **New — the always-listening voice buddy.**
 The AI as a smart other person at the table: you turn to it mid-conversation and ask its
@@ -54,6 +55,13 @@ the listening surface, and the context depth independently.
 
 1. Can Jev judge utterances (commitment / deadline / decision / interrupt-worthy) with
    useful calibration? (Afternoon spike on real transcripts — before any build.)
-2. Is the 2-second judgment brief the heat? (v0 — the catcher.)
+2a. Can we capture reliably and loudly? Hardened GREEN at `b14e31a`
+   (`b14e31a99a431e5cac6a49669f5c1955de38a1d1`), CDHash
+   `57250034b55e54e3ad6798983edf6e62c1553653`, board
+   `/tmp/catcher-auto/b14e31a-20260923-055848/board.json`. Preflight and P1–P6
+   pass under the hardened verifier (soft-pass killed). `MicrophoneGain` on the
+   mic path; floor 0.05 unchanged; P6 p50 0.2039, micGainMax 16.
+   ([09-v0-shipped.md](knowledge/09-v0-shipped.md).) The cite is the grade, not a merge.
+2b. Is the 2-second judgment brief the heat? (v0 catcher, next.)
 3. Does live mid-conversation participation earn the turn-to-it behavior? (v1.)
 4. Does proactive interjection delight or annoy? (v2 — the buddy.)
