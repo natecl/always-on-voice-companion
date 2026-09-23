@@ -47,6 +47,10 @@ let package = Package(
                 "Diagnostics",
             ]
         ),
+        .target(
+            name: "Brief",
+            dependencies: ["SessionStore"]
+        ),
         .testTarget(
             name: "AudioCaptureTests",
             dependencies: ["AudioCapture"]
@@ -74,6 +78,10 @@ let package = Package(
         .testTarget(
             name: "DiagnosticsTests",
             dependencies: ["Diagnostics"]
+        ),
+        .testTarget(
+            name: "BriefTests",
+            dependencies: ["Brief"]
         ),
     ]
 )

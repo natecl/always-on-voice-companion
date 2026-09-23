@@ -34,7 +34,7 @@ Stage diagnostics (`stages.log`, `trace.py`) grade nothing. Read [qa/v0-diagnost
 
 ## v1 Phase 3 — notes after stop (planned)
 
-Bar **B3**: shareable notes ≤ 30 s after stop. Plan: [plans/v1-phase3-brief.md](plans/v1-phase3-brief.md). No code exists for these rows. Owner paths are proposed. `PLANNED` means no code and no Mac run. A row moves to GREEN only when a B3 `grade.json` `pass` and a v0 `v0-verdict.json` `GREEN` share one SHA and CDHash (plan section 5). The v0 rows above do not change for this phase.
+Bar **B3**: shareable notes ≤ 30 s after stop. Plan: [plans/v1-phase3-brief.md](plans/v1-phase3-brief.md). Slice 1 is in the tree and ungraded: the `Brief` library (model, input, validator, renderer, stub engine, launch policy) and `catcher/harness/fixtures/known-60min.events.jsonl`. No Grok client, runner, app UI, or B3 harness yet. These rows stay `PLANNED`. A row moves to GREEN only when a B3 `grade.json` `pass` and a v0 `v0-verdict.json` `GREEN` share one SHA and CDHash (plan section 5). The v0 rows above do not change for this phase.
 
 | Surface | Owner (proposed) | Prove | Gate | Status |
 |---|---|---|---|---|
