@@ -33,28 +33,49 @@ launch_catcher "$SESSION" 1
 (while afplay "$ROOT/fixtures/known-60s.wav"; do :; done) &
 PLAYER=$!
 sleep 5
-IPS="$( { dig +short api.x.ai A; dig +short api.x.ai AAAA; } | tr '\n' ' ')"
+PID="$(cat "$SESSION/catcher.pid")"
+# The app's open sockets may sit on an address this dig does not return, so
+# their peers go in the table too. dig can print CNAME names; keep literals.
+IPS="$(
+  {
+    dig +short api.x.ai A || true
+    dig +short api.x.ai AAAA || true
+    lsof -nP -a -p "$PID" -iTCP:443 -sTCP:ESTABLISHED -Fn 2>/dev/null \
+      | sed -nE 's/^n.*->\[?([0-9A-Fa-f:.]+)\]?:443$/\1/p' || true
+  } | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f]*:[0-9A-Fa-f:]*$' | sort -u | tr '\n' ' ' || true
+)"
 if [[ -z "${IPS// /}" ]]; then
-  echo "dig did not resolve api.x.ai" >&2
+  echo "No address for api.x.ai (dig and the app's open sockets)" >&2
   exit 1
 fi
 RULE="$(mktemp)"
+# Both directions. With only outbound dropped, server frames already in
+# flight kept landing after pfOn and pushed the engine's inbound-stall clock
+# (and so degraded and the gap start) seconds past the block start.
 {
   echo "table <catcher_xai> { $IPS }"
-  echo "block drop out proto tcp from any to <catcher_xai> port 443"
+  echo "block drop out quick proto { tcp udp } from any to <catcher_xai> port 443"
+  echo "block drop in quick proto { tcp udp } from <catcher_xai> port 443 to any"
 } > "$RULE"
 pfctl -a catcher -f "$RULE"
-# pf passes a packet that matches an existing state without reading the rule.
-# Drop the open sockets' states so the block takes them at pfOn, not whenever
-# they next reconnect.
-for ip in $IPS; do
-  pfctl -k 0.0.0.0/0 -k "$ip" >/dev/null 2>&1 || true
-  pfctl -k ::/0 -k "$ip" >/dev/null 2>&1 || true
-done
 append_harness_field "$SESSION" pfOnWallMs "$(wall_ms)"
+# pf passes a packet that matches an existing state without reading the rule.
+# Kill any such states. These run alongside the window, not before pfOn: the
+# rule is live once -f returns, and a slow pfctl here would stamp pfOn after
+# a degrade it caused.
+KILLS=()
+for ip in $IPS; do
+  if [[ "$ip" == *:* ]]; then any="::/0"; else any="0.0.0.0/0"; fi
+  pfctl -k "$any" -k "$ip" >/dev/null 2>&1 &
+  KILLS+=("$!")
+done
 sleep 15
-pfctl -a catcher -F all || true
+wait "${KILLS[@]}" 2>/dev/null || true
+# Rules first, then stamp: -F all clears rules before its slower steps, so a
+# stamp after it lands seconds after traffic can flow again.
+pfctl -a catcher -F rules >/dev/null 2>&1 || true
 append_harness_field "$SESSION" pfOffWallMs "$(wall_ms)"
+pfctl -a catcher -F all >/dev/null 2>&1 || true
 echo "Network restored. Waiting for the system resume grade.py will grade."
 TARGET="$(resolve_session "$SESSION")"
 NEED="$(python3 - "$TARGET" "$ROOT" "$SESSION/harness_run.json" <<'PY'
@@ -115,7 +136,6 @@ if [[ "$NEED" == "0" ]]; then
 else
   echo "Recorded through system:tail (need end >= ${NEED})."
 fi
-PID="$(cat "$SESSION/catcher.pid")"
 kill "$PID" || true
 # stopAfterLiveTail keeps recording up to 30s when the signal lands before the
 # floor. Grade after exit so the end row is the post-hold stamp.
