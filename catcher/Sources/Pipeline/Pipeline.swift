@@ -111,6 +111,12 @@ public actor Pipeline {
     /// shutdown keeps the session live until the host clock reaches this.
     private var systemTailFloorMs: Int?
     private let liveTailFloor: LiveTailFloor
+    #if canImport(Darwin)
+    /// App Nap coalesces a background app's timers by seconds. The engine's
+    /// inbound-stall watchdog and the heartbeat tick are timers, so a napped
+    /// session wrote its network-loss degrade and gap start late.
+    private var noNap: (any NSObjectProtocol)?
+    #endif
 
     public init(
         sessionRoot: URL = SessionPaths.root(),
@@ -169,6 +175,7 @@ public actor Pipeline {
         await ledger.reset()
         origin = clock.now()
         SessionClockAnchor.reset(to: origin)
+        holdOffAppNap()
         let id = UUID()
         let directory = SessionPaths.directory(id: id, root: sessionRoot)
         do {
@@ -644,8 +651,28 @@ public actor Pipeline {
         }
         ended = true
         sessionOpen = false
+        releaseAppNap()
         await emit(await verifier.endSession())
         await emitTraceIfNeeded(fallback: traceError)
+    }
+
+    private func holdOffAppNap() {
+        #if canImport(Darwin)
+        guard noNap == nil else { return }
+        noNap = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
+            reason: "Recording and transcribing"
+        )
+        #endif
+    }
+
+    private func releaseAppNap() {
+        #if canImport(Darwin)
+        if let noNap {
+            ProcessInfo.processInfo.endActivity(noNap)
+        }
+        noNap = nil
+        #endif
     }
 
     private func failClosed(_ message: String, traceError: String? = nil) async {
