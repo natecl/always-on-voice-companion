@@ -31,3 +31,19 @@ Re-run that gate on a Mac. Copy the short SHA, CDHash, and board path into that 
 ## How to read a red row
 
 Stage diagnostics (`stages.log`, `trace.py`) grade nothing. Read [qa/v0-diagnostics.md](qa/v0-diagnostics.md) for the first failure, then the gate definition in [qa/v0-grading.md](qa/v0-grading.md).
+
+## v1 Phase 3 — notes after stop (planned)
+
+Bar **B3**: shareable notes ≤ 30 s after stop. Plan: [plans/v1-phase3-brief.md](plans/v1-phase3-brief.md). No code exists for these rows. Owner paths are proposed. `PLANNED` means no code and no Mac run. A row moves to GREEN only when a B3 `grade.json` `pass` and a v0 `v0-verdict.json` `GREEN` share one SHA and CDHash (plan section 5). The v0 rows above do not change for this phase.
+
+| Surface | Owner (proposed) | Prove | Gate | Status |
+|---|---|---|---|---|
+| Session end → brief trigger (consumes Phase 1 `SessionEnded`; temporary adapter until Phase 1 lands) | `catcher/Sources/Brief/BriefRunner.swift`; `catcher/Sources/Brief/SessionEnded.swift`; `catcher/Sources/CatcherApp/CatcherApp.swift` (`toggle` call site) | `./catcher/harness/run.sh b3 <dir>` | B3 | PLANNED |
+| Notes engine behind `NotesEngine` (xAI chat, structured output; stub for Tier L only) | `catcher/Sources/Brief/NotesEngine.swift`; `catcher/Sources/Brief/GrokNotesEngine.swift`; `catcher/Sources/Brief/StubNotesEngine.swift`; `catcher/Sources/Brief/NotesEngineFactory.swift` | `run.sh b3 <dir>` (stub engine is `fail`) | B3 (`engine`) | PLANNED |
+| Summary blocks + transcript citations (`brief.json`, schema `catcher.brief/1`) | `catcher/Sources/Brief/BriefModel.swift`; `catcher/Sources/Brief/BriefInput.swift`; `catcher/Sources/Brief/BriefPrompt.swift`; `catcher/Sources/Brief/BriefValidator.swift` | `run.sh b3 <dir>` | B3 (`schema`, `cites`) | PLANNED |
+| Shareable export (`brief.md` on disk; Markdown + HTML clipboard) | `catcher/Sources/Brief/BriefRenderer.swift`; `catcher/Sources/Brief/BriefWriter.swift`; `catcher/Sources/CatcherApp/Clipboard.swift` | `run.sh b3 <dir>` (`cua-driver` clicks `copyNotesButton`) | B3 (`shareable`, `copy`) | PLANNED |
+| Notes panel (writing / ready / failed + Retry / skipped; Copy notes, per-block copy) | `catcher/Sources/CatcherApp/Views/NotesView.swift`; `catcher/Sources/CatcherApp/Views/SessionListView.swift` | `run.sh b3 <dir>` | B3 | PLANNED |
+| Stop → notes ≤ 30 s (live 3 × 60 s sessions + 60-min transcript brief stage) | `catcher/Sources/Brief/BriefRunner.swift` (budget, retry); `catcher/Sources/BriefBench/main.swift`; `catcher/harness/b3_brief.sh`; `catcher/harness/b3_grade.py` | `run.sh b3 <dir>` | B3 (`latency`, `long`) | PLANNED |
+| Brief never mutates v0 artifacts (`events.jsonl`, `session.json`, `transcript.txt`) | `catcher/Sources/Brief/BriefWriter.swift`; `catcher/Sources/Brief/BriefPaths.swift` | `run.sh b3 <dir>` and `run.sh verdict` on the same SHA | B3 (`untouched`), v0 verdict | PLANNED |
+| Notes for recovered sessions (manual **Make notes**) | `catcher/Sources/CatcherApp/Views/NotesView.swift`; `catcher/Sources/Brief/BriefRunner.swift` | manual, not graded | — | PLANNED |
+| Cost footnote slot (`brief.json` `usage`, `cost: null`) | Phase 2 | — | — | OUT (Phase 2 names it; Phase 3 records `usage` only) |
