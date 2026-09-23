@@ -1,8 +1,12 @@
 import Foundation
 
 /// Deterministic notes for Tier L tests. A stub result cannot prove B3.
-public struct StubNotesEngine: NotesEngine {
+public struct StubNotesEngine: NotesEngine, Sendable {
     public init() {}
+
+    public var label: BriefEngineInfo {
+        BriefEngineInfo(name: "stub", model: "stub")
+    }
 
     public func write(_ input: BriefInput, timeout: Duration) async throws -> NotesDraft {
         _ = timeout

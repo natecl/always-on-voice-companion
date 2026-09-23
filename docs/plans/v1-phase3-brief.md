@@ -153,7 +153,7 @@ t0 is `stopRequestedWallMs`: the moment the user stops, taken before `pipeline.s
 | **Total** | **≈ 17 s** | **30 s** | About 13 s of headroom at p95. |
 
 Engine choices that keep this cheap and fast:
-- **Model:** xAI chat completions (`https://api.x.ai/v1/chat/completions`) with the existing `XAI_API_KEY`. This adds no new secret or vendor, and preflight already checks that key's reach and auth. Use a fast non-reasoning Grok model with structured output (`response_format` JSON schema) at temperature 0.2. IMPLEMENT pins the model id in `catcher/harness/thresholds.json` (`briefModel`) and records it in `brief.json`. Before pinning, it runs a small bake-off of up to 3 candidate ids on the 60-min transcript and picks the fastest one that passes the validator 5/5.
+- **Model:** xAI chat completions (`https://api.x.ai/v1/chat/completions`) with the existing `XAI_API_KEY`. This adds no new secret or vendor, and preflight already checks that key's reach and auth. Use a fast non-reasoning Grok model with structured output (`response_format` JSON schema) at temperature 0.2. IMPLEMENT pins `briefModel` and records it in `brief.json`. Before pinning, it runs a small bake-off of up to 3 candidate ids on the 60-min transcript and picks the fastest one that passes the validator 5/5. This climb pins the id on `NotesService.briefModel` and leaves v0 `thresholds.json` untouched.
 - **No streaming in v1.** B3 grades total time, and whole-JSON parsing keeps the copy format reliable. Streaming blocks into the UI is a follow-up for perceived speed.
 - **Long sessions:** single call up to 60k input tokens (≈ 5 h). Above that, map chunks of ≈ 30k tokens in parallel, then run one reduce call. B3 measures up to 60 min; the chunked path gets unit tests only.
 - **Cost:** order of 12k input + 0.8k output tokens per meeting hour, which is cheap enough to leave on. Phase 3 records `usage` only; pricing is Phase 2's.
@@ -299,9 +299,21 @@ Build order (one change per Mac QA cycle, per L2):
 2. **Footer on.** `BriefContract.footer` is `Notes by Catcher`. The copy renderer includes it by default.
 3. **Caveats out of the copy.** They live on `BriefInput.caveats` and `brief.json`. Markdown and HTML omit them.
 4. **Recovered sessions are manual.** `BriefLaunchPolicy.runMode(recoveredAtLaunch:)` is `.manual` for a launch recovery. No auto-run.
-5. **Vendor is xAI.** `NotesService.completionsURL` is `https://api.x.ai/v1/chat/completions`, key `XAI_API_KEY`. No new secret. The HTTP client is a later slice.
+5. **Vendor is xAI.** `NotesService.completionsURL` is `https://api.x.ai/v1/chat/completions`, key `XAI_API_KEY`. No new secret. `GrokNotesEngine` is that client. `briefModel` is pinned on `NotesService`, not in v0 `thresholds.json`.
 
-`BriefLaunchPolicy.notesEnabled` is false when `CATCHER_HARNESS=1` unless `CATCHER_BRIEF=1`. The app does not call it yet. Slice 4 wires it, so v0 gates stay on today's path.
+`BriefLaunchPolicy.notesEnabled` is false when `CATCHER_HARNESS=1` unless `CATCHER_BRIEF=1`. The app does not call it yet. Slice 4 wires it, so v0 gates stay on today's path. `brief-bench` also refuses to run unless `CATCHER_BRIEF=1`.
+
+### Bake-off status (slice 2)
+
+Candidates, at most three:
+
+1. `grok-4.20-0309-non-reasoning` — pinned on `NotesService.briefModel`. It is the only model on the xAI price list (2026-09-23) documented as non-reasoning.
+2. `grok-4-fast-non-reasoning` — not called. The current docs alias this name to reasoning `grok-4.3`.
+3. `grok-4-1-fast-non-reasoning` — not called, for the same reason.
+
+A live 5× timing run did not happen: this environment has no `XAI_API_KEY`. `brief-bench bake` exits `missingAPIKey`. With a key: `CATCHER_BRIEF=1 brief-bench bake catcher/harness/fixtures/known-60min.events.jsonl --out <dir> --runs 5`. The selector keeps the fastest model that passes the validator on every run, and drops a response whose model id is `grok-4.3` or otherwise reasoning.
+
+A stub-engine pass of the same fixture on this Linux VM (not B3 evidence) reported stage times of read 62 ms, request 4 ms, validate 1 ms, write 36 ms, total 103 ms. The fixture file was not modified.
 
 ## 10. Done-check for this plan's IMPLEMENT climb
 

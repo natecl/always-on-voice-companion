@@ -51,6 +51,10 @@ let package = Package(
             name: "Brief",
             dependencies: ["SessionStore"]
         ),
+        .executableTarget(
+            name: "BriefBench",
+            dependencies: ["Brief"]
+        ),
         .testTarget(
             name: "AudioCaptureTests",
             dependencies: ["AudioCapture"]

@@ -31,6 +31,9 @@ import Testing
     #expect(NotesService.outputTokenCap == 1_200)
     #expect(NotesService.requestTimeoutSeconds == 22)
     #expect(NotesService.retryCutoffSeconds == 10)
+    #expect(NotesService.briefModel == "grok-4.20-0309-non-reasoning")
+    #expect(BriefBakeOff.candidates.count == 3)
+    #expect(BriefBakeOff.candidates[0] == NotesService.briefModel)
 }
 
 @Test func inputLinesUseSeqMeThemAndClock() throws {
