@@ -287,7 +287,7 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
     /// yield — so the session only kept the verifier's heartbeat `degraded`
     /// and never wrote `gap` or `streaming`. The scripted transport's `close()`
     /// returns immediately, which is why that handshake test still passed.
-    private func socketDied(code: Int, reason: String) {
+    private func socketDied(code: Int, reason: String, extra: [Field] = []) {
         guard hasBeenReady, !finishRequested, recovery == nil else { return }
         ready = false
         socketGeneration += 1
@@ -312,7 +312,7 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
             Field("attempt", String(attempt)),
             Field("code", String(code)),
             Field("reason", reason),
-        ])
+        ] + extra)
         recovery = Task.detached {
             await self.reconnect(code: code, reason: reason, announced: true, prepared: true)
         }
@@ -435,7 +435,7 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
             kind: .stage,
             name: "reconnect",
             verdict: Verdict.ok.rawValue,
-            fields: fields
+            fields: fields + [Field("atMs", String(currentMs()))]
         )
         if let stageSink {
             stageSink.write(line, fsync: true)
@@ -863,6 +863,17 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
         watchdog = Task { await self.watchInbound(stall) }
     }
 
+    /// Wall time since the last server message, and bytes sitting in a send
+    /// that has not returned. Both land on the `STAGE reconnect` line when the
+    /// stall watchdog is what declared the socket dead.
+    private func stallFields() -> [Field] {
+        let sinceMs = Int((Date().timeIntervalSince(lastInbound) * 1000).rounded())
+        return [
+            Field("sinceInboundMs", String(sinceMs)),
+            Field("inFlight", String(inFlight.count)),
+        ]
+    }
+
     /// `send` can return while the packets sit in the kernel, or it can sit
     /// forever on the one in-flight chunk. Either way `receive` does not return.
     /// A server message sets the watermark to every byte `send` has already
@@ -882,13 +893,13 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
             // that window and nothing started reconnect.
             if Task.isCancelled || finishRequested || generation != socketGeneration { return }
             if !ready {
-                socketDied(code: 1006, reason: "inbound stall")
+                socketDied(code: 1006, reason: "inbound stall", extra: stallFields())
                 return
             }
             let outstanding = bytesSent > bytesAtLastInbound || !inFlight.isEmpty
             if !outstanding { continue }
             if Date().timeIntervalSince(lastInbound) >= limit {
-                socketDied(code: 1006, reason: "inbound stall")
+                socketDied(code: 1006, reason: "inbound stall", extra: stallFields())
                 return
             }
         }

@@ -60,9 +60,20 @@ public final class URLSessionGrokTransport: GrokTransport, @unchecked Sendable {
     /// Task and closed live in this lock. `withLock` is synchronous, so the
     /// critical section cannot span an `await`.
     private let state = OSAllocatedUnfairLock(initialState: State())
+    /// `resume` / `send` / `receive` can block inside URLSession while `pf`
+    /// drops the socket. Calling them on a Swift concurrency thread parks the
+    /// cooperative pool, so the inbound-stall watchdog never runs and no
+    /// `degraded` or `gap` is written for the block. These queues are GCD.
+    private let ioQueue: DispatchQueue
+    /// `cancel()` can block for the whole drop. It must not share the io
+    /// queue, or the next socket's `resume` waits behind it.
+    private let teardownQueue: DispatchQueue
 
     public init(session: URLSession = URLSession(configuration: .default)) {
         self.session = session
+        let id = UUID().uuidString
+        ioQueue = DispatchQueue(label: "com.catcher.grok.ws.io.\(id)")
+        teardownQueue = DispatchQueue(label: "com.catcher.grok.ws.teardown.\(id)")
     }
 
     public func connect(url: URL, authorizationBearer: String) async throws {
@@ -75,9 +86,9 @@ public final class URLSessionGrokTransport: GrokTransport, @unchecked Sendable {
             return true
         }
         if stored {
-            task.resume()
+            ioQueue.async { task.resume() }
         } else {
-            task.cancel()
+            teardownQueue.async { task.cancel() }
         }
     }
 
@@ -103,11 +114,13 @@ public final class URLSessionGrokTransport: GrokTransport, @unchecked Sendable {
                     continuation.resume(throwing: EngineError.socket("websocket is not connected"))
                     return
                 }
-                task.send(message) { [weak self] error in
-                    if let error {
-                        self?.completeSend(id, .failure(error))
-                    } else {
-                        self?.completeSend(id, .success(()))
+                self.ioQueue.async {
+                    task.send(message) { [weak self] error in
+                        if let error {
+                            self?.completeSend(id, .failure(error))
+                        } else {
+                            self?.completeSend(id, .success(()))
+                        }
                     }
                 }
             }
@@ -135,9 +148,11 @@ public final class URLSessionGrokTransport: GrokTransport, @unchecked Sendable {
                     continuation.resume(returning: .closed(code: 1006, reason: "websocket is not connected"))
                     return
                 }
-                task.receive { [weak self] result in
-                    guard let self else { return }
-                    self.completeReceive(id, self.event(from: result))
+                self.ioQueue.async {
+                    task.receive { [weak self] result in
+                        guard let self else { return }
+                        self.completeReceive(id, self.event(from: result))
+                    }
                 }
             }
         } onCancel: {
@@ -167,10 +182,10 @@ public final class URLSessionGrokTransport: GrokTransport, @unchecked Sendable {
             return (task, receives, sends)
         }
         // A custom session deallocated with a task still inside the dropped
-        // handshake can crash. Keep it alive across the detached cancel.
+        // handshake can crash. Keep it alive across the queued cancel.
         SessionHold.shared.keep(session)
         let teardown = SocketTeardown(task: taken.0, receives: taken.1, sends: taken.2)
-        Task.detached {
+        teardownQueue.async {
             teardown.run()
         }
     }

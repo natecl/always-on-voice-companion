@@ -364,6 +364,65 @@ func hungReplaySendStillEmitsTheGapOnTheNextSocket(profile: TransportProfile) as
 }
 
 @Test(arguments: TransportProfile.allCases)
+func pfWindowChainOnAHealthyRuntime(profile: TransportProfile) async throws {
+    // A pf block drops the SYN and never delivers a close. The stall watchdog
+    // (wall time) is the only detector. Session time stays at the death until
+    // backoff sleeps, so the gap must open there and close only once a socket
+    // is allowed to finish the handshake at pfOff.
+    let pfOn = 0
+    let pfOff = 15_000
+    let probe = PfClockProbe()
+    let rig = ReconnectRig(
+        profile: profile,
+        inboundStall: .milliseconds(80),
+        handshakeTimeout: .milliseconds(200)
+    ) { index, socket in
+        // The live socket is already up. Hanging it would skip the drop.
+        if index == 0 { return }
+        if probe.ms() < pfOff {
+            socket.hangConnect = true
+            socket.hangClose = true
+            socket.wakeReceiveOnClose = false
+            socket.ignoreReceiveCancel = true
+        } else {
+            socket.push(created)
+            socket.push(.text(partial(text: "back", start: 0.0, duration: 0.1, isFinal: true, speechFinal: true)))
+        }
+    }
+    probe.ms = { rig.clock.ms }
+
+    var iterator = rig.engine.events.makeAsyncIterator()
+    let first = try await rig.connected()
+    try await rig.engine.send(PCMFrame(track: .system, data: Data(count: 3_200), hostTime: 0))
+    try await waitUntil { first.binaryCount == 1 }
+
+    var sawDegraded = false
+    var gapFrom = -1
+    var gapTo = -1
+    var resumed = false
+    for _ in 0..<40 {
+        guard let event = await iterator.next() else { break }
+        if case .state(.degraded) = event { sawDegraded = true }
+        if case .gap(let from, let to) = event, sawDegraded {
+            gapFrom = from
+            gapTo = to
+        }
+        if case .state(.streaming) = event, gapFrom >= 0 {
+            resumed = true
+            break
+        }
+    }
+    #expect(sawDegraded)
+    // Death is the stall at pfOn. A later retry must not move the open.
+    #expect(gapFrom == pfOn)
+    #expect(gapFrom < pfOff)
+    #expect(gapTo >= pfOff)
+    #expect(resumed)
+    await rig.engine.finish()
+    rig.releaseAll()
+}
+
+@Test(arguments: TransportProfile.allCases)
 func stalledSocketReconnectsReplaysAudioAndEmitsAGap(profile: TransportProfile) async throws {
     let rig = ReconnectRig(profile: profile, inboundStall: .milliseconds(80)) { index, socket in
         if index == profile.resumeIndex { socket.push(created) }
@@ -931,6 +990,12 @@ private final class ProbeFlag: @unchecked Sendable {
 final class ManualClock: @unchecked Sendable {
     var ms = 0
     func advance(ms: Int) { self.ms += ms }
+}
+
+/// Reads the rig clock from a reconnect `configure` closure. The closure is
+/// stored before the rig exists, and it must not capture the rig binding.
+private final class PfClockProbe: @unchecked Sendable {
+    var ms: @Sendable () -> Int = { 0 }
 }
 
 final class SocketSupply: @unchecked Sendable {
