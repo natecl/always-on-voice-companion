@@ -16,6 +16,10 @@ public struct GrokEngineConfiguration: Sendable {
     /// have been written since the last message, means the socket is black-holed.
     /// A `pf` drop does not FIN/RST the WebSocket.
     public var inboundStall: Duration
+    /// One in-flight replay chunk that never returns. Healthy frames finish
+    /// in milliseconds. The 5s handshake budget closed sockets that were
+    /// still sending, which chopped P1 and moved `gap.begin` off the drop.
+    public var replaySendTimeout: Duration
     public var authProbe: @Sendable (String) async -> AuthProbeResult
 
     public init(
@@ -27,6 +31,7 @@ public struct GrokEngineConfiguration: Sendable {
         handshakeTimeout: Duration = .seconds(5),
         chunkBytes: Int = AudioFormat.chunkBytes,
         inboundStall: Duration = .seconds(5),
+        replaySendTimeout: Duration = .seconds(15),
         authProbe: @escaping @Sendable (String) async -> AuthProbeResult = { key in
             await GrokProbe.fetchAuthStatus(apiKey: key)
         }
@@ -39,6 +44,7 @@ public struct GrokEngineConfiguration: Sendable {
         self.handshakeTimeout = handshakeTimeout
         self.chunkBytes = chunkBytes
         self.inboundStall = inboundStall
+        self.replaySendTimeout = replaySendTimeout
         self.authProbe = authProbe
     }
 
@@ -369,11 +375,11 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
                     if catchUpLost || !ready { break }
                     await Task.yield()
                 }
-                // A parked replay send must not sit in front of `gap`. A real
-                // `pf` drop replays up to 30s; `URLSession` send does not
-                // return while that write is stuck, and the chain was never
-                // written. Bound it and let the next socket emit the gap.
-                await pump(minimumBytes: 1, sendTimeout: configuration.handshakeTimeout)
+                // A parked replay send must not sit in front of `gap`. Bound
+                // that one chunk. Do not use the 5s handshake budget: a live
+                // replay that is merely slow was closed, and the next
+                // `socketDied` stamped a new short gap instead of the drop.
+                await pump(minimumBytes: 1, sendTimeout: configuration.replaySendTimeout)
                 if finishRequested { return }
                 if !ready || catchUpLost {
                     stopCatchUpReader()
@@ -674,9 +680,9 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
             await configuration.sleep(.milliseconds(50))
             waited += 50
             if !ready || catchUpLost || finishRequested || Task.isCancelled { return }
-            // Same bound as the backlog send. A replay that starts moving and
-            // then stalls must not sit in front of `gap` for the rest of the block.
-            await pump(sendTimeout: configuration.handshakeTimeout)
+            // No send cap here. The socket already accepted the backlog; timing
+            // these frames out closed a healthy stream and left holes in P1.
+            await pump()
         }
     }
 
@@ -732,7 +738,12 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
                 sendErrors += 1
                 if lastError == nil { lastError = ErrorDetail.sentence(error) }
                 continuation.yield(.error(.socket(String(describing: error))))
-                socketDied(code: 1006, reason: ErrorDetail.sentence(error))
+                // A capped replay send is already inside reconnect. `socketDied`
+                // would no-op while that task is alive, and if it is not, it
+                // starts a new gap at "now" and drops the original `pf` drop.
+                if sendTimeout == nil {
+                    socketDied(code: 1006, reason: ErrorDetail.sentence(error))
+                }
                 return
             }
         }

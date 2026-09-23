@@ -59,9 +59,11 @@ import TranscriptionEngine
     #expect(rebase.sessionMs(engineSeconds: 0.2) == 1_200)
     var gap = GapAccount()
     gap.begin(atMs: 41_000)
-    let span = gap.end(atMs: 47_210)
+    // A later reconnect must not move the start off the original drop.
+    gap.begin(atMs: 90_000)
+    let span = gap.end(atMs: 97_000)
     #expect(span?.fromMs == 41_000)
-    #expect(span?.toMs == 47_210)
+    #expect(span?.toMs == 97_000)
     #expect(gap.end(atMs: 1) == nil)
     #expect(PCMClock.milliseconds(bytesSent: 3_200) == 100)
 }
@@ -144,6 +146,7 @@ private final class ReconnectRig: @unchecked Sendable {
         profile: TransportProfile,
         inboundStall: Duration = .seconds(30),
         handshakeTimeout: Duration? = nil,
+        replaySendTimeout: Duration = .seconds(15),
         configure: @escaping (Int, ScriptedTransport) -> Void = { _, _ in }
     ) {
         self.profile = profile
@@ -162,7 +165,8 @@ private final class ReconnectRig: @unchecked Sendable {
             },
             nowMs: { clock.ms },
             handshakeTimeout: handshakeTimeout ?? profile.handshakeTimeout,
-            inboundStall: inboundStall
+            inboundStall: inboundStall,
+            replaySendTimeout: replaySendTimeout
         ))
     }
 
@@ -312,7 +316,11 @@ func reconnectSendsTheShortTailTheChunkPumpLeftBehind(profile: TransportProfile)
 func hungReplaySendStillEmitsTheGapOnTheNextSocket(profile: TransportProfile) async throws {
     // The socket that finishes the handshake but never completes a send is the
     // Mac replay after a real pf drop. The gap has to come from the next one.
-    let rig = ReconnectRig(profile: profile, handshakeTimeout: .milliseconds(200)) { index, socket in
+    let rig = ReconnectRig(
+        profile: profile,
+        handshakeTimeout: .milliseconds(200),
+        replaySendTimeout: .milliseconds(200)
+    ) { index, socket in
         if index == profile.resumeIndex {
             socket.push(created)
             socket.hangSendsAfter = 0
@@ -329,9 +337,15 @@ func hungReplaySendStillEmitsTheGapOnTheNextSocket(profile: TransportProfile) as
     first.push(.closed(code: 1006, reason: "drop"))
     var sawGap = false
     var sawStreaming = false
+    var gapFrom = -1
+    var gapTo = -1
     for _ in 0..<32 {
         guard let event = await iterator.next() else { break }
-        if case .gap = event { sawGap = true }
+        if case .gap(let from, let to) = event {
+            sawGap = true
+            gapFrom = from
+            gapTo = to
+        }
         if case .state(.streaming) = event, sawGap {
             sawStreaming = true
             break
@@ -339,6 +353,9 @@ func hungReplaySendStillEmitsTheGapOnTheNextSocket(profile: TransportProfile) as
     }
     #expect(sawGap)
     #expect(sawStreaming)
+    // Death is at session clock 0. A second socketDied must not move it.
+    #expect(gapFrom == 0)
+    #expect(gapTo > gapFrom)
     let next = try await rig.socket(profile.resumeIndex + 1)
     try await waitUntil { next.binaryCount >= 1 }
     #expect(next.binary(at: 0) == Data(count: 3_200))

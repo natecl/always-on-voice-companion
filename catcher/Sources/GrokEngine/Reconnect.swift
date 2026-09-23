@@ -38,7 +38,12 @@ public struct GapAccount: Sendable, Equatable {
 
     public init() {}
 
+    /// The first drop wins. A later reconnect must not move the start forward:
+    /// that is how a real `pf` block was graded as a 1s gap at the end of the session.
     public mutating func begin(atMs: Int) {
+        if let existing = disconnectedAtMs, existing <= atMs {
+            return
+        }
         disconnectedAtMs = atMs
     }
 
