@@ -2,6 +2,7 @@ import AppKit
 import AudioCapture
 import Diagnostics
 import GrokEngine
+import Metering
 import Observation
 import Pipeline
 import SessionStore
@@ -112,6 +113,11 @@ final class CatcherModel {
         } catch {
             StageMirror.note("recovery scan \(ErrorDetail.sentence(error))")
             reports = []
+        }
+        do {
+            _ = try CostLog.recoverAll(root: sessionRoot)
+        } catch {
+            StageMirror.note("cost recover \(ErrorDetail.sentence(error))")
         }
         if !reports.isEmpty {
             let annotation = Annotation(

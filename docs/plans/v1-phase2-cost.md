@@ -1,6 +1,6 @@
-# v1 Phase 2 — cost meter and cost loop (plan only)
+# v1 Phase 2 — cost meter and cost loop
 
-**Status:** plan doc, no code. Cap GO 2026-09-23. Planned from `10db545` on `main` (v0 transcript foundation, hardened GREEN at `b14e31a`). Nothing here is built or graded.
+**Status:** Step A (meter only) is in the tree and ungraded. Steps B and C are not started. Cap GO 2026-09-23. Planned from `10db545` on `main` (v0 transcript foundation, hardened GREEN at `b14e31a`). `swift test` does not grade B1. FEATURE_MAP rows stay `PLANNED` until a Mac preflight and P1–P6 verdict at the Step A SHA, and until `cost-grade.json` exists for B1.
 
 **v1 one-liner:** Granola mechanics, instant, zero friction, cheap enough to leave on.
 
@@ -133,6 +133,8 @@ Two new versioned files next to `thresholds.json`. That file is v0 verifier cons
 ```jsonc
 {
   "b1UsdPerSessionHr": 0.25,
+  "sttBudgetUsdPerSessionHr": 0.20,          // locked split: STT on the $0.25 bar
+  "phase3ReserveUsdPerSessionHr": 0.05,      // reserved for Phase 3; not spent in this phase
   "b1MinSessionMs": 3600000,
   "b1MinSystemSpeechDuty": 0.40,
   "serverUnderMeterTolerance": 0.02,
@@ -309,7 +311,7 @@ extension CostMeter {
 
 - A new spend surface picks a namespaced component id (`llm.notes`, `jev.judge`, …), adds a `rates.json` entry, and calls `record` where the money is spent. It gets per-minute rows and rollup inclusion without further work.
 - A component without a rate-card entry is written with `usd: null`, and `cost_grade.py` fails B1 with `unpriced component <id>`. Unpriced spend cannot be averaged in silently.
-- **Budget:** B1 is total spend. Proposed split, a Cap-call: STT ≤ $0.20/session-hr, leaving ≥ $0.05 for Phase 3 components on the same bar.
+- **Budget:** B1 is total spend. Locked split: STT ≤ $0.20/session-hr, leaving ≥ $0.05 for Phase 3 components on the same bar.
 
 ## 10. Risks
 
@@ -336,16 +338,17 @@ extension CostMeter {
 
 | Step | Work | Done when |
 |---|---|---|
-| **A: meter** | §5 (Metering module, engine counters, `meterTask`, shadow gate, `cost.jsonl`, `recoverAll`, `rates.json`, `metering.json`, Readout API §9.1, hook API §9.2), plus the §5.3 tests. One commit each for the module, the engine counters, the pipeline, and the app launch, so a v0 regression is local to one commit. | `swift test` is green on `macos-15` CI. A stub session writes a valid `cost.jsonl`. The P5 shape guard passes. The Mac preflight and P1–P6 verdict are GREEN at the Step A SHA. |
+| **A: meter** | §5 (Metering module, engine counters, `meterTask`, shadow gate, `cost.jsonl`, `recoverAll`, `rates.json`, `metering.json`, Readout API §9.1, hook API §9.2), plus the §5.3 tests. One commit each for the module, the engine counters, the pipeline, and the app launch, so a v0 regression is local to one commit. **Landed in this branch. Not graded. B and C are not started.** | `swift test` is green on `macos-15` CI. A stub session writes a valid `cost.jsonl`. The P5 shape guard passes. The Mac preflight and P1–P6 verdict are GREEN at the Step A SHA. |
 | **B: measure** | `b1_cost.sh`, the `run.sh b1` arm, `cost_grade.py`, `test_cost_grade.py` (synthetic pass, bar fail, short `invalid`, low-duty `invalid`, uncalibrated `unproven`, sum mismatch `fail`, unpriced component `fail`), `stt_calibrate.swift`, `docs/qa/v1-cost-grading.md`. Run C1–C5 and one `meeting` baseline, plus `headphones` and `idle`. | rates.json is `reconciled` with evidence. The baseline `cost-grade.json` exists (expected `fail` with about $0.40 in the evidence) and reports `shadowUsdPerSessionHr` and `bothOpenMs`. FEATURE_MAP rows for the meter surfaces move from `PLANNED` to their graded status. |
 | **C: lever** | Cap picks from §8 using the step B numbers. That lever is built behind `CATCHER_SEND_GATE`, with `on` as the default. | At one SHA and CDHash on the Mac: preflight, P1–P6 `verdict` GREEN, **and** `cost-grade.json` B1 `pass` on the `meeting` profile. |
 
-### Cap-calls still open
+### Cap-calls locked (2026-09-23)
 
-1. **The B1 profile:** speakers with no headphones (proposed) or headphones. Also the source and licence of `meeting-60m.wav`, and whether a scripted "me" speaker is added.
-2. **The lever,** after step B (L2 with an echo-aware mic gate proposed; L1 only if C4 bills once and L2 misses).
-3. **The budget split** between STT and Phase 3 components on the $0.25 bar ($0.20 / $0.05 proposed).
-4. **Calibration owner:** a dedicated xAI key and console access for C1–C5 (Nathan).
-5. **Whether an uncalibrated B1 can ever be claimed.** Proposed: no. `b1.calibrated` makes it `unproven`.
+1. **B1 grade profile** is speakers, no headphones (honest zero-friction). Headphones and idle are informational only.
+2. **`meeting-60m.wav`** is a synthetic multi-party conversation. Its SHA-256 is pinned in `harness_run.json` when Step B builds the fixture. No Nathan recording. The file stays out of git if it is large. Step A does not build it.
+3. **Budget split** on the $0.25 bar: STT ≤ $0.20/session-hr, and ≥ $0.05 stays reserved for Phase 3. Encoded in `metering.json` and `MeteringConstants`.
+4. **An uncalibrated B1 never passes.** `b1.calibrated` stays unproven until `rates.json` is reconciled (`billingModel` other than `uncalibrated` and `calibration.status == "reconciled"`).
+5. **The lever (L2 or L1) is Cap's pick after Step B.** Step C is not started.
+6. **C1–C5 calibration owner is Nathan.** Step A does not need it.
 
 Rows: [FEATURE_MAP.md](../FEATURE_MAP.md#v1-phase-2--cost-metering-planned). v0 gates: [qa/v0-grading.md](../qa/v0-grading.md). v0 slice: [v0-catcher.md](v0-catcher.md).
