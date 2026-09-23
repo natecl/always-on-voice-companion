@@ -130,7 +130,7 @@ public actor Pipeline {
                 startedAt: ISO8601.string(from: Date()),
                 engine: engineLabel,
                 tracks: AudioTrack.allCases.map(\.rawValue),
-                app: CatcherMetadata.appVersion
+                app: CatcherMetadata.headerApp
             ))
         } catch {
             let sentence = ErrorDetail.sentence(error)

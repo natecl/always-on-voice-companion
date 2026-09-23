@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import platform
 import struct
 import sys
 from datetime import datetime
@@ -236,11 +237,79 @@ def recovered(session: Path, rows: list[dict]) -> bool:
     return any(row.get("recovered") is True for row in rows_of(rows, "end"))
 
 
-def provenance_checks(gate: Gate, session: Path, rows: list[dict], name: str, no_provenance: bool) -> None:
+def platform_system() -> str:
+    return platform.system()
+
+
+def load_harness_run(session: Path) -> dict | None:
+    """`<root>/harness_run.json`, written by lib.sh before launch. The session
+    is `<root>/<uuid>`; a session graded in place may carry its own copy."""
+    for candidate in (session.parent / "harness_run.json", session / "harness_run.json"):
+        if candidate.is_file():
+            try:
+                loaded = json.loads(candidate.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                return None
+            return loaded if isinstance(loaded, dict) else None
+    return None
+
+
+def app_sha(rows: list[dict]) -> str:
+    app = str(header(rows).get("app", ""))
+    return app.split("+", 1)[1] if "+" in app else ""
+
+
+def macos_major(version: str) -> int:
+    try:
+        return int(str(version).split(".")[0])
+    except ValueError:
+        return 0
+
+
+def provenance_checks(gate: Gate, session: Path, rows: list[dict], name: str, run: dict | None, no_provenance: bool) -> None:
     if no_provenance:
         gate.check("provenance", False, "--no-provenance: unit-test grading, never a pass", PROVENANCE_CHECK)
         return
-    gate.check("provenance", False, "this grader build does not verify harness provenance", PROVENANCE_CHECK)
+    host = platform_system()
+    gate.check("graded-on-mac", host == "Darwin", f"grade host {host}; Linux/CI grading is Tier L", PROVENANCE_CHECK)
+    if run is None:
+        gate.check("harness-run", False, "no harness_run.json next to the session; not a harness run", PROVENANCE_CHECK)
+        return
+    gate.check("harness-run", run.get("gate") == name, f"harness_run.json gate={run.get('gate')!r}, grading {name}", PROVENANCE_CHECK)
+    minimum = int(THRESHOLDS["minMacOSMajor"])
+    gate.check(
+        "macos",
+        run.get("host", "Darwin") == "Darwin" and macos_major(str(run.get("macOS", ""))) >= minimum,
+        f"harness host {run.get('host')!r} macOS {run.get('macOS')!r} (need Darwin >= {minimum})",
+        PROVENANCE_CHECK,
+    )
+    sha = app_sha(rows)
+    plist = str(run.get("catcherGitSHA", ""))
+    good_sha = bool(sha) and sha == plist and sha != "unknown" and not sha.endswith("-dirty")
+    gate.check("build-sha", good_sha, f"header app sha {sha!r}, harness CatcherGitSHA {plist!r}", PROVENANCE_CHECK)
+    started = session_start_ms(rows)
+    wall = run.get("startedWallMs")
+    gate.check(
+        "session-after-harness-start",
+        started is not None and isinstance(wall, int) and started >= wall,
+        f"session startedAt {started} vs harness startedWallMs {wall}",
+        PROVENANCE_CHECK,
+    )
+    sign = run.get("codesign") or {}
+    signed = bool(sign.get("cdhash")) and sign.get("signature") != "adhoc"
+    gate.check("codesign", signed, f"cdhash {sign.get('cdhash')!r} signature {sign.get('signature')!r}", PROVENANCE_CHECK)
+
+
+def engine_check(gate: Gate, rows: list[dict], name: str) -> None:
+    engine = str(header(rows).get("engine", ""))
+    if name == "P5":
+        gate.check("engine=stub", engine == "stub", f"header engine {engine!r}; P5 must be the stub")
+        return
+    grok = str(THRESHOLDS["grokEngine"])
+    detail = f"header engine {engine!r}"
+    if engine == "stub":
+        detail = f"stub engine cannot prove P1/P3/P6 ({detail})"
+    gate.check("engine=grok", engine == grok, detail)
 
 
 def grade_p1(gate: Gate, session: Path, rows: list[dict], ref: Path | None, expect_recovery: bool) -> None:
@@ -372,6 +441,14 @@ def grade_p5(gate: Gate, rows: list[dict], reference: Path | None) -> None:
         return
     ref_dir = reference.parent if reference.name == "events.jsonl" else reference
     ref_rows, _note = load_rows(ref_dir)
+    ref_engine = str(header(ref_rows).get("engine", ""))
+    gate.check("reference-engine", ref_engine not in ("", "stub"), f"shape reference engine {ref_engine!r}; must be a Grok session")
+    left_sha, right_sha = app_sha(rows), app_sha(ref_rows)
+    gate.check(
+        "reference-same-build",
+        bool(left_sha) and left_sha == right_sha,
+        f"stub build {left_sha!r}, reference build {right_sha!r}",
+    )
     left = shape_keys(rows)
     right = shape_keys(ref_rows)
     same = left.keys() == right.keys() and all(left[key] == right[key] for key in left)
@@ -405,6 +482,11 @@ def grade_gate(
     no_provenance: bool = False,
 ) -> dict[str, object]:
     gate = Gate()
+    run = load_harness_run(session)
+    if revoke_at is None and run is not None and isinstance(run.get("revokeWallMs"), int):
+        revoke_at = wall_to_session_ms(rows, run["revokeWallMs"])
+    if name in ("P1", "P3", "P5", "P6"):
+        engine_check(gate, rows, name)
     if name == "P1":
         grade_p1(gate, session, rows, ref, expect_recovery)
     elif name == "P2":
@@ -417,7 +499,7 @@ def grade_gate(
         grade_p5(gate, rows, shape_reference)
     elif name == "P6":
         grade_p6(gate, rows)
-    provenance_checks(gate, session, rows, name, no_provenance)
+    provenance_checks(gate, session, rows, name, run, no_provenance)
     return gate.result()
 
 

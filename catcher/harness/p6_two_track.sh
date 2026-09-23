@@ -6,6 +6,7 @@ source "$ROOT/lib.sh"
 SESSION="${1:?session dir}"
 mkdir -p "$SESSION"
 export CATCHER_ENGINE=grok
+begin_harness_run "$SESSION" P6
 launch_catcher "$SESSION" 1
 echo "Speak into the mic while the fixture plays."
 afplay "$ROOT/fixtures/known-60s.wav" &

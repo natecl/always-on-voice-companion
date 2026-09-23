@@ -2,6 +2,15 @@ import Foundation
 @testable import SessionStore
 import Testing
 
+@Test func buildSHAComesFromThePlistAndUnexpandedIsUnknown() {
+    #expect(CatcherMetadata.buildSHA(info: ["CatcherGitSHA": "95a9cce"]) == "95a9cce")
+    #expect(CatcherMetadata.buildSHA(info: ["CatcherGitSHA": "95a9cce-dirty"]) == "95a9cce-dirty")
+    #expect(CatcherMetadata.buildSHA(info: ["CatcherGitSHA": "$(CATCHER_GIT_SHA)"]) == "unknown")
+    #expect(CatcherMetadata.buildSHA(info: ["CatcherGitSHA": " "]) == "unknown")
+    #expect(CatcherMetadata.buildSHA(info: [:]) == "unknown")
+    #expect(CatcherMetadata.headerApp.hasPrefix("\(CatcherMetadata.appVersion)+"))
+}
+
 @Test func finalsAndAnnotationsFsyncAndRoundTrip() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent("catcher-store-\(UUID().uuidString)", isDirectory: true)

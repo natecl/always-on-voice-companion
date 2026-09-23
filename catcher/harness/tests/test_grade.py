@@ -141,5 +141,122 @@ class VocabularyTests(TempRoot):
         self.assertEqual(report["P1"]["result"], "n/a")
 
 
+def harness_run(root: Path, gate: str, **overrides) -> dict:
+    record = {
+        "gate": gate,
+        "startedWallMs": 1790139590000,  # 2026-09-23T04:59:50Z, before the session header
+        "host": "Darwin",
+        "macOS": "15.3",
+        "arch": "arm64",
+        "hwModel": "Mac15,3",
+        "catcherApp": "/tmp/Catcher.app",
+        "catcherGitSHA": "abc123",
+        "catcherEngine": "grok",
+        "harnessGitSHA": "abc123",
+        "codesign": {"cdhash": "deadbeef", "teamIdentifier": "not set", "signature": "", "authority": ["Catcher Development"]},
+    }
+    record.update(overrides)
+    (root / "harness_run.json").write_text(json.dumps(record), encoding="utf-8")
+    return record
+
+
+class OnMac(TempRoot):
+    """Grades as if on a Mac so provenance itself is exercised."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._host = grade.platform_system
+        grade.platform_system = lambda: "Darwin"
+
+    def tearDown(self) -> None:
+        grade.platform_system = self._host
+        super().tearDown()
+
+
+def p6_session(case: TempRoot, **kwargs) -> Path:
+    session = case.session(**kwargs)
+    session.seg("system", 1000, 4000, "hello from the fixture", "S1")
+    session.seg("microphone", 2000, 5000, "and me talking over it")
+    session.pcm("microphone", [(2000, 5000, 0.2)], 6000)
+    session.pcm("system", [(1000, 4000, 0.2)], 6000)
+    return session.write()
+
+
+class ProvenanceTests(OnMac):
+    def test_linux_host_is_unproven(self) -> None:
+        grade.platform_system = lambda: "Linux"
+        harness_run(self.root, "P6")
+        result = run("P6", p6_session(self), no_provenance=False)
+        self.assertEqual(result["result"], "unproven")
+        self.assertIn("graded-on-mac", failed(result))
+
+    def test_mac_harness_run_with_matching_sha_passes(self) -> None:
+        harness_run(self.root, "P6")
+        result = run("P6", p6_session(self), no_provenance=False)
+        self.assertEqual(result["result"], "pass", result["evidence"])
+
+    def test_missing_harness_run_is_unproven(self) -> None:
+        result = run("P6", p6_session(self), no_provenance=False)
+        self.assertEqual(result["result"], "unproven")
+        self.assertIn("harness-run", failed(result))
+
+    def test_harness_run_for_another_gate_is_unproven(self) -> None:
+        harness_run(self.root, "P1")
+        self.assertIn("harness-run", failed(run("P6", p6_session(self), no_provenance=False)))
+
+    def test_old_macos_is_unproven(self) -> None:
+        harness_run(self.root, "P6", macOS="14.6")
+        self.assertIn("macos", failed(run("P6", p6_session(self), no_provenance=False)))
+
+    def test_sha_mismatch_unknown_and_dirty_are_unproven(self) -> None:
+        for app, plist in (("0.0.1+abc123", "fff999"), ("0.0.1+unknown", "unknown"), ("0.0.1+abc123-dirty", "abc123-dirty"), ("0.0.1", "")):
+            with self.subTest(app=app):
+                sub = self.root / app.replace("+", "_")
+                sub.mkdir()
+                harness_run(sub, "P6", catcherGitSHA=plist)
+                case = TempRoot()
+                case.root = sub
+                result = run("P6", p6_session(case, app=app), no_provenance=False)
+                self.assertEqual(result["result"], "unproven", result["evidence"])
+                self.assertIn("build-sha", failed(result))
+
+    def test_session_older_than_the_harness_run_is_unproven(self) -> None:
+        harness_run(self.root, "P6", startedWallMs=1790139700000)
+        self.assertIn("session-after-harness-start", failed(run("P6", p6_session(self), no_provenance=False)))
+
+    def test_missing_cdhash_is_unproven(self) -> None:
+        harness_run(self.root, "P6", codesign={"cdhash": "", "signature": "adhoc"})
+        self.assertIn("codesign", failed(run("P6", p6_session(self), no_provenance=False)))
+
+    def test_stub_engine_fails_p1_p3_p6(self) -> None:
+        session = p6_session(self, engine="stub")
+        for gate in ("P1", "P3", "P6"):
+            with self.subTest(gate=gate):
+                harness_run(self.root, gate)
+                result = run(gate, session, ref=REF, no_provenance=False)
+                self.assertEqual(result["result"], "fail")
+                self.assertIn("engine=grok", failed(result))
+
+    def test_p5_needs_stub_header_and_same_build_grok_reference(self) -> None:
+        reference = p6_session(self)
+        stub_root = self.root / "p5"
+        stub_root.mkdir()
+        harness_run(stub_root, "P5", catcherEngine="stub")
+        case = TempRoot()
+        case.root = stub_root
+        stub = p6_session(case, engine="stub")
+        self.assertEqual(run("P5", stub, shape_reference=reference, no_provenance=False)["result"], "pass")
+        stub_ref = self.root / "stubref"
+        stub_ref.mkdir()
+        case.root = stub_ref
+        self.assertIn("reference-engine", failed(run("P5", stub, shape_reference=p6_session(case, engine="stub"))))
+        other = self.root / "other"
+        other.mkdir()
+        case.root = other
+        self.assertIn("reference-same-build", failed(run("P5", stub, shape_reference=p6_session(case, app="0.0.1+fff999"))))
+        self.assertIn("shape-reference", failed(run("P5", stub)))
+        self.assertIn("engine=stub", failed(run("P5", reference, shape_reference=reference)))
+
+
 if __name__ == "__main__":
     unittest.main()

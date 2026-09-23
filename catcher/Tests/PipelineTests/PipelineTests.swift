@@ -68,6 +68,8 @@ import TranscriptionEngine
     #expect(!events.contains("\"text\":\"partial\""))
     #expect(!events.contains("\"conf\""))
     #expect(events.contains("\"t\":\"end\""))
+    // SwiftPM has no Info.plist CatcherGitSHA. The grader rejects `unknown`.
+    #expect(events.contains("\"app\":\"0.0.1+unknown\""))
     let transcript = try String(contentsOf: SessionPaths.transcriptFile(in: directory), encoding: .utf8)
     #expect(transcript.contains("[them] S1"))
     #expect(transcript.contains("[me]"))

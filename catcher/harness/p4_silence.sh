@@ -7,6 +7,7 @@ SESSION="${1:?session dir}"
 mkdir -p "$SESSION"
 echo "Mute system output and stay quiet, then press enter."
 read -r _
+begin_harness_run "$SESSION" P4
 launch_catcher "$SESSION" 1
 sleep 15
 kill "$(cat "$SESSION/catcher.pid")" || true

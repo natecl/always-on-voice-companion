@@ -20,6 +20,8 @@
 	<string>0.0.1</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
+	<key>CatcherGitSHA</key>
+	<string>$(CATCHER_GIT_SHA)</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>15.0</string>
 	<key>NSHighResolutionCapable</key>

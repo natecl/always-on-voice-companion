@@ -5,7 +5,9 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 source "$ROOT/lib.sh"
 SESSION="${1:?session dir}"
 mkdir -p "$SESSION"
-export CATCHER_ENGINE="${CATCHER_ENGINE:-grok}"
+# Only Grok proves P1. A stub session from the environment would grade as fail.
+export CATCHER_ENGINE=grok
+begin_harness_run "$SESSION" P1
 launch_catcher "$SESSION" 1
 sleep 2
 afplay "$ROOT/fixtures/known-60s.wav"

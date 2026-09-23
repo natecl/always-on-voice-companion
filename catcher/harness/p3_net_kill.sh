@@ -10,6 +10,7 @@ if [[ "${CATCHER_ALLOW_PF:-}" != "1" ]]; then
   exit 2
 fi
 export CATCHER_ENGINE=grok
+begin_harness_run "$SESSION" P3
 launch_catcher "$SESSION" 1
 sleep 3
 IPS="$(dig +short api.x.ai A | tr '\n' ' ')"

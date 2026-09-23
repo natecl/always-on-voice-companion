@@ -12,6 +12,7 @@ if [[ "${CATCHER_ALLOW_TCC_RESET:-}" != "1" ]]; then
   exit 2
 fi
 export CATCHER_HARNESS=1
+begin_harness_run "$SESSION" P2
 launch_catcher "$SESSION" 1
 wait_for_recording "$SESSION"
 # Mid-session, not at t=0. Pin the directory before tccutil: a later
@@ -23,10 +24,8 @@ else
   LIVE="$(resolve_session "$SESSION")"
 fi
 printf '%s\n' "$LIVE" > "$SESSION/revoke_session"
-python3 - <<'PY' > "$SESSION/revoke_wall_ms"
-import time
-print(int(time.time() * 1000))
-PY
+wall_ms > "$SESSION/revoke_wall_ms"
+append_harness_field "$SESSION" revokeWallMs "$(cat "$SESSION/revoke_wall_ms")"
 tccutil reset ScreenCapture "$BUNDLE"
 echo "TCC reset at wall ms $(cat "$SESSION/revoke_wall_ms")."
 echo "Re-grant Screen & System Audio Recording for ${BUNDLE}, then press enter."
