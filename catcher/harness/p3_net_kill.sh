@@ -55,18 +55,113 @@ require_fixture_play "$SESSION"
 PLAYER=$!
 sleep 5
 PID="$(cat "$SESSION/catcher.pid")"
-# The app's open sockets may sit on an address this dig does not return, so
-# their peers go in the table too. dig can print CNAME names; keep literals.
-IPS="$(
-  {
-    dig +short api.x.ai A || true
-    dig +short api.x.ai AAAA || true
-    lsof -nP -a -p "$PID" -iTCP:443 -sTCP:ESTABLISHED -Fn 2>/dev/null \
-      | sed -nE 's/^n.*->\[?([0-9A-Fa-f:.]+)\]?:443$/\1/p' || true
-  } | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f]*:[0-9A-Fa-f:]*$' | sort -u | tr '\n' ' ' || true
-)"
-if [[ -z "${IPS// /}" ]]; then
-  echo "No address for api.x.ai (dig and the app's open sockets)" >&2
+# The graded socket is the one Catcher already has open, not whatever
+# `dig api.x.ai` returns. That name is Cloudflare (104.18.0.0/15). The STT
+# stream's peer is Deepgram (api.deepgram.com, a different address), so a
+# table built from api.x.ai never matches the live packets. Partial text and
+# ~32 kB/s then continue for the whole block.
+# lsof is the peer that is actually connected. TCP and UDP both: a QUIC
+# socket is UDP and `-iTCP` does not list it. dig of both names only covers
+# a reconnect to a published address.
+lsof -nP -a -p "$PID" -iTCP:443 -Fn >"$SESSION/p3-lsof-tcp.txt" 2>"$SESSION/p3-lsof.err" || true
+lsof -nP -a -p "$PID" -iUDP:443 -Fn >"$SESSION/p3-lsof-udp.txt" 2>>"$SESSION/p3-lsof.err" || true
+{
+  dig +short api.x.ai A || true
+  dig +short api.x.ai AAAA || true
+  dig +short api.deepgram.com A || true
+  dig +short api.deepgram.com AAAA || true
+} >"$SESSION/p3-dig.txt" || true
+python3 - "$SESSION" "$SESSION/p3-lsof-tcp.txt" "$SESSION/p3-lsof-udp.txt" "$SESSION/p3-dig.txt" <<'PEERS'
+import ipaddress
+import sys
+from pathlib import Path
+
+session = Path(sys.argv[1])
+
+def read(path):
+    file = Path(path)
+    if not file.is_file():
+        return ""
+    return file.read_text(encoding="utf-8", errors="replace")
+
+def normalize(raw):
+    text = raw.strip().strip("[]")
+    if "%" in text:
+        text = text.split("%", 1)[0]
+    if text.startswith("::ffff:"):
+        text = text[7:]
+    try:
+        addr = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        return str(mapped)
+    return str(addr)
+
+def split_endpoint(token):
+    token = token.strip()
+    if not token or token.startswith("*"):
+        return None, None
+    if token.startswith("["):
+        host, _, rest = token[1:].partition("]")
+        port = rest[1:] if rest.startswith(":") else ""
+        return normalize(host), port
+    if token.count(":") == 1 and token.split(":", 1)[0].count(".") == 3:
+        host, port = token.split(":", 1)
+        return normalize(host), port
+    host, sep, port = token.rpartition(":")
+    if not sep:
+        return None, None
+    return normalize(host), port
+
+pairs = []
+seen = set()
+blob = read(sys.argv[2]) + "\n" + read(sys.argv[3])
+for line in blob.splitlines():
+    if not line.startswith("n") or "->" not in line:
+        continue
+    left, right = line[1:].split("->", 1)
+    local, _ = split_endpoint(left)
+    remote, port = split_endpoint(right)
+    if remote is None or port not in ("443", "https"):
+        continue
+    key = (local or "", remote)
+    if key in seen:
+        continue
+    seen.add(key)
+    pairs.append(key)
+
+table = []
+table_seen = set()
+
+def add(ip):
+    if ip and ip not in table_seen:
+        table_seen.add(ip)
+        table.append(ip)
+
+for _, remote in pairs:
+    add(remote)
+for line in read(sys.argv[4]).splitlines():
+    add(normalize(line.strip().rstrip(".")))
+
+(session / "p3-endpoints.txt").write_text(
+    "".join(f"{local} {remote}\n" for local, remote in pairs),
+    encoding="utf-8",
+)
+(session / "p3-table-ips.txt").write_text(
+    "".join(f"{ip}\n" for ip in table),
+    encoding="utf-8",
+)
+if not pairs:
+    sys.stderr.write(
+        "No :443 peer on the Catcher pid. dig(api.x.ai) does not name the live socket.\n"
+    )
+    sys.exit(1)
+PEERS
+IPS="$(tr '\n' ' ' <"$SESSION/p3-table-ips.txt" | sed 's/  */ /g;s/^ //;s/ $//')"
+if [[ -z "$IPS" ]]; then
+  echo "No address for the live STT socket or api.x.ai / api.deepgram.com" >&2
   exit 1
 fi
 RULE="$(mktemp)"
@@ -90,10 +185,127 @@ append_harness_field "$SESSION" pfOnWallMs "$(wall_ms)"
 # pf passes a packet that matches an existing state without reading the rule.
 # Kill those states and wait before the hold. A background -k let the socket
 # die and reconnect while this script still called the block "on".
-for ip in $IPS; do
-  if [[ "$ip" == *:* ]]; then any="::/0"; else any="0.0.0.0/0"; fi
-  sudo -n /sbin/pfctl -k "$any" -k "$ip" >/dev/null 2>&1 || true
-done
+# Darwin does not treat a wildcard source as "any" for -k, so that form kills
+# nothing and the established socket keeps passing. Kill the concrete pair,
+# both directions, from the process sockets and from the state table.
+sudo -n /sbin/pfctl -s states >"$SESSION/p3-states-before.txt" 2>>"$SESSION/p3-pf-kill.txt" || true
+python3 - "$SESSION/p3-states-before.txt" "$SESSION/p3-table-ips.txt" >"$SESSION/p3-state-pairs.txt" <<'STATES'
+import ipaddress
+import re
+import sys
+from pathlib import Path
+
+def normalize(raw):
+    text = raw.strip().strip("[]")
+    if "%" in text:
+        text = text.split("%", 1)[0]
+    if text.startswith("::ffff:"):
+        text = text[7:]
+    try:
+        addr = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    mapped = getattr(addr, "ipv4_mapped", None)
+    return str(mapped or addr)
+
+table = set()
+for line in Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace").splitlines():
+    ip = normalize(line.strip())
+    if ip:
+        table.add(ip)
+
+endpoint = re.compile(
+    r"(?:\[([0-9A-Fa-f:.%]+)\]|(\d{1,3}(?:\.\d{1,3}){3}))[:.](\d+)"
+)
+emitted = set()
+for line in Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines():
+    found = []
+    for match in endpoint.finditer(line):
+        ip = normalize(match.group(1) or match.group(2))
+        if ip:
+            found.append((ip, match.group(3)))
+    if "443" not in {port for _, port in found}:
+        continue
+    blocked = [ip for ip, _ in found if ip in table]
+    others = [ip for ip, _ in found if ip not in table]
+    for remote in blocked:
+        for local in others:
+            key = (local, remote)
+            if key in emitted:
+                continue
+            emitted.add(key)
+            sys.stdout.write(f"{local} {remote}\n")
+STATES
+: >"$SESSION/p3-pf-kill.txt"
+kill_pair() {
+  local src="$1" dst="$2" out
+  if [[ -z "$src" || -z "$dst" ]]; then
+    return 0
+  fi
+  if ! out="$(sudo -n /sbin/pfctl -k "$src" -k "$dst" 2>&1)"; then
+    printf '%s\n' "$out" | tee -a "$SESSION/p3-pf-kill.txt" >&2
+    exit 1
+  fi
+  printf '%s\n' "$out" >>"$SESSION/p3-pf-kill.txt"
+}
+while read -r src dst; do
+  kill_pair "$src" "$dst"
+  kill_pair "$dst" "$src"
+done <"$SESSION/p3-endpoints.txt"
+while read -r src dst; do
+  kill_pair "$src" "$dst"
+  kill_pair "$dst" "$src"
+done <"$SESSION/p3-state-pairs.txt"
+sudo -n /sbin/pfctl -s states >"$SESSION/p3-states-after.txt" 2>>"$SESSION/p3-pf-kill.txt" || true
+# Only the process's own peers must be gone. A published Cloudflare address
+# can still have some other app's state; that state is not this socket.
+if ! python3 - "$SESSION/p3-states-after.txt" "$SESSION/p3-endpoints.txt" <<'STILL'
+import ipaddress
+import re
+import sys
+from pathlib import Path
+
+def normalize(raw):
+    text = raw.strip().strip("[]")
+    if "%" in text:
+        text = text.split("%", 1)[0]
+    if text.startswith("::ffff:"):
+        text = text[7:]
+    try:
+        addr = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    mapped = getattr(addr, "ipv4_mapped", None)
+    return str(mapped or addr)
+
+peers = set()
+for line in Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace").splitlines():
+    parts = line.split()
+    if not parts:
+        continue
+    ip = normalize(parts[-1])
+    if ip:
+        peers.add(ip)
+endpoint = re.compile(
+    r"(?:\[([0-9A-Fa-f:.%]+)\]|(\d{1,3}(?:\.\d{1,3}){3}))[:.](\d+)"
+)
+for line in Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines():
+    hit = False
+    port443 = False
+    for match in endpoint.finditer(line):
+        ip = normalize(match.group(1) or match.group(2))
+        if match.group(3) == "443":
+            port443 = True
+        if ip in peers:
+            hit = True
+    if hit and port443:
+        sys.stderr.write(line + "\n")
+        sys.exit(1)
+STILL
+then
+  echo "The live :443 state is still installed, so packets would skip the new rule." >&2
+  exit 1
+fi
 # 15s after the states are gone. The engine's inbound stall is 5s, so the
 # hole that remains still spans the 10s grade bar and reaches pf off.
 sleep 15

@@ -227,6 +227,10 @@ if pf.count("sudo -n /sbin/pfctl") < 5:
     raise SystemExit("p3 pfctl wrap regressed")
 if 'ANCHOR="com.apple/catcher"' not in pf or '-a "$ANCHOR"' not in pf or "pfctl -E" not in pf:
     raise SystemExit("p3 block is not an evaluated com.apple anchor with pf enabled")
+if "0.0.0.0/0" in pf or "::/0" in pf:
+    raise SystemExit("p3 state kill still uses a wildcard source")
+if "api.deepgram.com" not in pf or "-iUDP:443" not in pf:
+    raise SystemExit("p3 block does not name the live Deepgram socket")
 kill_line = pf.split("pfctl -k", 1)[1].split("\n", 1)[0]
 if kill_line.rstrip().endswith("&"):
     raise SystemExit("p3 state kill is backgrounded, so the socket can reconnect during the block")
@@ -263,6 +267,91 @@ if "NSHostingController" not in app or ".suppressed" not in app:
     raise SystemExit("harness does not open its own key content window")
 if "setActivationPolicy" not in app.split("applicationWillFinishLaunching")[1].split("applicationDidFinishLaunching")[0]:
     raise SystemExit("activation policy is not set before the window")
+
+import subprocess
+import tempfile
+
+def heredoc(name):
+    marker = "<<'" + name + "'"
+    start = pf.index(marker) + len(marker)
+    body = pf[start:]
+    if body.startswith("\n"):
+        body = body[1:]
+    end = body.index("\n" + name + "\n")
+    return body[:end]
+
+peers_py = heredoc("PEERS")
+states_py = heredoc("STATES")
+still_py = heredoc("STILL")
+
+def run_py(script, args):
+    return subprocess.run(
+        [sys.executable, "-"] + args,
+        input=script,
+        text=True,
+        capture_output=True,
+    )
+
+with tempfile.TemporaryDirectory() as tmp:
+    session = pathlib.Path(tmp)
+    tcp = session / "tcp.txt"
+    udp = session / "udp.txt"
+    dig = session / "dig.txt"
+    tcp.write_text(
+        "n10.0.0.5:50000->208.184.56.201:443\n"
+        "n[fe80::1%en0]:50001->[2606:4700::6812:1250]:443\n"
+        "n10.0.0.5:50002->::ffff:208.184.56.201:443\n",
+        encoding="utf-8",
+    )
+    udp.write_text("n10.0.0.5:50003->208.184.56.201:443\n", encoding="utf-8")
+    dig.write_text("api.sv1.deepgram.com.\n104.18.18.80\n", encoding="utf-8")
+    got = run_py(peers_py, [str(session), str(tcp), str(udp), str(dig)])
+    if got.returncode != 0:
+        raise SystemExit(got.stderr)
+    endpoints = (session / "p3-endpoints.txt").read_text(encoding="utf-8")
+    table = (session / "p3-table-ips.txt").read_text(encoding="utf-8").split()
+    if "208.184.56.201" not in endpoints or "2606:4700::6812:1250" not in endpoints:
+        raise SystemExit(f"live peers dropped: {endpoints}")
+    if "::ffff:" in endpoints:
+        raise SystemExit(f"mapped peer was not rewritten: {endpoints}")
+    if "208.184.56.201" not in table or "104.18.18.80" not in table:
+        raise SystemExit(f"table missed a peer or dig address: {table}")
+    if "api.sv1.deepgram.com" in table:
+        raise SystemExit("CNAME leaked into the pf table")
+    (session / "none.txt").write_text("n*:443\np99\n", encoding="utf-8")
+    missing = run_py(peers_py, [str(session), str(session / "none.txt"), str(session / "none.txt"), str(dig)])
+    if missing.returncode == 0:
+        raise SystemExit("p3 accepts a dig-only table when the process has no :443 peer")
+    states = session / "states.txt"
+    states.write_text(
+        "all tcp 10.0.0.5:50000 -> 208.184.56.201:443 ESTABLISHED:ESTABLISHED\n"
+        "all tcp 1.2.3.4:443 (10.0.0.8:9) -> 104.18.18.80:443 ESTABLISHED:ESTABLISHED\n"
+        "all tcp 10.9.9.9:1 -> 9.9.9.9:443 ESTABLISHED:ESTABLISHED\n",
+        encoding="utf-8",
+    )
+    (session / "p3-table-ips.txt").write_text("208.184.56.201\n104.18.18.80\n", encoding="utf-8")
+    listed = run_py(states_py, [str(states), str(session / "p3-table-ips.txt")])
+    if listed.returncode != 0:
+        raise SystemExit(listed.stderr)
+    pairs = listed.stdout.splitlines()
+    if "10.0.0.5 208.184.56.201" not in pairs:
+        raise SystemExit(f"state pair missing: {pairs}")
+    if "10.0.0.8 104.18.18.80" not in pairs or "1.2.3.4 104.18.18.80" not in pairs:
+        raise SystemExit(f"nat state pair missing: {pairs}")
+    if any("9.9.9.9" in pair for pair in pairs):
+        raise SystemExit(f"unrelated state was selected: {pairs}")
+    (session / "p3-endpoints.txt").write_text("10.0.0.5 208.184.56.201\n", encoding="utf-8")
+    stuck = run_py(still_py, [str(states), str(session / "p3-endpoints.txt")])
+    if stuck.returncode == 0:
+        raise SystemExit("a remaining live peer state was treated as cleared")
+    clear = session / "clear.txt"
+    clear.write_text(
+        "all tcp 1.2.3.4:443 -> 104.18.18.80:443 ESTABLISHED:ESTABLISHED\n",
+        encoding="utf-8",
+    )
+    other = run_py(still_py, [str(clear), str(session / "p3-endpoints.txt")])
+    if other.returncode != 0:
+        raise SystemExit("another app's Cloudflare state aborted the block: " + other.stderr)
 PY
 
 echo "cycle guard ok"
