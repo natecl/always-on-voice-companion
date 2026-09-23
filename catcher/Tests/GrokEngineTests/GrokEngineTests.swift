@@ -159,6 +159,100 @@ import TranscriptionEngine
     await engine.finish()
 }
 
+@Test func postResumeFinalIsQueuedBeforeStreamingAndNotBeforeTheGap() async throws {
+    let clock = ManualClock()
+    let transport = ScriptedTransport()
+    let engine = GrokEngine(track: .system, configuration: GrokEngineConfiguration(
+        apiKey: "test-key",
+        url: GrokWebSocket.url(),
+        makeTransport: { transport },
+        sleep: { duration in
+            clock.advance(ms: Int(seconds(duration) * 1000))
+        },
+        nowMs: { clock.ms },
+        handshakeTimeout: .seconds(2),
+        inboundStall: .seconds(30)
+    ))
+    let connecting = Task { try await engine.connect(track: .system) }
+    transport.push(.text(#"{"type":"transcript.created"}"#))
+    try await connecting.value
+    try await engine.send(PCMFrame(track: .system, data: Data(count: 3_200), hostTime: 0))
+    try await waitUntil { transport.binaryCount == 1 }
+
+    var iterator = engine.events.makeAsyncIterator()
+    transport.push(.closed(code: 1006, reason: "drop"))
+    transport.push(.text(#"{"type":"transcript.created"}"#))
+    transport.push(.text(partial(text: "after", start: 0.0, duration: 0.2, isFinal: true, speechFinal: true)))
+
+    var order: [String] = []
+    var gapTo = 0
+    var segStart = -1
+    var degraded = false
+    for _ in 0..<16 {
+        guard let event = await iterator.next() else { break }
+        switch event {
+        case .state(.degraded):
+            degraded = true
+            order.append("degraded")
+        case .transcript(let transcript) where degraded && transcript.kind == .final:
+            order.append("seg")
+            segStart = transcript.startMs
+        case .gap(_, let to) where degraded:
+            order.append("gap")
+            gapTo = to
+        case .state(.streaming) where degraded:
+            order.append("streaming")
+        default:
+            break
+        }
+        if order.last == "streaming" { break }
+    }
+    #expect(order == ["degraded", "seg", "gap", "streaming"])
+    #expect(segStart >= gapTo)
+    await engine.finish()
+}
+
+@Test func reconnectSendsTheShortTailTheChunkPumpLeftBehind() async throws {
+    let clock = ManualClock()
+    let transport = ScriptedTransport()
+    let engine = GrokEngine(track: .system, configuration: GrokEngineConfiguration(
+        apiKey: "test-key",
+        url: GrokWebSocket.url(),
+        makeTransport: { transport },
+        sleep: { duration in
+            clock.advance(ms: Int(seconds(duration) * 1000))
+        },
+        nowMs: { clock.ms },
+        handshakeTimeout: .seconds(2),
+        inboundStall: .seconds(30)
+    ))
+    let connecting = Task { try await engine.connect(track: .system) }
+    transport.push(.text(#"{"type":"transcript.created"}"#))
+    try await connecting.value
+    let tail = Data(repeating: 5, count: 100)
+    try await engine.send(PCMFrame(track: .system, data: tail, hostTime: 0))
+    try await Task.sleep(for: .milliseconds(30))
+    #expect(transport.binaryCount == 0)
+
+    var iterator = engine.events.makeAsyncIterator()
+    transport.push(.closed(code: 1006, reason: "drop"))
+    transport.push(.text(#"{"type":"transcript.created"}"#))
+    var sawDegraded = false
+    var sawStreaming = false
+    for _ in 0..<12 {
+        guard let event = await iterator.next() else { break }
+        if case .state(.degraded) = event { sawDegraded = true }
+        if case .state(.streaming) = event, sawDegraded {
+            sawStreaming = true
+            break
+        }
+    }
+    #expect(sawStreaming)
+    #expect(transport.binaryCount == 1)
+    #expect(transport.binary(at: 0) == tail)
+    await engine.finish()
+}
+
 @Test func stalledSocketReconnectsReplaysAudioAndEmitsAGap() async throws {
     let clock = ManualClock()
     let transport = ScriptedTransport()

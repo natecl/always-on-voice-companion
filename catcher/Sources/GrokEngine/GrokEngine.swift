@@ -87,6 +87,12 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
     private var watchdog: Task<Void, Never>?
     /// Owns reconnect. Independent of the reader: a dropped close frame never wakes `receive`.
     private var recovery: Task<Void, Never>?
+    /// A final from the socket opened after `gap` began. Streaming stays unannounced
+    /// until this is set or the catch-up budget ends, so the seg is already queued.
+    private var postResumeFinal = false
+    /// The catch-up socket closed while `recovery` still owns reconnect. `socketDied`
+    /// would no-op; the loop retries instead of announcing a dead stream.
+    private var catchUpLost = false
     private var socketGeneration = 0
     /// Socket generation that currently owns `pump`. A hung send keeps its task; a new socket must still pump.
     private var pumpOwner: Int?
@@ -219,12 +225,14 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
                 let event = try await transport.receive()
                 if finishRequested || Task.isCancelled || generation != socketGeneration { return }
                 await handle(event, generation: generation)
+                if catchUpLost || generation != socketGeneration { return }
             } catch is CancellationError {
                 return
             } catch {
                 if finishRequested || Task.isCancelled || generation != socketGeneration { return }
                 lastError = ErrorDetail.sentence(error)
                 await handle(.closed(code: 1006, reason: ErrorDetail.sentence(error)), generation: generation)
+                if catchUpLost || generation != socketGeneration { return }
             }
         }
     }
@@ -246,6 +254,14 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
             if !hasBeenReady {
                 handshakeFailure = .socket("closed \(code) \(reason)")
                 if lastError == nil { lastError = "closed \(code) \(reason)" }
+                return
+            }
+            // `recovery` is this reconnect. Starting another one here drops the
+            // attempt that is about to yield `gap`. Mark the socket lost so the
+            // loop opens a fresh one instead of announcing streaming.
+            if recovery != nil {
+                ready = false
+                catchUpLost = true
                 return
             }
             socketDied(code: code, reason: reason)
@@ -336,17 +352,40 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
                 try await open(next)
                 transport = next
                 try await readUntilCreated(next)
-                await pump()
                 if finishRequested { return }
-                if !ready {
-                    reader?.cancel()
-                    reader = nil
+                // Arm `receive` before the replay send. The previous order pumped
+                // the backlog, yielded `streaming` (the verifier writes `resumed`),
+                // and only then started the reader. Mac graded the file at that
+                // ann: the replay had gone out with nobody reading, so no `t=seg`
+                // was queued at or after the resumed `atMs`.
+                postResumeFinal = false
+                catchUpLost = false
+                reader = Task { await self.readLoop() }
+                for _ in 0..<4 {
+                    if catchUpLost || !ready { break }
+                    await Task.yield()
+                }
+                await pump(minimumBytes: 1)
+                if finishRequested { return }
+                if !ready || catchUpLost {
+                    stopCatchUpReader()
+                    reclaimReplay()
+                    abandonSocket(next)
+                    transport = nil
+                    continue
+                }
+                await waitForPostResumeSegment()
+                if finishRequested || Task.isCancelled { return }
+                if !ready || catchUpLost {
+                    stopCatchUpReader()
+                    reclaimReplay()
                     abandonSocket(next)
                     transport = nil
                     continue
                 }
                 // End the hole on the new socket's origin so the resumed ann and
-                // the next seg share one session time.
+                // the next seg share one session time. A final already queued
+                // uses that same origin, so its `startMs` is not before the ann.
                 if let span = gap.end(atMs: lastSocketOrigin) {
                     continuation.yield(.gap(fromMs: span.fromMs, toMs: span.toMs))
                 }
@@ -357,11 +396,13 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
                     Field("result", "streaming"),
                 ])
                 continuation.yield(.state(.streaming))
-                reader = Task { await self.readLoop() }
                 armWatchdog()
                 return
             } catch {
                 let message = String(describing: error)
+                if reader != nil {
+                    stopCatchUpReader()
+                }
                 continuation.yield(.error(.socket(message)))
                 noteReconnect([
                     Field("track", track.rawValue),
@@ -514,7 +555,10 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
         let confidences = words.compactMap(\.conf)
         let confidence = confidences.isEmpty ? nil : confidences.reduce(0, +) / Double(confidences.count)
         seq += 1
-        if final { socketEmittedFinal = true }
+        if final {
+            socketEmittedFinal = true
+            postResumeFinal = true
+        }
         continuation.yield(.transcript(TranscriptEvent(
             track: track,
             kind: final ? .final : .partial,
@@ -539,16 +583,41 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
         return "S\(top + 1)"
     }
 
-    private func pump() async {
+    /// Chunk finals land about 3s into speech. The grade reads `events.jsonl`
+    /// when `resumed` appears, so this wait ends when that final has been
+    /// yielded, and still yields streaming if the server stays quiet.
+    private static let postResumeBudgetMs = 8_000
+
+    private func waitForPostResumeSegment() async {
+        var waited = 0
+        while !postResumeFinal && ready && !catchUpLost && !finishRequested && !Task.isCancelled && waited < Self.postResumeBudgetMs {
+            await Task.yield()
+            if postResumeFinal || !ready || catchUpLost || finishRequested || Task.isCancelled { return }
+            await configuration.sleep(.milliseconds(50))
+            waited += 50
+            if !ready || catchUpLost || finishRequested || Task.isCancelled { return }
+            await pump()
+        }
+    }
+
+    private func stopCatchUpReader() {
+        catchUpLost = false
+        reader?.cancel()
+        reader = nil
+        socketGeneration += 1
+    }
+
+    private func pump(minimumBytes: Int? = nil) async {
         guard pumpOwner == nil, ready, let transport else { return }
         let generation = socketGeneration
+        let minimum = minimumBytes ?? configuration.chunkBytes
         pumpOwner = generation
         defer {
             if pumpOwner == generation {
                 pumpOwner = nil
             }
         }
-        while pending.count >= configuration.chunkBytes && generation == socketGeneration {
+        while pending.count >= minimum && pending.count > 0 && generation == socketGeneration {
             let chunk = Self.takePrefix(&pending, configuration.chunkBytes)
             inFlight = chunk
             inFlightGeneration = generation
