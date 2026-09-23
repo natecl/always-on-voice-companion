@@ -103,32 +103,103 @@ import TranscriptionEngine
     try await waitUntil { transport.sentTexts.contains(GrokMessages.audioDone) }
 }
 
-@Test func reconnectEmitsGapAndRebasesWordTimes() async throws {
-    let clock = ManualClock()
-    let transport = ScriptedTransport()
-    let engine = GrokEngine(track: .system, configuration: GrokEngineConfiguration(
-        apiKey: "test-key",
-        url: GrokWebSocket.url(),
-        makeTransport: { transport },
-        sleep: { duration in
-            clock.advance(ms: Int(seconds(duration) * 1000))
-        },
-        nowMs: { clock.ms },
-        handshakeTimeout: .seconds(2),
-        inboundStall: .seconds(30)
-    ))
-    let connecting = Task { try await engine.connect(track: .system) }
-    transport.push(.text(#"{"type":"transcript.created"}"#))
-    try await connecting.value
-    try await engine.send(PCMFrame(track: .system, data: Data(count: 3_200), hostTime: 0))
-    try await waitUntil { transport.binaryCount == 1 }
+/// Two transport profiles for every reconnect test. `.friendly` is a socket
+/// whose `close()` returns and wakes `receive`. `.macParked` is Mac
+/// `URLSession` under a `pf` drop: `close()` and `cancel()` never return or
+/// wake the parked `receive`, and the in-window retry's connect parks too.
+/// A new reconnect test that only passes on `.friendly` is a review blocker.
+/// Both are Linux fakes; neither is Mac evidence.
+enum TransportProfile: String, CaseIterable, Sendable, CustomStringConvertible {
+    case friendly
+    case macParked
 
-    var iterator = engine.events.makeAsyncIterator()
-    transport.push(.closed(code: 1006, reason: "drop"))
-    transport.push(.text(#"{"type":"transcript.created"}"#))
+    var description: String { rawValue }
+
+    /// The socket that finally resumes: the parked profile burns one retry.
+    var resumeIndex: Int { self == .friendly ? 1 : 2 }
+    /// Session clock at that socket's origin: 1 s backoff, plus 2 s after the parked retry.
+    var resumeOriginMs: Int { self == .friendly ? 1_000 : 3_000 }
+    var handshakeTimeout: Duration { self == .friendly ? .seconds(2) : .milliseconds(400) }
+
+    func configure(_ index: Int, _ socket: ScriptedTransport) {
+        guard self == .macParked, index < resumeIndex else { return }
+        socket.wakeReceiveOnClose = false
+        socket.ignoreReceiveCancel = true
+        socket.hangClose = true
+        if index >= 1 {
+            socket.hangConnect = true
+        }
+    }
+}
+
+private let created = GrokSocketEvent.text(#"{"type":"transcript.created"}"#)
+
+private final class ReconnectRig: @unchecked Sendable {
+    let supply = SocketSupply()
+    let clock = ManualClock()
+    let engine: GrokEngine
+    let profile: TransportProfile
+
+    init(
+        profile: TransportProfile,
+        inboundStall: Duration = .seconds(30),
+        handshakeTimeout: Duration? = nil,
+        configure: @escaping (Int, ScriptedTransport) -> Void = { _, _ in }
+    ) {
+        self.profile = profile
+        let supply = supply
+        let clock = clock
+        supply.configure = { index, socket in
+            profile.configure(index, socket)
+            configure(index, socket)
+        }
+        engine = GrokEngine(track: .system, configuration: GrokEngineConfiguration(
+            apiKey: "test-key",
+            url: GrokWebSocket.url(),
+            makeTransport: { supply.make() },
+            sleep: { duration in
+                clock.advance(ms: Int(seconds(duration) * 1000))
+            },
+            nowMs: { clock.ms },
+            handshakeTimeout: handshakeTimeout ?? profile.handshakeTimeout,
+            inboundStall: inboundStall
+        ))
+    }
+
+    func socket(_ index: Int) async throws -> ScriptedTransport {
+        try await waitUntil { self.supply.count > index }
+        return try #require(supply.socket(index))
+    }
+
+    func connected() async throws -> ScriptedTransport {
+        let connecting = Task { try await engine.connect(track: .system) }
+        let first = try await socket(0)
+        first.push(created)
+        try await connecting.value
+        return first
+    }
+
+    func releaseAll() {
+        for index in 0..<supply.count {
+            supply.socket(index)?.release()
+        }
+    }
+}
+
+@Test(arguments: TransportProfile.allCases)
+func reconnectEmitsGapAndRebasesWordTimes(profile: TransportProfile) async throws {
+    let rig = ReconnectRig(profile: profile) { index, socket in
+        if index == profile.resumeIndex { socket.push(created) }
+    }
+    let first = try await rig.connected()
+    try await rig.engine.send(PCMFrame(track: .system, data: Data(count: 3_200), hostTime: 0))
+    try await waitUntil { first.binaryCount == 1 }
+
+    var iterator = rig.engine.events.makeAsyncIterator()
+    first.push(.closed(code: 1006, reason: "drop"))
     var sawGap = false
     var sawDegraded = false
-    for _ in 0..<12 {
+    for _ in 0..<24 {
         guard let event = await iterator.next() else { break }
         if case .state(.degraded) = event { sawDegraded = true }
         if case .gap(let from, let to) = event {
@@ -139,61 +210,53 @@ import TranscriptionEngine
     }
     #expect(sawDegraded)
     #expect(sawGap)
-    #expect(transport.connectCount >= 2)
+    let resumed = try await rig.socket(profile.resumeIndex)
 
-    transport.push(.text(#"""
+    resumed.push(.text(#"""
     {"type":"transcript.partial","text":"again","is_final":true,"start":0.0,"duration":0.1,"words":[{"text":"again","start":0.0,"end":0.1}]}
     """#))
     var rebased = false
     for _ in 0..<8 {
         guard let event = await iterator.next() else { break }
         if case .transcript(let transcript) = event, transcript.kind == .final {
-            // Backoff advanced the session clock by 1s. The new socket lands there,
+            // Backoff advanced the session clock. The new socket lands there,
             // not on the byte cursor from before the drop.
-            #expect(transcript.startMs == 1_000)
+            #expect(transcript.startMs == profile.resumeOriginMs)
             rebased = true
             break
         }
     }
     #expect(rebased)
-    await engine.finish()
+    await rig.engine.finish()
+    rig.releaseAll()
 }
 
-@Test func postResumeFinalIsQueuedBeforeStreamingAndNotBeforeTheGap() async throws {
-    let clock = ManualClock()
-    let transport = ScriptedTransport()
-    let engine = GrokEngine(track: .system, configuration: GrokEngineConfiguration(
-        apiKey: "test-key",
-        url: GrokWebSocket.url(),
-        makeTransport: { transport },
-        sleep: { duration in
-            clock.advance(ms: Int(seconds(duration) * 1000))
-        },
-        nowMs: { clock.ms },
-        handshakeTimeout: .seconds(2),
-        inboundStall: .seconds(30)
-    ))
-    let connecting = Task { try await engine.connect(track: .system) }
-    transport.push(.text(#"{"type":"transcript.created"}"#))
-    try await connecting.value
-    try await engine.send(PCMFrame(track: .system, data: Data(count: 3_200), hostTime: 0))
-    try await waitUntil { transport.binaryCount == 1 }
+@Test(arguments: TransportProfile.allCases)
+func postResumeFinalIsQueuedBeforeStreamingAndNotBeforeTheGap(profile: TransportProfile) async throws {
+    let rig = ReconnectRig(profile: profile) { index, socket in
+        if index == profile.resumeIndex {
+            socket.push(created)
+            socket.push(.text(partial(text: "after", start: 0.0, duration: 0.2, isFinal: true, speechFinal: true)))
+        }
+    }
+    let first = try await rig.connected()
+    try await rig.engine.send(PCMFrame(track: .system, data: Data(count: 3_200), hostTime: 0))
+    try await waitUntil { first.binaryCount == 1 }
 
-    var iterator = engine.events.makeAsyncIterator()
-    transport.push(.closed(code: 1006, reason: "drop"))
-    transport.push(.text(#"{"type":"transcript.created"}"#))
-    transport.push(.text(partial(text: "after", start: 0.0, duration: 0.2, isFinal: true, speechFinal: true)))
+    var iterator = rig.engine.events.makeAsyncIterator()
+    first.push(.closed(code: 1006, reason: "drop"))
 
     var order: [String] = []
     var gapTo = 0
     var segStart = -1
     var degraded = false
-    for _ in 0..<16 {
+    for _ in 0..<24 {
         guard let event = await iterator.next() else { break }
         switch event {
         case .state(.degraded):
+            // The parked profile announces each retry; the chain is one degrade.
+            if !degraded { order.append("degraded") }
             degraded = true
-            order.append("degraded")
         case .transcript(let transcript) where degraded && transcript.kind == .final:
             order.append("seg")
             segStart = transcript.startMs
@@ -209,37 +272,26 @@ import TranscriptionEngine
     }
     #expect(order == ["degraded", "seg", "gap", "streaming"])
     #expect(segStart >= gapTo)
-    await engine.finish()
+    await rig.engine.finish()
+    rig.releaseAll()
 }
 
-@Test func reconnectSendsTheShortTailTheChunkPumpLeftBehind() async throws {
-    let clock = ManualClock()
-    let transport = ScriptedTransport()
-    let engine = GrokEngine(track: .system, configuration: GrokEngineConfiguration(
-        apiKey: "test-key",
-        url: GrokWebSocket.url(),
-        makeTransport: { transport },
-        sleep: { duration in
-            clock.advance(ms: Int(seconds(duration) * 1000))
-        },
-        nowMs: { clock.ms },
-        handshakeTimeout: .seconds(2),
-        inboundStall: .seconds(30)
-    ))
-    let connecting = Task { try await engine.connect(track: .system) }
-    transport.push(.text(#"{"type":"transcript.created"}"#))
-    try await connecting.value
+@Test(arguments: TransportProfile.allCases)
+func reconnectSendsTheShortTailTheChunkPumpLeftBehind(profile: TransportProfile) async throws {
+    let rig = ReconnectRig(profile: profile) { index, socket in
+        if index == profile.resumeIndex { socket.push(created) }
+    }
+    let first = try await rig.connected()
     let tail = Data(repeating: 5, count: 100)
-    try await engine.send(PCMFrame(track: .system, data: tail, hostTime: 0))
+    try await rig.engine.send(PCMFrame(track: .system, data: tail, hostTime: 0))
     try await Task.sleep(for: .milliseconds(30))
-    #expect(transport.binaryCount == 0)
+    #expect(first.binaryCount == 0)
 
-    var iterator = engine.events.makeAsyncIterator()
-    transport.push(.closed(code: 1006, reason: "drop"))
-    transport.push(.text(#"{"type":"transcript.created"}"#))
+    var iterator = rig.engine.events.makeAsyncIterator()
+    first.push(.closed(code: 1006, reason: "drop"))
     var sawDegraded = false
     var sawStreaming = false
-    for _ in 0..<12 {
+    for _ in 0..<24 {
         guard let event = await iterator.next() else { break }
         if case .state(.degraded) = event { sawDegraded = true }
         if case .state(.streaming) = event, sawDegraded {
@@ -248,37 +300,27 @@ import TranscriptionEngine
         }
     }
     #expect(sawStreaming)
-    #expect(transport.binaryCount == 1)
-    #expect(transport.binary(at: 0) == tail)
-    await engine.finish()
+    let resumed = try await rig.socket(profile.resumeIndex)
+    try await waitUntil { resumed.binaryCount >= 1 }
+    #expect(resumed.binaryCount == 1)
+    #expect(resumed.binary(at: 0) == tail)
+    await rig.engine.finish()
+    rig.releaseAll()
 }
 
-@Test func stalledSocketReconnectsReplaysAudioAndEmitsAGap() async throws {
-    let clock = ManualClock()
-    let transport = ScriptedTransport()
-    let engine = GrokEngine(track: .system, configuration: GrokEngineConfiguration(
-        apiKey: "test-key",
-        url: GrokWebSocket.url(),
-        makeTransport: { transport },
-        sleep: { duration in
-            clock.advance(ms: Int(seconds(duration) * 1000))
-        },
-        nowMs: { clock.ms },
-        handshakeTimeout: .seconds(2),
-        inboundStall: .milliseconds(80)
-    ))
-    var iterator = engine.events.makeAsyncIterator()
-    let connecting = Task { try await engine.connect(track: .system) }
-    transport.push(.text(#"{"type":"transcript.created"}"#))
-    try await connecting.value
+@Test(arguments: TransportProfile.allCases)
+func stalledSocketReconnectsReplaysAudioAndEmitsAGap(profile: TransportProfile) async throws {
+    let rig = ReconnectRig(profile: profile, inboundStall: .milliseconds(80)) { index, socket in
+        if index == profile.resumeIndex { socket.push(created) }
+    }
+    var iterator = rig.engine.events.makeAsyncIterator()
+    let first = try await rig.connected()
     let frame = Data(repeating: 9, count: 3_200)
-    try await engine.send(PCMFrame(track: .system, data: frame, hostTime: 0))
-    try await waitUntil { transport.binaryCount == 1 }
-    try await waitUntil { transport.connectCount >= 2 }
-    transport.push(.text(#"{"type":"transcript.created"}"#))
+    try await rig.engine.send(PCMFrame(track: .system, data: frame, hostTime: 0))
+    try await waitUntil { first.binaryCount == 1 }
     var sawGap = false
     var sawDegraded = false
-    for _ in 0..<16 {
+    for _ in 0..<24 {
         guard let event = await iterator.next() else { break }
         if case .state(.degraded) = event { sawDegraded = true }
         if case .gap = event { sawGap = true }
@@ -286,38 +328,78 @@ import TranscriptionEngine
     }
     #expect(sawDegraded)
     #expect(sawGap)
-    try await waitUntil { transport.binaryCount >= 2 }
-    #expect(transport.binary(at: 1) == frame)
-    await engine.finish()
+    let resumed = try await rig.socket(profile.resumeIndex)
+    try await waitUntil { resumed.binaryCount >= 1 }
+    #expect(resumed.binary(at: 0) == frame)
+    await rig.engine.finish()
+    rig.releaseAll()
 }
 
-@Test func bufferedSendReconnectsWhenCloseDoesNotWakeReceive() async throws {
-    let clock = ManualClock()
-    let supply = SocketSupply()
-    supply.configure = { index, socket in
+@Test(arguments: TransportProfile.allCases)
+func resumeReportsTheBacklogAndItsFirstFinalIsBacklog(profile: TransportProfile) async throws {
+    let rig = ReconnectRig(profile: profile)
+    let first = try await rig.connected()
+    #expect(await rig.engine.snapshot().lastResumeBacklogMs == 0)
+    try await rig.engine.send(PCMFrame(track: .system, data: Data(count: 3_200), hostTime: 0))
+    try await waitUntil { first.binaryCount == 1 }
+    var iterator = rig.engine.events.makeAsyncIterator()
+    first.push(.closed(code: 1006, reason: "drop"))
+    let resumed = try await rig.socket(profile.resumeIndex)
+    // 1 s of audio captured during the outage, queued behind the 100 ms replay.
+    for _ in 0..<10 {
+        try await rig.engine.send(PCMFrame(track: .system, data: Data(count: 3_200), hostTime: 0))
+    }
+    resumed.push(created)
+    var streamingAfterDrop = false
+    var degraded = false
+    for _ in 0..<24 {
+        guard let event = await iterator.next() else { break }
+        if case .state(.degraded) = event { degraded = true }
+        if case .state(.streaming) = event, degraded {
+            streamingAfterDrop = true
+            break
+        }
+    }
+    #expect(streamingAfterDrop)
+    let backlog = await rig.engine.snapshot().lastResumeBacklogMs
+    #expect(backlog >= 1_100)
+    resumed.push(.text(partial(text: "backlog words", start: 0.0, duration: 0.5, isFinal: true, speechFinal: true)))
+    var firstFinal: TranscriptEvent?
+    for _ in 0..<8 {
+        guard let event = await iterator.next() else { break }
+        if case .transcript(let transcript) = event, transcript.kind == .final {
+            firstFinal = transcript
+            break
+        }
+    }
+    // The first post-resume final is backlog audio, so it lands inside
+    // [origin, origin + backlogMs). A grader must not count it as live.
+    let start = try #require(firstFinal?.startMs)
+    #expect(start >= profile.resumeOriginMs)
+    #expect(start < profile.resumeOriginMs + backlog)
+    await rig.engine.finish()
+    rig.releaseAll()
+}
+
+@Test(arguments: TransportProfile.allCases)
+func bufferedSendReconnectsWhenCloseDoesNotWakeReceive(profile: TransportProfile) async throws {
+    let rig = ReconnectRig(profile: profile, inboundStall: .milliseconds(80)) { index, socket in
         if index == 0 {
             socket.wakeReceiveOnClose = false
             socket.ignoreReceiveCancel = true
         }
     }
-    let engine = stalledEngine(supply: supply, clock: clock)
-    defer { supply.socket(0)?.release() }
-    var iterator = engine.events.makeAsyncIterator()
-    let connecting = Task { try await engine.connect(track: .system) }
-    try await waitUntil { supply.count >= 1 }
-    let first = try #require(supply.socket(0))
-    first.push(.text(#"{"type":"transcript.created"}"#))
-    try await connecting.value
+    var iterator = rig.engine.events.makeAsyncIterator()
+    let first = try await rig.connected()
     let frame = Data(repeating: 9, count: 3_200)
-    try await engine.send(PCMFrame(track: .system, data: frame, hostTime: 0))
+    try await rig.engine.send(PCMFrame(track: .system, data: frame, hostTime: 0))
     try await waitUntil { first.binaryCount == 1 }
     let parked = first.receiveReturns
-    try await waitUntil { supply.count >= 2 }
-    let second = try #require(supply.socket(1))
-    second.push(.text(#"{"type":"transcript.created"}"#))
+    let second = try await rig.socket(profile.resumeIndex)
+    second.push(created)
     var sawGap = false
     var sawDegraded = false
-    for _ in 0..<16 {
+    for _ in 0..<24 {
         guard let event = await iterator.next() else { break }
         if case .state(.degraded) = event { sawDegraded = true }
         if case .gap = event { sawGap = true }
@@ -335,39 +417,32 @@ import TranscriptionEngine
     for _ in 0..<8 {
         guard let event = await iterator.next() else { break }
         if case .transcript(let transcript) = event, transcript.kind == .final {
-            #expect(transcript.startMs == 1_000)
+            #expect(transcript.startMs == profile.resumeOriginMs)
             rebased = true
             break
         }
     }
     #expect(rebased)
-    first.release()
-    await engine.finish()
+    await rig.engine.finish()
+    rig.releaseAll()
 }
 
-@Test func blockedSendAfterWatermarkStillReconnects() async throws {
-    let clock = ManualClock()
-    let supply = SocketSupply()
-    supply.configure = { index, socket in
+@Test(arguments: TransportProfile.allCases)
+func blockedSendAfterWatermarkStillReconnects(profile: TransportProfile) async throws {
+    // Longer than one watchdog poll so the acking transcript lands before the
+    // stall check. 80ms would race the first poll and reconnect too soon.
+    let rig = ReconnectRig(profile: profile, inboundStall: .milliseconds(250)) { index, socket in
         if index == 0 {
             socket.wakeReceiveOnClose = false
             socket.ignoreReceiveCancel = true
             socket.hangSendsAfter = 1
         }
     }
-    // Longer than one watchdog poll so the acking transcript lands before the
-    // stall check. 80ms would race the first poll and reconnect too soon.
-    let engine = stalledEngine(supply: supply, clock: clock, inboundStall: .milliseconds(250))
-    defer { supply.socket(0)?.release() }
-    var iterator = engine.events.makeAsyncIterator()
-    let connecting = Task { try await engine.connect(track: .system) }
-    try await waitUntil { supply.count >= 1 }
-    let first = try #require(supply.socket(0))
-    first.push(.text(#"{"type":"transcript.created"}"#))
-    try await connecting.value
+    var iterator = rig.engine.events.makeAsyncIterator()
+    let first = try await rig.connected()
     let sent = Data(repeating: 3, count: 3_200)
     let blocked = Data(repeating: 4, count: 3_200)
-    try await engine.send(PCMFrame(track: .system, data: sent, hostTime: 0))
+    try await rig.engine.send(PCMFrame(track: .system, data: sent, hostTime: 0))
     try await waitUntil { first.binaryCount == 1 }
     first.push(.text(#"""
     {"type":"transcript.partial","text":"heard","is_final":true,"speech_final":true,"start":0.0,"duration":0.1,"words":[{"text":"heard","start":0.0,"end":0.1}]}
@@ -382,12 +457,12 @@ import TranscriptionEngine
     }
     #expect(heard)
     let parked = first.receiveReturns
+    let engine = rig.engine
     let hung = Task { try await engine.send(PCMFrame(track: .system, data: blocked, hostTime: 0)) }
-    try await waitUntil { supply.count >= 2 }
-    let second = try #require(supply.socket(1))
-    second.push(.text(#"{"type":"transcript.created"}"#))
+    let second = try await rig.socket(profile.resumeIndex)
+    second.push(created)
     var sawGap = false
-    for _ in 0..<16 {
+    for _ in 0..<24 {
         guard let event = await iterator.next() else { break }
         if case .gap = event { sawGap = true }
         if case .state(.streaming) = event, sawGap { break }
@@ -398,15 +473,20 @@ import TranscriptionEngine
     // Only the chunk still blocked in `send` is replayed.
     try await waitUntil { second.binaryCount >= 1 }
     #expect(second.binary(at: 0) == blocked)
-    first.release()
-    await engine.finish()
+    await rig.engine.finish()
+    rig.releaseAll()
     _ = try? await hung.value
 }
 
-@Test func handshakeTimeoutClosesParkedReceiveAndEmitsGap() async throws {
+@Test(arguments: TransportProfile.allCases)
+func handshakeTimeoutClosesParkedReceiveAndEmitsGap(profile: TransportProfile) async throws {
     let clock = ManualClock()
     let supply = SocketSupply()
     supply.configure = { index, socket in
+        if profile == .macParked, index < 2 {
+            // Mac: neither the dead socket's close nor the parked handshake's returns.
+            socket.hangClose = true
+        }
         if index == 0 {
             socket.wakeReceiveOnClose = false
             socket.ignoreReceiveCancel = true
@@ -732,12 +812,12 @@ private final class ProbeFlag: @unchecked Sendable {
     var value = false
 }
 
-private final class ManualClock: @unchecked Sendable {
+final class ManualClock: @unchecked Sendable {
     var ms = 0
     func advance(ms: Int) { self.ms += ms }
 }
 
-private final class SocketSupply: @unchecked Sendable {
+final class SocketSupply: @unchecked Sendable {
     private let lock = NSLock()
     private var sockets: [ScriptedTransport] = []
     var configure: (Int, ScriptedTransport) -> Void = { _, _ in }
@@ -766,7 +846,7 @@ private final class SocketSupply: @unchecked Sendable {
     }
 }
 
-private final class ScriptedTransport: GrokTransport, @unchecked Sendable {
+final class ScriptedTransport: GrokTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var queue: [Result<GrokSocketEvent, Error>] = []
     private var waiters: [UUID: CheckedContinuation<GrokSocketEvent, Error>] = [:]
