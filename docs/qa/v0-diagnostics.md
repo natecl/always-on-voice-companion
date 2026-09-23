@@ -116,4 +116,14 @@ First match wins. `TRACE error=` is the underlying error (domain and code, OSSta
 | `transcript-write` | `error=` present | assemble/end failed | the error names the path and errno |
 | `transcript-write` | `bytes=0` and `segments=0` | nothing to write | the trace points upstream; this is a symptom |
 
+## P3 packet filter
+
+`catcher/harness/p3_net_kill.sh` loads and clears the `catcher` anchor only when `CATCHER_ALLOW_PF=1`. Every `pfctl` invocation is `sudo -n /sbin/pfctl` (absolute path). `-n` means a missing sudoers rule exits instead of waiting for a password. Nathan installs `/etc/sudoers.d/catcher-p3` with:
+
+```
+n.chinlue ALL=(root) NOPASSWD: /sbin/pfctl
+```
+
+The sudoers command must be `/sbin/pfctl`. A different path does not match NOPASSWD.
+
 Mid-session Screen Recording revoke and socket reconnect are graded from `blocked`, `degraded`, `gap`, and `resumed` annotations. They do not add a stage line. `degraded` and `resumed` detail text ends in `track=<t>`, and `resumed` carries `backlogMs=<n>` (audio the new socket replays before live). `noAudio` and heartbeat/handshake `degraded` carry `emittedAtMs=`; `noAudio` also carries `observedFromMs=` (capture start). `stages.log` is still never read by `grade.py`; provenance comes from `harness_run.json`, not from stage lines.

@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Block api.x.ai for 15s mid-session. Requires root and CATCHER_ALLOW_PF=1.
+# Block api.x.ai for 15s mid-session. Requires CATCHER_ALLOW_PF=1.
+# Every pfctl call is `sudo -n /sbin/pfctl` so NOPASSWD matches the absolute
+# path and a missing sudoers rule fails closed (no password prompt). Nathan
+# installs /etc/sudoers.d/catcher-p3 with:
+#   n.chinlue ALL=(root) NOPASSWD: /sbin/pfctl
 # The fixture loops the whole time so there is live speech before, during,
 # and after the block. pf on/off wall times go into harness_run.json. After
 # the rule clears the script waits for the system resume grade.py will grade
@@ -11,7 +15,7 @@ source "$ROOT/lib.sh"
 SESSION="${1:?session dir}"
 mkdir -p "$SESSION"
 if [[ "${CATCHER_ALLOW_PF:-}" != "1" ]]; then
-  echo "Refusing to change the packet filter. Re-run as root with CATCHER_ALLOW_PF=1." >&2
+  echo "Refusing to change the packet filter. Re-run with CATCHER_ALLOW_PF=1." >&2
   exit 2
 fi
 export CATCHER_ENGINE=grok
@@ -23,7 +27,7 @@ cleanup() {
     kill "$PLAYER" 2>/dev/null || true
     pkill -P "$PLAYER" afplay 2>/dev/null || true
   fi
-  pfctl -a catcher -F all >/dev/null 2>&1 || true
+  sudo -n /sbin/pfctl -a catcher -F all >/dev/null 2>&1 || true
   if [[ -n "$RULE" ]]; then
     rm -f "$RULE"
   fi
@@ -57,7 +61,7 @@ RULE="$(mktemp)"
   echo "block drop out quick proto { tcp udp } from any to <catcher_xai> port 443"
   echo "block drop in quick proto { tcp udp } from <catcher_xai> port 443 to any"
 } > "$RULE"
-pfctl -a catcher -f "$RULE"
+sudo -n /sbin/pfctl -a catcher -f "$RULE"
 append_harness_field "$SESSION" pfOnWallMs "$(wall_ms)"
 # pf passes a packet that matches an existing state without reading the rule.
 # Kill any such states. These run alongside the window, not before pfOn: the
@@ -66,16 +70,16 @@ append_harness_field "$SESSION" pfOnWallMs "$(wall_ms)"
 KILLS=()
 for ip in $IPS; do
   if [[ "$ip" == *:* ]]; then any="::/0"; else any="0.0.0.0/0"; fi
-  pfctl -k "$any" -k "$ip" >/dev/null 2>&1 &
+  sudo -n /sbin/pfctl -k "$any" -k "$ip" >/dev/null 2>&1 &
   KILLS+=("$!")
 done
 sleep 15
 wait "${KILLS[@]}" 2>/dev/null || true
 # Rules first, then stamp: -F all clears rules before its slower steps, so a
 # stamp after it lands seconds after traffic can flow again.
-pfctl -a catcher -F rules >/dev/null 2>&1 || true
+sudo -n /sbin/pfctl -a catcher -F rules >/dev/null 2>&1 || true
 append_harness_field "$SESSION" pfOffWallMs "$(wall_ms)"
-pfctl -a catcher -F all >/dev/null 2>&1 || true
+sudo -n /sbin/pfctl -a catcher -F all >/dev/null 2>&1 || true
 echo "Network restored. Waiting for the system resume grade.py will grade."
 TARGET="$(resolve_session "$SESSION")"
 NEED="$(python3 - "$TARGET" "$ROOT" "$SESSION/harness_run.json" <<'PY'
