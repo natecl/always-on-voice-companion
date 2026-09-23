@@ -328,7 +328,11 @@ public actor Pipeline {
                 continue
             }
             let stored = await store?.syncedFinalCount ?? 0
-            await emit(await verifier.observeEngine(stamped, track: track, atMs: at, storedCount: stored))
+            var backlogMs: Int?
+            if case .state(.streaming) = stamped, let diagnostics = engines[track] as? EngineDiagnostics {
+                backlogMs = await diagnostics.snapshot().lastResumeBacklogMs
+            }
+            await emit(await verifier.observeEngine(stamped, track: track, atMs: at, storedCount: stored, backlogMs: backlogMs))
             if case .transcript(let transcript) = stamped {
                 if transcript.kind != .final {
                     await ledger.notePartial()

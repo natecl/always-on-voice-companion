@@ -267,6 +267,91 @@ import TranscriptionEngine
     #expect(transcript.field("error")?.isEmpty == false)
 }
 
+@Test func resumedRowCarriesTrackAndEngineBacklog() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("catcher-resume-\(UUID().uuidString)", isDirectory: true)
+    let capture = FakeCapture()
+    let engines = LockedEngines()
+    let pipeline = Pipeline(
+        sessionRoot: root,
+        makeCapture: { capture },
+        makeEngine: { track in engines.make(track) },
+        launchProbe: { .granted },
+        recheckProbe: { .granted },
+        engineLabel: "stub"
+    )
+    await pipeline.start()
+    let directory = try #require(await pipeline.sessionDirectory)
+    engines.engine(.system)?.dropAndResume(backlogMs: 21_000)
+    try await waitUntil {
+        let text = (try? String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)) ?? ""
+        return text.contains("\"kind\":\"resumed\"")
+    }
+    await pipeline.stop()
+    let events = try String(contentsOf: SessionPaths.eventsFile(in: directory), encoding: .utf8)
+    #expect(events.contains("ws closed (1006) track=system"))
+    #expect(events.contains("\"track\":\"system\""))
+    #expect(events.contains("transport resumed track=system backlogMs=21000"))
+    try expectEventShapeUnchanged(events)
+}
+
+private final class LockedEngines: @unchecked Sendable {
+    private let lock = NSLock()
+    private var made: [AudioTrack: ReconnectingEngine] = [:]
+
+    func make(_ track: AudioTrack) -> ReconnectingEngine {
+        let engine = ReconnectingEngine()
+        lock.lock()
+        made[track] = engine
+        lock.unlock()
+        return engine
+    }
+
+    func engine(_ track: AudioTrack) -> ReconnectingEngine? {
+        lock.lock()
+        defer { lock.unlock() }
+        return made[track]
+    }
+}
+
+private final class ReconnectingEngine: TranscriptionEngine, EngineDiagnostics, @unchecked Sendable {
+    let events: AsyncStream<EngineEvent>
+    private let continuation: AsyncStream<EngineEvent>.Continuation
+    private let lock = NSLock()
+    private var backlog = 0
+
+    init() {
+        let pair = AsyncStream<EngineEvent>.makeStream()
+        events = pair.stream
+        continuation = pair.continuation
+    }
+
+    func connect(track: AudioTrack) async throws {
+        continuation.yield(.state(.connecting))
+        continuation.yield(.state(.ready))
+        continuation.yield(.state(.streaming))
+    }
+
+    func send(_ frame: PCMFrame) async throws {}
+
+    func finish() async {
+        continuation.yield(.state(.closed))
+        continuation.finish()
+    }
+
+    func dropAndResume(backlogMs: Int) {
+        lock.lock()
+        backlog = backlogMs
+        lock.unlock()
+        continuation.yield(.state(.degraded(reason: "ws closed (1006)")))
+        continuation.yield(.gap(fromMs: 1_000, toMs: 2_000))
+        continuation.yield(.state(.streaming))
+    }
+
+    func snapshot() async -> EngineDiagnosticsSnapshot {
+        EngineDiagnosticsSnapshot(lastResumeBacklogMs: lock.withLock { backlog })
+    }
+}
+
 private func stageLines(in directory: URL) throws -> [StageLine] {
     let text = try String(contentsOf: directory.appendingPathComponent("stages.log"), encoding: .utf8)
     return text.split(separator: "\n", omittingEmptySubsequences: true).compactMap { StageLine.parse(String($0)) }

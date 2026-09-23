@@ -82,8 +82,14 @@ public actor Verifier {
         return publish(annotations: annotation.map { [$0] } ?? [], atMs: atMs)
     }
 
-    public func observeEngine(_ event: EngineEvent, track: AudioTrack, atMs: Int, storedCount: Int) -> VerifierEffect {
-        let annotations = transport.observe(event, track: track, atMs: atMs)
+    public func observeEngine(
+        _ event: EngineEvent,
+        track: AudioTrack,
+        atMs: Int,
+        storedCount: Int,
+        backlogMs: Int? = nil
+    ) -> VerifierEffect {
+        let annotations = transport.observe(event, track: track, atMs: atMs, backlogMs: backlogMs)
         if case .transcript(let transcript) = event, transcript.kind == .final {
             sanity.observeFinal(text: transcript.text)
             crash.observeEngineFinal(atMs: atMs, storedCount: storedCount)
@@ -114,7 +120,7 @@ public actor Verifier {
         if let sanityAnn = sanity.tick(atMs: atMs) {
             annotations.append(sanityAnn)
         }
-        annotations.append(contentsOf: transport.tick(atMs: atMs, audioFlowing: audio.audioFlowing && !audio.noAudio))
+        annotations.append(contentsOf: transport.tick(atMs: atMs, audioFlowingTracks: audio.noAudio ? [] : audio.sustainedTracks))
         if let crashAnn = crash.tick(atMs: atMs) {
             annotations.append(crashAnn)
         }

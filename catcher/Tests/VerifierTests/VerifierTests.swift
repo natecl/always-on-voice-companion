@@ -109,6 +109,41 @@ import Verifier
     #expect(resumed.snapshot.status.isOk)
 }
 
+@Test func systemReconnectDoesNotClearMicrophoneDegraded() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    let reason = "ws closed (1006); reconnect #1 in 1s"
+    let system = await verifier.observeEngine(.state(.degraded(reason: reason)), track: .system, atMs: 5_000, storedCount: 0)
+    let mic = await verifier.observeEngine(.state(.degraded(reason: reason)), track: .microphone, atMs: 5_100, storedCount: 0)
+    // Identical reason text on two tracks is two rows.
+    #expect(system.annotations.map(text) == ["\(reason) track=system"])
+    #expect(mic.annotations.map(text) == ["\(reason) track=microphone"])
+    let back = await verifier.observeEngine(.state(.streaming), track: .system, atMs: 20_000, storedCount: 0, backlogMs: 21_000)
+    #expect(back.annotations.map(text) == ["transport resumed track=system backlogMs=21000"])
+    if case .degraded = back.snapshot.status {} else {
+        Issue.record("microphone is still down; got \(back.snapshot.status)")
+    }
+    let micBack = await verifier.observeEngine(.state(.streaming), track: .microphone, atMs: 22_000, storedCount: 0, backlogMs: 0)
+    #expect(micBack.annotations.map(text) == ["transport resumed track=microphone backlogMs=0"])
+    #expect(micBack.snapshot.status.isOk)
+}
+
+@Test func heartbeatIsPerTrack() async {
+    let verifier = Verifier()
+    _ = await verifier.beginSession(atMs: 0)
+    _ = await verifier.captureStarted(atMs: 0)
+    _ = await verifier.observeEngine(.state(.ready), track: .system, atMs: 100, storedCount: 0)
+    _ = await verifier.observeEngine(.state(.ready), track: .microphone, atMs: 100, storedCount: 0)
+    let speech = tone(track: .microphone, amplitude: 8_000)
+    _ = await verifier.observeFrame(PCMFrame.silence(track: .system, sampleCount: 160, hostTime: 0), atMs: 0)
+    _ = await verifier.observeFrame(speech, atMs: 0)
+    _ = await verifier.observeFrame(speech, atMs: AudioFlowCheck.speechHoldMs)
+    // The system engine keeps talking; only the flowing mic track is stale.
+    _ = await verifier.observeEngine(.state(.streaming), track: .system, atMs: 8_000, storedCount: 0)
+    let tick = await verifier.tick(atMs: 8_100)
+    #expect(tick.annotations.map(text) == ["no engine event for 8000ms while audio is flowing track=microphone emittedAtMs=8100"])
+}
+
 @Test func finalWordFloorFlagsWhenAudioIsFlowing() async {
     let verifier = Verifier()
     _ = await verifier.beginSession(atMs: 0)

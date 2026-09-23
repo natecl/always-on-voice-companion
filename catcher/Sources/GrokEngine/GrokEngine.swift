@@ -115,6 +115,7 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
     private var sendErrors = 0
     private var binaryFrames = 0
     private var authProbed = false
+    private var lastResumeBacklogMs = 0
     /// This session's `stages.log`. Nil in unit tests; the pipeline binds it.
     private var stageSink: (any StageSink)?
 
@@ -142,7 +143,8 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
             httpBody: httpBody,
             unknownMessages: unknownMessages,
             sendErrors: sendErrors,
-            binaryFrames: binaryFrames
+            binaryFrames: binaryFrames,
+            lastResumeBacklogMs: lastResumeBacklogMs
         )
     }
 
@@ -353,6 +355,8 @@ public actor GrokEngine: TranscriptionEngine, EngineDiagnostics, StageLogging {
                 transport = next
                 try await readUntilCreated(next)
                 if finishRequested { return }
+                // Read-only. What the new socket must replay before live audio.
+                lastResumeBacklogMs = PCMClock.milliseconds(bytesSent: pending.count + inFlight.count + replay.count)
                 // Arm `receive` before the replay send. The previous order pumped
                 // the backlog, yielded `streaming` (the verifier writes `resumed`),
                 // and only then started the reader. Mac graded the file at that
