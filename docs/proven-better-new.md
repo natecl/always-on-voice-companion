@@ -41,7 +41,8 @@ copy the mechanics at pixel level. Zero innovation budget, zero testing budget h
 **Better — kill all friction.**
 No bot to invite, no setup dance, just on. Near-zero latency responses (Pincus and Tan put
 zero-latency in *better*, not new — everyone says yes to it). Consumer-cheap via Jev
-judgment instead of frontier-model spend.
+judgment instead of frontier-model spend. Loud capture — never a silent blank session —
+shipped with the v0 transcript foundation.
 
 **New — the always-listening voice buddy.**
 The AI as a smart other person at the table: you turn to it mid-conversation and ask its
@@ -54,6 +55,8 @@ the listening surface, and the context depth independently.
 
 1. Can Jev judge utterances (commitment / deadline / decision / interrupt-worthy) with
    useful calibration? (Afternoon spike on real transcripts — before any build.)
-2. Is the 2-second judgment brief the heat? (v0 — the catcher.)
+2a. Can we capture reliably and loudly? DONE — v0 foundation green
+   ([09-v0-shipped.md](knowledge/09-v0-shipped.md)).
+2b. Is the 2-second judgment brief the heat? (v0 catcher, next.)
 3. Does live mid-conversation participation earn the turn-to-it behavior? (v1.)
 4. Does proactive interjection delight or annoy? (v2 — the buddy.)

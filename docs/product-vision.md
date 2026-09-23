@@ -1,7 +1,8 @@
 # Product Vision: Always-On Voice Companion
 
 **Status:** vision spec — the north star. The v0 build brief (with pass/fail) is a separate,
-smaller document. Nothing here is a build order until the v0 brief is approved.
+smaller document. v0's transcript foundation is shipped and graded
+([09-v0-shipped.md](knowledge/09-v0-shipped.md)); nothing above it is built.
 
 ## One-liner
 
@@ -37,7 +38,9 @@ A companion that hears what you hear:
 
 ## How it works
 
-1. **Always-on audio → streaming transcription** (Whisper-class, on-device where possible).
+1. **Always-on audio → streaming transcription.** Partially real: v0 does per-session Mac
+   capture of system audio and the mic → Grok Voice Transcribe 2.0 streaming → a verified
+   transcript. On-device transcription is still an open question.
 2. **Jev judgment stream.** Every utterance is judged in real time: commitment? deadline?
    decision? question for me? interrupt-worthy? Calibrated confidence scores gate everything
    downstream — including whether the companion speaks.
@@ -59,8 +62,12 @@ the entire bet.
 
 ## Phases
 
-- **v0 — the catcher (embarrassingly small).** Per-call record/upload → transcript → Jev
-  judges every utterance → 2-second judgment brief. Tests: is the judgment brief the heat?
+- **v0 foundation — shipped.** System audio + mic → verified transcript on disk; loud on
+  every failure (blocked, degraded/gap/resumed, noAudio); P1–P6 green at `95837a8`.
+  P4 passing does not prove system audio was captured.
+  See [09-v0-shipped.md](knowledge/09-v0-shipped.md).
+- **v0 catcher — next, not built.** Jev judges every utterance → 2-second judgment brief.
+  The test is unchanged: is the brief the heat?
 - **v1 — the participant.** Live in-conversation: turn to it mid-call, ask with full context.
 - **v2 — the buddy.** True always-on: ambient listening, proactive interjection gated by
   judgment confidence.
@@ -80,7 +87,10 @@ Each phase only starts if the previous one shows heat ("the fish are running").
 
 - Interjection policy: exactly when does it jump in vs. stay quiet? (Jev confidence thresholds, user-tunable.)
 - Privacy model for always-on: on-device vs. cloud, per-conversation consent, what gets stored.
-- Platform order: v0 desktop-first vs. phone-first. (Vision is voice-everywhere: phone, desktop, whatever.)
+  v0 stores a session directory with `events.jsonl`, `transcript.txt`, and `session.json`.
+  Raw PCM is written only in harness mode.
+- Platform order: v0 is desktop (macOS 15+). Phone is still open. (Vision is voice-everywhere:
+  phone, desktop, whatever.)
 - Distribution: prosumer/whales first (founder is whale #1), then the viral hook. Distribution
   can't be an afterthought — Pincus.
 
