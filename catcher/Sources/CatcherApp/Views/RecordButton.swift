@@ -3,6 +3,7 @@ import SwiftUI
 struct RecordButton: View {
     var isRecording: Bool
     var enabled: Bool
+    var frameFile: URL? = nil
     var action: () -> Void
 
     var body: some View {
@@ -14,5 +15,10 @@ struct RecordButton: View {
         .disabled(!enabled)
         .keyboardShortcut(isRecording ? .cancelAction : .defaultAction)
         .accessibilityIdentifier("recordButton")
+        .background {
+            if let frameFile {
+                ScreenFrameReporter(url: frameFile)
+            }
+        }
     }
 }

@@ -81,6 +81,10 @@ public actor Pipeline {
 
     private var capture: (any AudioCapturing)?
     private var store: SessionStore?
+    /// Harness-only. Nil outside `CATCHER_HARNESS=1`, so a normal session writes
+    /// the same `events.jsonl` as v0.
+    private let writeLatency: Bool
+    private var probe: LatencyProbe?
     private var directory: URL?
     private var engines: [AudioTrack: any TranscriptionEngine] = [:]
     private var eventTasks: [Task<Void, Never>] = []
@@ -125,6 +129,7 @@ public actor Pipeline {
         launchProbe: @escaping @Sendable () async -> PermissionState = { await PermissionGate.startCaptureProbe() },
         recheckProbe: @escaping @Sendable () async -> PermissionState = { PermissionGate.recheck() },
         recordPCM: Bool = false,
+        writeLatency: Bool = false,
         engineLabel: String = EngineFactory.sessionEngineName(),
         probeInterval: Duration = .seconds(1),
         clock: any SessionClock = HostSessionClock(),
@@ -137,6 +142,7 @@ public actor Pipeline {
         self.launchProbe = launchProbe
         self.recheckProbe = recheckProbe
         self.recordPCM = recordPCM
+        self.writeLatency = writeLatency
         self.engineLabel = engineLabel
         self.probeInterval = probeInterval
         self.clock = clock
@@ -160,7 +166,35 @@ public actor Pipeline {
     public var isRunning: Bool { sessionOpen }
     public var sessionDirectory: URL? { directory }
 
+    /// UI apply time for one transcript event. Harness sessions only; a nil probe
+    /// returns immediately. The stamp is taken by the caller before this await.
+    public func noteShown(track: AudioTrack, seq: Int, atMs: Int) {
+        probe?.noteShown(track: track, seq: seq, atMs: atMs)
+    }
+
+    private func openProbe(directory: URL, request: StartRequest, originWallMs: Int) {
+        guard writeLatency else { return }
+        let sidecar = SessionSidecar(url: SessionPaths.latencyFile(in: directory))
+        let created = LatencyProbe(sidecar: sidecar)
+        created.begin(
+            origin: origin,
+            request: request,
+            originWallMs: originWallMs,
+            app: CatcherMetadata.headerApp
+        )
+        probe = created
+    }
+
     public func start() async {
+        let now = clock.now()
+        await start(request: StartRequest(
+            source: .recordButton,
+            inputHostTime: now,
+            processStartHostTime: now
+        ))
+    }
+
+    public func start(request: StartRequest) async {
         if sessionOpen || halting { return }
         ended = false
         failing = false
@@ -172,8 +206,10 @@ public actor Pipeline {
         closing = false
         pcmError = nil
         sink = nil
+        probe = nil
         await ledger.reset()
         origin = clock.now()
+        let originWallMs = Int((Date().timeIntervalSince1970 * 1000).rounded())
         SessionClockAnchor.reset(to: origin)
         holdOffAppNap()
         let id = UUID()
@@ -189,6 +225,7 @@ public actor Pipeline {
                 tracks: AudioTrack.allCases.map(\.rawValue),
                 app: CatcherMetadata.headerApp
             ))
+            openProbe(directory: directory, request: request, originWallMs: originWallMs)
         } catch {
             let sentence = ErrorDetail.sentence(error)
             StageMirror.note("store create \(sentence)")
@@ -247,6 +284,7 @@ public actor Pipeline {
         do {
             try await capture.start()
             await emit(await verifier.captureStarted(atMs: nowMs()))
+            probe?.noteCaptureStarted(atMs: nowMs())
             await persist([StageBuilders.captureStart(display: displayID(of: capture), error: nil)])
         } catch {
             await persist([StageBuilders.captureStart(display: displayID(of: capture), error: error)])
@@ -306,6 +344,11 @@ public actor Pipeline {
     }
 
     public func stop() async {
+        await stop(source: .recordButton)
+    }
+
+    public func stop(source: StartRequest.Source) async {
+        probe?.noteStop(source: source, atMs: nowMs())
         await halt(clean: true)
     }
 
@@ -315,6 +358,7 @@ public actor Pipeline {
     /// `end` with no audio behind it: the tail cleared on an idle clock while the
     /// live window got no speech, and a real relapse in that window went unwritten.
     public func stopAfterLiveTail() async {
+        probe?.noteStop(source: .harnessShutdown, atMs: nowMs())
         await holdSessionUntilLiveTail()
         await halt(clean: true)
     }
@@ -436,6 +480,7 @@ public actor Pipeline {
                 let after = await store?.syncedFinalCount ?? before
                 await emit(await verifier.observeEngine(stamped, track: track, atMs: at, storedCount: before))
                 await emit(await verifier.observeStored(count: after, atMs: at))
+                probe?.noteTranscript(transcript, recvAtMs: at)
                 uiContinuation.yield(.transcript(transcript))
                 continue
             }
@@ -455,10 +500,14 @@ public actor Pipeline {
                 }
             }
             await emit(await verifier.observeEngine(stamped, track: track, atMs: at, storedCount: stored, backlogMs: backlogMs))
+            if case .state(.streaming) = stamped {
+                probe?.noteStreaming(track: track, atMs: at)
+            }
             if case .transcript(let transcript) = stamped {
                 if transcript.kind != .final {
                     await ledger.notePartial()
                 }
+                probe?.noteTranscript(transcript, recvAtMs: at)
                 uiContinuation.yield(.transcript(transcript))
             }
         }
@@ -518,9 +567,11 @@ public actor Pipeline {
         await emit(await verifier.observeFrame(frame, atMs: at))
         appendPCM(frame)
         await ledger.frameExtracted(track: frame.track.rawValue, energy: StageLedger.hasEnergy(frame.data))
+        probe?.noteFrame(track: frame.track, sampleCount: frame.sampleCount, capAtMs: at)
         guard let engine = engines[frame.track] else { return }
         do {
             try await engine.send(frame)
+            probe?.noteSent(track: frame.track, sentAtMs: nowMs())
             await ledger.noteSent(track: frame.track.rawValue, bytes: frame.data.count)
         } catch {
             let sentence = ErrorDetail.sentence(error)
@@ -631,6 +682,7 @@ public actor Pipeline {
             await ledger.notePCMError(pcmError)
         }
         let at = nowMs()
+        probe?.noteEnded(atMs: at)
         var endError: String?
         do {
             try await store?.end(atMs: at, clean: clean)

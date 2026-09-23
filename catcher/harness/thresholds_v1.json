@@ -1,0 +1,9 @@
+{
+  "b2LagP95Ms": 2000,
+  "b2MinWords": 100,
+  "b2MatchWindowMs": 300,
+  "b4LiveWithinMs": 5000,
+  "b4MaxInputs": 2,
+  "b4Runs": 5,
+  "b4IdleMs": 30000
+}

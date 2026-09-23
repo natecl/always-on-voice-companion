@@ -47,6 +47,9 @@ final class CatcherModel {
     private var listenTask: Task<Void, Never>?
     private let pipeline: Pipeline
     private let sessionRoot: URL
+    /// Host time at process start. Cold start (B4) is measured from launch, which
+    /// is before the session origin.
+    private let processStartHostTime = HostClock.now()
     private let autoRecord: Bool
     private let harness: Bool
     private var launchStarted = false
@@ -86,6 +89,7 @@ final class CatcherModel {
                 try EngineFactory.make(track: track, environment: environment)
             },
             recordPCM: environment["CATCHER_HARNESS"] == "1",
+            writeLatency: environment["CATCHER_HARNESS"] == "1",
             engineLabel: EngineFactory.sessionEngineName(environment: environment)
         )
         if harness {
@@ -134,18 +138,43 @@ final class CatcherModel {
         await applyLaunchProbe(probe)
         listen()
         if autoRecord, !status.isBlocked {
-            await toggle()
+            // ST1 makes --auto-record a no-op unless --harness. S0 still starts,
+            // and labels a harness launch so the baseline is not scored as a click.
+            let source: StartRequest.Source = harness ? .harnessAutoRecord : .recordButton
+            await toggle(source: source)
+        }
+        if harness {
+            // The Record button is on screen during the launch probe. The cold
+            // baseline waits for this file so the click does not race that probe.
+            let ready = sessionRoot.appendingPathComponent("ui_ready")
+            do {
+                try "1".write(to: ready, atomically: true, encoding: .utf8)
+            } catch {
+                StageMirror.note("ui_ready \(ErrorDetail.sentence(error))")
+            }
         }
     }
 
-    func toggle() async {
+    /// Screen frame of the Record button, written only while the harness is
+    /// driving a cold-record click. Nil in normal use.
+    var recordButtonFrameFile: URL? {
+        guard harness else { return nil }
+        return sessionRoot.appendingPathComponent("record_button_frame.json")
+    }
+
+    func toggle(source: StartRequest.Source = .recordButton) async {
+        let inputHostTime = HostClock.now()
         if await pipeline.isRunning {
-            await pipeline.stop()
+            await pipeline.stop(source: source)
         } else if !status.isBlocked {
             finals = []
             partials = [:]
             rebuildLines()
-            await pipeline.start()
+            await pipeline.start(request: StartRequest(
+                source: source,
+                inputHostTime: inputHostTime,
+                processStartHostTime: processStartHostTime
+            ))
         }
         isRecording = await pipeline.isRunning
         if harness, isRecording {
@@ -339,7 +368,7 @@ final class CatcherModel {
         }
     }
 
-    private func apply(_ event: PipelineUIEvent) {
+    private func apply(_ event: PipelineUIEvent) async {
         switch event {
         case .transcript(let transcript):
             if transcript.kind == .final {
@@ -349,6 +378,10 @@ final class CatcherModel {
                 partials[transcript.track] = transcript
             }
             rebuildLines()
+            if harness {
+                let shownAtMs = SessionClockAnchor.milliseconds()
+                await pipeline.noteShown(track: transcript.track, seq: transcript.seq, atMs: shownAtMs)
+            }
         case .snapshot(let snapshot):
             let previous = status
             status = snapshot.status
@@ -494,7 +527,8 @@ struct ContentView: View {
             HStack(alignment: .center, spacing: 16) {
                 RecordButton(
                     isRecording: model.isRecording,
-                    enabled: model.isRecording || !model.status.isBlocked
+                    enabled: model.isRecording || !model.status.isBlocked,
+                    frameFile: model.recordButtonFrameFile
                 ) {
                     Task { await model.toggle() }
                 }
