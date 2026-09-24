@@ -22,9 +22,9 @@
   "rigWindowMinWidth": 720,
   "rigWindowMinHeight": 520,
   "rigP3SampleMs": [2000, 8000, 14000],
-  "rigPreflightTimeoutS": 40,
+  "rigPreflightTimeoutS": 120,
   "rigGateTimeoutS": {
-    "preflight": 90,
+    "preflight": 300,
     "p1": 200,
     "p2": 90,
     "p3": 360,

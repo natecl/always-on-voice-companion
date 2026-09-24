@@ -73,6 +73,93 @@ def is_preflight_process(command: str, session: str) -> bool:
     )
 
 
+PREFLIGHT_ATTEMPTS = 2
+NO_RESULT_LINE = "PREFLIGHT preflight-finish FAIL error=no-result source=harness"
+
+
+def _report_lines(report: Path) -> list[str]:
+    try:
+        text = report.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _kill_session_preflight(session: str, lister, killer, pause, now) -> list[tuple[int, str]]:
+    """SIGKILL this session's preflight Catcher. Returns survivors after 5s."""
+    found = [(pid, command) for pid, command in lister() if is_preflight_process(command, session)]
+    for pid, _command in found:
+        try:
+            killer(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    deadline = now() + 5
+    survivors = found
+    while survivors and now() < deadline:
+        pause(0.2)
+        survivors = [(pid, command) for pid, command in lister() if is_preflight_process(command, session)]
+    return survivors
+
+
+def run_preflight(
+    session: str,
+    attempt,
+    *,
+    lister=None,
+    killer=None,
+    pause=time.sleep,
+    now=time.time,
+) -> int:
+    """Run one preflight attempt, and a second only after the harness's no-result line.
+
+    An attempt the app itself failed, a signing or launch failure, or a second
+    no-result is final. The first attempt's report is kept as
+    preflight.attempt1.txt, and preflight_attempts.json records every attempt.
+    """
+    if lister is None:
+        lister = list_processes
+    if killer is None:
+        killer = os.kill
+    root = Path(session)
+    root.mkdir(parents=True, exist_ok=True)
+    report = root / "preflight.txt"
+    attempts: list[dict[str, object]] = []
+    for number in range(1, PREFLIGHT_ATTEMPTS + 1):
+        try:
+            attempt()
+        except OSError as error:
+            attempts.append({"attempt": number, "result": "not-observed", "noResult": False, "error": str(error)})
+            break
+        lines = _report_lines(report)
+        no_result = NO_RESULT_LINE in lines
+        entry: dict[str, object] = {
+            "attempt": number,
+            "result": lines[-1] if lines else "not-observed",
+            "noResult": no_result,
+        }
+        attempts.append(entry)
+        if not no_result or number == PREFLIGHT_ATTEMPTS:
+            break
+        kept = root / f"preflight.attempt{number}.txt"
+        os.replace(report, kept)
+        entry["report"] = kept.name
+        survivors = _kill_session_preflight(session, lister, killer, pause, now)
+        if survivors:
+            report.write_text(
+                "PREFLIGHT preflight-retry FAIL error=preflight-survived source=harness\n"
+                "PREFLIGHT RESULT FAIL failed=1 source=harness\n",
+                encoding="utf-8",
+            )
+            entry["survivors"] = [{"pid": pid, "command": command} for pid, command in survivors]
+            break
+    (root / "preflight_attempts.json").write_text(
+        json.dumps({"max": PREFLIGHT_ATTEMPTS, "attempts": attempts}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    final = _report_lines(report)
+    return 0 if final and final[-1].startswith("PREFLIGHT RESULT PASS") else 1
+
+
 def list_processes() -> list[tuple[int, str]]:
     try:
         listed = subprocess.run(
@@ -255,6 +342,9 @@ def compose(
         env = None
     result_line = preflight_line(run)
     lines = preflight_lines(run)
+    attempts = _load_json(run / "preflight" / "preflight_attempts.json")
+    if not isinstance(attempts, dict):
+        attempts = None
     launched = [name for name in GATES if (run / name).is_dir()]
     ledger = afplay_rows(run)
     plays = [row for row in ledger if row.get("action") == "play"] if ledger is not None else None
@@ -343,7 +433,15 @@ def compose(
 
     logs = {
         relative: file_stamp(run, relative)
-        for relative in ["obs/afplay.log", "obs/orphans.jsonl", "obs/board-env.json", "preflight/preflight.txt", "v0-verdict.json"]
+        for relative in [
+            "obs/afplay.log",
+            "obs/orphans.jsonl",
+            "obs/board-env.json",
+            "preflight/preflight.txt",
+            "preflight/preflight.attempt1.txt",
+            "preflight/preflight_attempts.json",
+            "v0-verdict.json",
+        ]
         + [f"{name}/gate.log" for name in GATES]
         + [f"{name}/rig_obs.json" for name in GATES]
     }
@@ -355,6 +453,7 @@ def compose(
         "stopped": field(stopped, "preflight/preflight.txt" if stopped == "preflight" else "obs/orphans.jsonl"),
         "preflight": field(result_line, "preflight/preflight.txt"),
         "preflightLines": field(lines, "preflight/preflight.txt"),
+        "preflightAttempts": field(attempts, "preflight/preflight_attempts.json"),
         "gatesLaunched": {"value": len(launched), "source": "gate-dirs"},
         "gatesLaunchedNames": {"value": launched, "source": "gate-dirs"},
         "afplayLaunched": field(None if plays is None else len(plays), "obs/afplay.log"),
@@ -383,6 +482,7 @@ def render_markdown(board: dict) -> str:
         f"harness: {board['harnessGitSHA']['value']} ({board['harnessGitSHA']['source']})",
         f"stopped: {board['stopped']['value']}",
         f"preflight: {board['preflight']['value']}",
+        f"preflight attempts: {json.dumps(board['preflightAttempts']['value'], sort_keys=True)}",
         f"gates launched: {board['gatesLaunched']['value']} {board['gatesLaunchedNames']['value']}",
         f"afplay launched: {board['afplayLaunched']['value']} (hard gate {board['afplayHardGate']['value']})",
         f"orphans: {json.dumps(board['orphans']['value'], sort_keys=True)}",
@@ -432,6 +532,10 @@ def main(argv: list[str]) -> int:
     # the same dest overwrites it, so exec-gate used to fall through to compose.
     execute.add_argument("argv", nargs=argparse.REMAINDER)
 
+    pre = sub.add_parser("preflight")
+    pre.add_argument("--session", required=True)
+    pre.add_argument("argv", nargs=argparse.REMAINDER)
+
     build = sub.add_parser("compose")
     build.add_argument("--run", type=Path, required=True)
     build.add_argument("--stopped", choices=("preflight", "orphans"))
@@ -449,6 +553,17 @@ def main(argv: list[str]) -> int:
             print("exec-gate needs a command", file=sys.stderr)
             return 2
         return exec_gate(args.timeout, args.log, args.obs, command)
+    if args.command == "preflight":
+        command = list(args.argv)
+        if command and command[0] == "--":
+            command = command[1:]
+        if not command:
+            print("preflight needs the single-attempt command", file=sys.stderr)
+            return 2
+        return run_preflight(
+            args.session,
+            lambda: subprocess.run(command, stdin=subprocess.DEVNULL, check=False),
+        )
     board = compose(
         args.run,
         stopped=args.stopped,

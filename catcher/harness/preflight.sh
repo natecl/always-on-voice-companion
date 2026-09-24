@@ -2,16 +2,28 @@
 # Preflight inside Catcher.app, launched through LaunchServices so TCC bills
 # com.catcher.app. open(1) does not forward the app's exit status, so
 # preflight.txt is the verdict.
+#
+# `preflight.sh <session>` runs `board.py preflight`, which calls
+# `preflight.sh --once <session>` and retries once only when that attempt
+# ended in the harness's error=no-result line. Any other FAIL is final.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck disable=SC1091
 source "$ROOT/lib.sh"
+ONCE=0
+if [[ "${1:-}" == "--once" ]]; then
+  ONCE=1
+  shift
+fi
 SESSION="${1:-}"
 if [[ -z "$SESSION" ]]; then
   echo "usage: $0 <session-root>" >&2
   exit 2
 fi
 mkdir -p "$SESSION"
+if [[ "$ONCE" != 1 ]]; then
+  exec python3 "$ROOT/board.py" preflight --session "$SESSION" -- "$ROOT/preflight.sh" --once "$SESSION"
+fi
 REPORT="$SESSION/preflight.txt"
 APP="${CATCHER_APP:-}"
 if [[ -z "$APP" || ! -d "$APP" ]]; then
@@ -92,8 +104,10 @@ if [[ "$launch_status" -ne 0 ]]; then
   cat "$REPORT"
   exit 1
 fi
-# The app writes PREFLIGHT RESULT and terminates. Past the budget this is a
-# hang, not a Screen Recording deny: kill only this preflight and say so.
+# The app writes PREFLIGHT RESULT and terminates. A granted host can still
+# sit in SCStream start (startRemoteAudioReceiveQueue) for tens of seconds,
+# so rigPreflightTimeoutS is sized for that. Past it this is a hang, not a
+# Screen Recording deny: kill only this preflight and say so.
 LIMIT="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["rigPreflightTimeoutS"]))' "$ROOT/thresholds.json")"
 deadline=$((SECONDS + LIMIT))
 while [[ "$SECONDS" -lt "$deadline" ]]; do
@@ -105,7 +119,7 @@ done
 if [[ ! -f "$REPORT" ]] || ! tail -n 1 "$REPORT" | tr -d '\r' | grep -q '^PREFLIGHT RESULT '; then
   kill_preflight_app "$SESSION"
   printf 'PREFLIGHT preflight-finish FAIL error=no-result source=harness\nPREFLIGHT RESULT FAIL failed=1 source=harness\n' >> "$REPORT"
-  echo "preflight produced no RESULT within ${LIMIT}s. Wrote FAIL and stopped." >&2
+  echo "preflight produced no RESULT within ${LIMIT}s. Wrote FAIL." >&2
 fi
 cat "$REPORT"
 last="$(tail -n 1 "$REPORT" | tr -d '\r')"

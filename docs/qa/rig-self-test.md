@@ -26,6 +26,8 @@ The command prints the run directory. Paste that directory's `board.md`.
 
 GREEN requires a passing preflight, `v0-verdict.json` GREEN, every `rig_obs.json` tag `ok`, no orphan survivor, and no `afplay` line whose token is not `RAISE OK`. A build whose SHA or CDHash does not match the `--expect-*` values is `invalid (wrong build)`, which is neither RED nor GREEN. A rebuilt tree of `b14e31a` may not reproduce CDHash `57250034`; the original binary, if it is still on the Mac, is the baseline that matches the recorded grade.
 
+Preflight waits up to 120s for its RESULT line. A `no-result` is retried once. The board's `preflightAttempts` field lists each attempt. Two `no-result` attempts in a row stop the board RED. Details are in [`v0-diagnostics.md`](v0-diagnostics.md#preflight).
+
 P2 runs last and revokes Screen Recording. The script cannot restore it. The board's P2 obs records `regrantRequired`. The next preflight stays red until Screen & System Audio Recording is granted again for `com.catcher.app`.
 
 P6 plays the fixture through the speakers and does not ask anyone to talk. If the microphone does not hear the speakers on this Mac, P6 fails the existing mic bar. That is a host fact, not a threshold change.

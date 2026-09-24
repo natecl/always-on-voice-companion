@@ -53,7 +53,7 @@ A stub engine header on P1, P3, or P6 is `fail` ("stub engine cannot prove P1/P3
    ./catcher/harness/run.sh board /tmp/catcher-auto
    ```
 
-   `preflight` exits 0 only when `preflight.txt` ends in `PREFLIGHT RESULT PASS`. `board` writes `board.json` and returns on any other result, with no gate directory and no `afplay`. A missing RESULT within 40s is `preflight-finish` `error=no-result source=harness`: the harness kills that preflight process and stops. Checks and the board fields are in [`v0-diagnostics.md`](v0-diagnostics.md). The self-test on the known-good tip is in [`rig-self-test.md`](rig-self-test.md).
+   `preflight` exits 0 only when `preflight.txt` ends in `PREFLIGHT RESULT PASS`. `board` writes `board.json` and returns on any other result, with no gate directory and no `afplay`. A missing RESULT within 120s is `preflight-finish` `error=no-result source=harness`: the harness kills that preflight process and launches preflight once more. A second `no-result` stops the board RED. No other FAIL is retried. Checks and the board fields are in [`v0-diagnostics.md`](v0-diagnostics.md). The self-test on the known-good tip is in [`rig-self-test.md`](rig-self-test.md).
 6. Replace `catcher/harness/fixtures/known-60s.wav` with a clear ~60 s reading of `known-60s.ref.txt` before scoring P1. The file in git is a 16 kHz mono PCM16 carrier so the script has something to play. It is not that reading. WER against the reference will fail until you replace it.
 
 ## How a run is laid out

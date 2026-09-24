@@ -39,7 +39,7 @@ The harness and product sources at `main` are byte-identical to `b14e31a` (only 
 ### 1. Red preflight stops the run immediately
 
 - `board.sh`: orphan sweep, then `run.sh preflight <run>/preflight`. If the last line of `preflight.txt` is not `PREFLIGHT RESULT PASS`, call `board.py compose --stopped preflight` and exit 1. No gate dir is created and `play_fixture` is never reachable.
-- `preflight.sh`: drop `-W` (see property 4). Bounded wait (40 s) for the RESULT line; on timeout, SIGKILL only the preflight instance (match executable + `--preflight` + this session root) and append `PREFLIGHT preflight-finish FAIL error=no-result source=harness`. Lines the harness writes carry `source=harness`; lines the app writes do not, so the board can say which is which.
+- `preflight.sh`: drop `-W` (see property 4). Bounded wait (`rigPreflightTimeoutS`, 120 s) for the RESULT line, with one retry after `error=no-result` only (`board.py` `run_preflight`); on timeout, SIGKILL only the preflight instance (match executable + `--preflight` + this session root) and append `PREFLIGHT preflight-finish FAIL error=no-result source=harness`. Lines the harness writes carry `source=harness`; lines the app writes do not, so the board can say which is which.
 - `lib.sh`: `require_preflight_pass <report> <cdhash>` used by every `pN` script (and by `run.sh`), so a hand-run gate cannot skip it either.
 - `verdict.py`: optional `--preflight <dir>`; when given, anything but PASS makes the verdict RED with reason `preflight <result>`. `board.sh` always passes it.
 - `board.py`: stopped-at-preflight board carries the preflight lines verbatim, `gatesLaunched` counted from gate dirs on disk, and `afplayLaunched` counted from the afplay ledger (property 2), not constants.

@@ -251,5 +251,138 @@ class CdhashTests(unittest.TestCase):
         self.assertNotIn('kill_preflight_app "$APP"', script)
 
 
+NO_RESULT = (
+    "PREFLIGHT signing PASS source=harness\n"
+    "PREFLIGHT preflight-finish FAIL error=no-result source=harness\n"
+    "PREFLIGHT RESULT FAIL failed=1 source=harness\n"
+)
+APP_PASS = (
+    "PREFLIGHT signing PASS source=harness\n"
+    "PREFLIGHT tcc-screen PASS\n"
+    "PREFLIGHT capture-probe PASS system=48000 microphone=48000\n"
+    "PREFLIGHT RESULT PASS failed=0\n"
+)
+APP_FAIL = (
+    "PREFLIGHT signing PASS source=harness\n"
+    "PREFLIGHT api-stt FAIL error=timeout\n"
+    "PREFLIGHT RESULT FAIL failed=1\n"
+)
+
+
+class PreflightRetryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.session = str(Path(self.tmp.name) / "preflight")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _attempts(self, *reports: str):
+        calls = {"n": 0}
+
+        def attempt() -> None:
+            text = reports[calls["n"]]
+            calls["n"] += 1
+            Path(self.session, "preflight.txt").write_text(text, encoding="utf-8")
+
+        return attempt, calls
+
+    def _run(self, attempt, lister=lambda: []) -> int:
+        clock = {"t": 0.0}
+
+        def now() -> float:
+            clock["t"] += 1.0
+            return clock["t"]
+
+        return board.run_preflight(
+            self.session, attempt, lister=lister, killer=lambda pid, sig: None, pause=lambda _s: None, now=now,
+        )
+
+    def _record(self) -> dict:
+        return json.loads(Path(self.session, "preflight_attempts.json").read_text(encoding="utf-8"))
+
+    def test_result_wait_is_120s_and_the_docs_quote_it(self) -> None:
+        limits = json.loads((HARNESS / "thresholds.json").read_text(encoding="utf-8"))
+        wait = limits["rigPreflightTimeoutS"]
+        self.assertEqual(wait, 120)
+        script = (HARNESS / "preflight.sh").read_text(encoding="utf-8")
+        self.assertIn('["rigPreflightTimeoutS"]', script)
+        docs = HARNESS.parents[1] / "docs" / "qa"
+        for name in ("v0-diagnostics.md", "v0-grading.md", "rig-self-test.md"):
+            text = (docs / name).read_text(encoding="utf-8")
+            self.assertIn(f"{wait}s", text, name)
+            self.assertNotIn("40s", text, name)
+
+    def test_board_preflight_budget_holds_both_attempts(self) -> None:
+        limits = json.loads((HARNESS / "thresholds.json").read_text(encoding="utf-8"))
+        outer = limits["rigGateTimeoutS"]["preflight"]
+        self.assertEqual(board.PREFLIGHT_ATTEMPTS, 2)
+        self.assertGreaterEqual(outer, board.PREFLIGHT_ATTEMPTS * limits["rigPreflightTimeoutS"] + 30)
+        self.assertIn(f"{outer}s", (HARNESS.parents[1] / "docs" / "qa" / "v0-diagnostics.md").read_text(encoding="utf-8"))
+
+    def test_no_result_is_retried_once_then_passes(self) -> None:
+        attempt, calls = self._attempts(NO_RESULT, APP_PASS)
+        self.assertEqual(self._run(attempt), 0)
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(Path(self.session, "preflight.txt").read_text(encoding="utf-8"), APP_PASS)
+        self.assertEqual(Path(self.session, "preflight.attempt1.txt").read_text(encoding="utf-8"), NO_RESULT)
+        record = self._record()
+        self.assertEqual([row["noResult"] for row in record["attempts"]], [True, False])
+        self.assertEqual(record["attempts"][1]["result"], "PREFLIGHT RESULT PASS failed=0")
+
+    def test_two_no_results_fail_without_a_third_attempt(self) -> None:
+        attempt, calls = self._attempts(NO_RESULT, NO_RESULT, APP_PASS)
+        self.assertEqual(self._run(attempt), 1)
+        self.assertEqual(calls["n"], 2)
+        last = Path(self.session, "preflight.txt").read_text(encoding="utf-8").splitlines()[-1]
+        self.assertEqual(last, "PREFLIGHT RESULT FAIL failed=1 source=harness")
+        self.assertEqual([row["noResult"] for row in self._record()["attempts"]], [True, True])
+
+    def test_an_app_fail_is_not_retried(self) -> None:
+        attempt, calls = self._attempts(APP_FAIL, APP_PASS)
+        self.assertEqual(self._run(attempt), 1)
+        self.assertEqual(calls["n"], 1)
+        self.assertFalse(Path(self.session, "preflight.attempt1.txt").exists())
+
+    def test_a_surviving_preflight_blocks_the_retry(self) -> None:
+        attempt, calls = self._attempts(NO_RESULT, APP_PASS)
+        stuck = [(41, f"/b/CatcherApp.app/Contents/MacOS/CatcherApp --preflight --session-root {self.session}")]
+        self.assertEqual(self._run(attempt, lister=lambda: stuck), 1)
+        self.assertEqual(calls["n"], 1)
+        report = Path(self.session, "preflight.txt").read_text(encoding="utf-8")
+        self.assertIn("error=preflight-survived source=harness", report)
+        self.assertEqual(self._record()["attempts"][0]["survivors"][0]["pid"], 41)
+
+    def test_preflight_cli_retries_the_single_attempt_command(self) -> None:
+        script = Path(self.tmp.name) / "once.py"
+        script.write_text(
+            "import sys\n"
+            "from pathlib import Path\n"
+            "session = Path(sys.argv[1])\n"
+            "count = session / 'count'\n"
+            "n = int(count.read_text()) + 1 if count.exists() else 1\n"
+            "count.write_text(str(n))\n"
+            f"text = {NO_RESULT!r} if n == 1 else {APP_PASS!r}\n"
+            "(session / 'preflight.txt').write_text(text)\n",
+            encoding="utf-8",
+        )
+        Path(self.session).mkdir(parents=True)
+        status = board.main(["preflight", "--session", self.session, "--", sys.executable, str(script), self.session])
+        self.assertEqual(status, 0)
+        self.assertEqual(Path(self.session, "count").read_text(), "2")
+
+    def test_board_quotes_the_attempts(self) -> None:
+        run = Path(self.tmp.name) / "run"
+        self.session = str(run / "preflight")
+        attempt, _calls = self._attempts(NO_RESULT, NO_RESULT)
+        self._run(attempt)
+        built = board.compose(run, stopped="preflight")
+        self.assertEqual(built["verdict"]["value"], "RED")
+        self.assertEqual(len(built["preflightAttempts"]["value"]["attempts"]), 2)
+        self.assertNotEqual(built["logs"]["preflight/preflight.attempt1.txt"]["bytes"], "not-observed")
+        self.assertIn("preflight attempts:", (run / "board.md").read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()
