@@ -261,6 +261,33 @@ import Testing
     #expect(sink.fsyncCount == 1)
 }
 
+@Test func deadlineEndsACallbackThatNeverFires() async {
+    let started = ContinuousClock.now
+    let value = await Deadline.first(seconds: 0.2, timedOut: "timedOut") { _ in }
+    #expect(value == "timedOut")
+    #expect(started.duration(to: .now) < .seconds(5))
+}
+
+@Test func deadlineReturnsTheCallbackValueAndDropsTheTimer() async {
+    let value = await Deadline.first(seconds: 5, timedOut: "timedOut") { finish in
+        finish("started")
+        finish("again")
+    }
+    #expect(value == "started")
+}
+
+@Test func deadlineIsNotHeldByAStartThatBlocksItsThread() async {
+    let release = DispatchSemaphore(value: 0)
+    let started = ContinuousClock.now
+    let value = await Deadline.first(seconds: 0.2, timedOut: "timedOut") { finish in
+        release.wait()
+        finish("late")
+    }
+    #expect(value == "timedOut")
+    #expect(started.duration(to: .now) < .seconds(5))
+    release.signal()
+}
+
 private extension PreflightDependencies {
     static let denied = PreflightDependencies(
         screenGranted: { false },

@@ -514,6 +514,8 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, CaptureDiagnosti
     private var stream: SCStream?
     private var outputs: [NSObject] = []
     private var accepting = false
+    /// Set while startCapture is outstanding, so a daemon stop ends the wait.
+    private var pendingStart: (@Sendable (CaptureCall) -> Void)?
     private var reportedExtractionFailure = false
     private let counterBox = CaptureCounterBox()
     private let displayID = OSAllocatedUnfairLock(initialState: UInt32(0))
@@ -597,14 +599,63 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, CaptureDiagnosti
         // Accept before startCapture. Buffers can arrive before startCapture returns,
         // and dropping them on `accepting == false` used to throw away the head of the take.
         arm(stream: stream, outputs: [audio, microphone, screen])
-        do {
-            try await stream.startCapture()
-        } catch {
+        // Not `try await stream.startCapture()`: when replayd stalls in
+        // startRemoteAudioReceiveQueue that continuation never resumes, and
+        // preflight never reaches PREFLIGHT RESULT.
+        let handle = StreamHandle(stream: stream)
+        let outcome = await Deadline.first(seconds: Self.startDeadlineSeconds, timedOut: CaptureCall.timedOut) { finish in
+            self.setPendingStart(finish)
+            handle.stream.startCapture { error in
+                finish(error.map(CaptureCall.failed) ?? .done)
+            }
+        }
+        setPendingStart(nil)
+        switch outcome {
+        case .done:
+            break
+        case .failed(let error):
             StageMirror.note("startCapture \(ErrorDetail.sentence(error))")
             _ = takeStream()
             throw error
+        case .timedOut:
+            let error = CaptureError.streamStopped(
+                "SCStream startCapture did not complete within \(Int(Self.startDeadlineSeconds))s"
+            )
+            StageMirror.note(ErrorDetail.sentence(error))
+            if let stalled = takeStream() {
+                Self.abandon(stalled)
+            }
+            throw error
         }
         SCKPermissionProbe.noteScreenGrant()
+    }
+
+    /// Past this, start is a stall, not a slow grant. Preflight must still fit
+    /// start, the one-second sample, stop, and the API checks inside the
+    /// harness's 120s RESULT wait.
+    static let startDeadlineSeconds: Double = 45
+    static let stopDeadlineSeconds: Double = 10
+
+    private func setPendingStart(_ finish: (@Sendable (CaptureCall) -> Void)?) {
+        lock.lock()
+        pendingStart = finish
+        lock.unlock()
+    }
+
+    private func takePendingStart() -> (@Sendable (CaptureCall) -> Void)? {
+        lock.lock()
+        let finish = pendingStart
+        pendingStart = nil
+        lock.unlock()
+        return finish
+    }
+
+    /// A stalled stream's stopCapture can stall the same way. Nobody waits on it.
+    private static func abandon(_ stream: SCStream) {
+        let handle = StreamHandle(stream: stream)
+        DispatchQueue.global(qos: .utility).async {
+            handle.stream.stopCapture { _ in }
+        }
     }
 
     private func arm(stream: SCStream, outputs: [NSObject]) {
@@ -616,12 +667,20 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, CaptureDiagnosti
     }
 
     public func stop() async {
-        let stream = takeStream()
-        if let stream {
-            do {
-                try await stream.stopCapture()
-            } catch {
+        if let stream = takeStream() {
+            let handle = StreamHandle(stream: stream)
+            let outcome = await Deadline.first(seconds: Self.stopDeadlineSeconds, timedOut: CaptureCall.timedOut) { finish in
+                handle.stream.stopCapture { error in
+                    finish(error.map(CaptureCall.failed) ?? .done)
+                }
+            }
+            switch outcome {
+            case .done:
+                break
+            case .failed(let error):
                 StageMirror.note("stopCapture \(ErrorDetail.sentence(error))")
+            case .timedOut:
+                StageMirror.note("stopCapture did not complete within \(Int(Self.stopDeadlineSeconds))s")
             }
         }
         frameContinuation.finish()
@@ -629,6 +688,7 @@ public final class SCKCaptureSession: NSObject, AudioCapturing, CaptureDiagnosti
     }
 
     public func stream(_ stream: SCStream, didStopWithError error: Error) {
+        takePendingStart()?(.failed(error))
         failureContinuation.yield(Self.classify(error))
     }
 
@@ -757,6 +817,17 @@ private enum ScreenGrantMemory {
             liveWindows: liveWindows
         )
     }
+}
+
+private enum CaptureCall: Sendable {
+    case done
+    case failed(any Error)
+    case timedOut
+}
+
+/// SCStream is not Sendable. The handle only carries it into the completion-handler call.
+private struct StreamHandle: @unchecked Sendable {
+    let stream: SCStream
 }
 
 private final class DiscardingScreenOutput: NSObject, SCStreamOutput {

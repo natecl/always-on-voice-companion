@@ -8,6 +8,20 @@ public enum CaptureError: Error, Sendable, Equatable {
     case unavailable(String)
 }
 
+/// `ErrorDetail.sentence` reads `localizedDescription`. Without this, every
+/// case prints as "CaptureError error N" and the detail string is lost.
+extension CaptureError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .tccDenied(let detail): detail
+        case .tccRevokedMidSession: "screen recording access revoked mid-session"
+        case .streamStopped(let detail): detail
+        case .pcmExtractionFailed(let status, let detail): "pcm extraction failed (\(status)): \(detail)"
+        case .unavailable(let detail): detail
+        }
+    }
+}
+
 public enum PermissionState: Sendable, Equatable {
     case granted
     case blocked(reason: String)

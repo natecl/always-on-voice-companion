@@ -11,6 +11,7 @@ import Verifier
 
 @main
 struct CatcherApp: App {
+    @NSApplicationDelegateAdaptor(CatcherAppDelegate.self) private var appDelegate
     @State private var model = CatcherModel()
 
     var body: some Scene {
@@ -51,13 +52,11 @@ final class CatcherModel {
     private let harness: Bool
     private var launchStarted = false
     private let preflight: Bool
-    private let launchEnvironment: [String: String]
 
     init() {
         GrokEngineBootstrap.install()
         let launch = LaunchConfiguration.resolve()
         let environment = launch.mergedEnvironment(ProcessInfo.processInfo.environment)
-        launchEnvironment = environment
         preflight = launch.preflight
         if !launch.preflight {
             Loud.prepare()
@@ -98,7 +97,7 @@ final class CatcherModel {
 
     func onAppear() async {
         if preflight {
-            await runPreflightAndQuit()
+            PreflightLaunch.startIfRequested()
             return
         }
         // A second pass (SwiftUI re-creates the task when Screen Recording is
@@ -401,35 +400,6 @@ final class CatcherModel {
         } catch {
             StageMirror.note("live_session \(ErrorDetail.sentence(error))")
         }
-    }
-
-    private func runPreflightAndQuit() async {
-        do {
-            try FileManager.default.createDirectory(at: sessionRoot, withIntermediateDirectories: true)
-        } catch {
-            StageMirror.note("preflight mkdir \(ErrorDetail.sentence(error))")
-        }
-        let reportURL = sessionRoot.appendingPathComponent("preflight.txt")
-        let prior: String
-        if FileManager.default.fileExists(atPath: reportURL.path) {
-            do {
-                prior = try String(contentsOf: reportURL, encoding: .utf8)
-            } catch {
-                StageMirror.note("preflight read \(ErrorDetail.sentence(error))")
-                prior = ""
-            }
-        } else {
-            prior = ""
-        }
-        let lines = await Preflight.run(environment: launchEnvironment, dependencies: PreflightHost.dependencies())
-        let result = Preflight.result(checks: lines, priorFails: Preflight.failCount(in: prior))
-        let preflightSink = FileStageSink(directory: sessionRoot, fileName: "preflight.txt")
-        let launchSink = FileStageSink(directory: sessionRoot, fileName: "launch-stages.log")
-        for line in lines + [result] {
-            preflightSink.write(line, fsync: true)
-            launchSink.write(line, fsync: line.verdict == PreflightVerdict.fail.rawValue || line.name == "RESULT")
-        }
-        NSApp.terminate(nil)
     }
 
     private func noteLaunchFailure(_ sentence: String) {
