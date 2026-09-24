@@ -444,14 +444,16 @@ with tempfile.TemporaryDirectory() as tmp:
         got = run_py(count_py, [str(path)])
         if got.returncode != 0:
             raise SystemExit(got.stderr)
-        return got.stdout.strip()
+        lines = got.stdout.splitlines()
+        return (lines[0].strip() if lines else ""), got.stdout
 
-    if packets(
+    first, _body = packets(
         "block drop out quick proto tcp from any to <catcher_xai> port = 443\n"
         "  [ Evaluations: 10 Packets: 0 Bytes: 0 States: 0 ]\n"
-    ) != "Packets:0":
+    )
+    if first != "Packets:0":
         raise SystemExit("a zero out-rule packet count would hold the block")
-    normal = packets(
+    normal, _body = packets(
         "block drop out quick proto tcp from any to <catcher_xai> port = 443\n"
         "  [ Evaluations: 10 Packets: 42 Bytes: 100 States: 0 ]\n"
         "block drop in quick proto tcp from <catcher_xai> port = 443 to any\n"
@@ -459,6 +461,32 @@ with tempfile.TemporaryDirectory() as tmp:
     )
     if normal != "Packets:42":
         raise SystemExit(f"out-rule packet count parsed as {normal}")
+    mixed, mixed_body = packets(
+        "block drop out quick proto tcp from any to <catcher_xai> port = 443\n"
+        "  [ Evaluations: 160 Packets: 36 Bytes: 4000 States: 0 ]\n"
+        "block drop out quick proto udp from any to <catcher_xai> port = 443\n"
+        "  [ Evaluations: 4 Packets: 0 Bytes: 0 States: 0 ]\n"
+        "block drop in quick proto tcp from <catcher_xai> port = 443 to any\n"
+        "  [ Evaluations: 20 Packets: 21 Bytes: 800 States: 0 ]\n"
+        "block drop in quick proto udp from <catcher_xai> port = 443 to any\n"
+        "  [ Evaluations: 1 Packets: 0 Bytes: 0 States: 0 ]\n"
+    )
+    if mixed == "Packets:0" or mixed != "Packets:57":
+        raise SystemExit(f"tcp packets were hidden by a later udp zero: {mixed}")
+    if "Packets:36" not in mixed_body or "Packets:21" not in mixed_body:
+        raise SystemExit(f"per-rule packet breakdown missing: {mixed_body}")
+    zeros, _body = packets(
+        "block drop out quick proto tcp from any to <catcher_xai> port = 443\n"
+        "  [ Evaluations: 10 Packets: 0 Bytes: 0 States: 0 ]\n"
+        "block drop out quick proto udp from any to <catcher_xai> port = 443\n"
+        "  [ Evaluations: 4 Packets: 0 Bytes: 0 States: 0 ]\n"
+        "block drop in quick proto tcp from <catcher_xai> port = 443 to any\n"
+        "  [ Evaluations: 2 Packets: 0 Bytes: 0 States: 0 ]\n"
+        "block drop in quick proto udp from <catcher_xai> port = 443 to any\n"
+        "  [ Evaluations: 1 Packets: 0 Bytes: 0 States: 0 ]\n"
+    )
+    if zeros != "Packets:0":
+        raise SystemExit(f"all-zero block-drop rules parsed as {zeros}")
 
     counts = session / "kills.txt"
     counts.write_text(

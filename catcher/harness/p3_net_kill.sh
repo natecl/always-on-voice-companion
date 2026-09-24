@@ -63,7 +63,7 @@ write_block_tag() {
   printf '%s\n' "$tag" >"$SESSION/p3-block.txt"
   ruleset="$(tr -d '[:space:]' <"$SESSION/p3-ruleset.txt")"
   anchor="$(tr -d '[:space:]' <"$SESSION/p3-anchor.txt")"
-  packets="$(tr -d '[:space:]' <"$SESSION/p3-out-packets.txt")"
+  packets="$(sed -n '/^Packets:/p' "$SESSION/p3-out-packets.txt" | head -n 1 | tr -d '[:space:]')"
   kills="$(head -n 1 "$SESSION/p3-kill-counts.txt" | tr -d '[:space:]')"
   {
     printf 'ruleset=%s\n' "$ruleset"
@@ -505,23 +505,34 @@ import sys
 from pathlib import Path
 
 text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
-out_packets = None
-pending_out = False
+total = 0
+seen = False
+pending = None
+parts = []
 for line in text.splitlines():
-    if "block drop out" in line:
-        pending_out = True
+    if "block drop" in line:
+        pending = line.strip()
         continue
-    if pending_out:
-        match = re.search(r"Packets:\s*(\d+)", line)
-        if match:
-            out_packets = int(match.group(1))
-            pending_out = False
-# A missing out rule is the same as a rule that never saw a packet.
-sys.stdout.write("Packets:0\n" if out_packets is None else f"Packets:{out_packets}\n")
+    if pending is None:
+        continue
+    match = re.search(r"Packets:\s*(\d+)", line)
+    if not match:
+        continue
+    count = int(match.group(1))
+    total += count
+    seen = True
+    parts.append(f"{pending} Packets:{count}")
+    pending = None
+# pfctl prints one rule per proto. The last out rule is often UDP with
+# Packets: 0 while TCP on the line above has already dropped. Sum every
+# block-drop rule, in and out. No such rule counts as zero.
+sys.stdout.write(f"Packets:{total if seen else 0}\n")
+for part in parts:
+    sys.stdout.write(part + "\n")
 COUNTERS
 OUT="$(sed -n 's/^Packets://p' "$SESSION/p3-out-packets.txt" | head -n 1 | tr -d '[:space:]')"
 if [[ -z "$OUT" || "$OUT" == "0" || "$OUT" == "n/a" ]]; then
-  echo "NOT_EFFECTIVE: catcher anchor out rule saw ${OUT:-0} packets." >&2
+  echo "NOT_EFFECTIVE: block-drop rules saw ${OUT:-0} packets." >&2
   write_block_tag NOT_EFFECTIVE
   exit 1
 fi
