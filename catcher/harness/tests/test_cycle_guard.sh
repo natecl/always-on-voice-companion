@@ -238,6 +238,11 @@ if "PF_LOADED_STOCK" not in pf or "sudo -n /sbin/pfctl -F rules" not in pf or "/
 load = pf.index('-a "$ANCHOR" -f "$RULE"')
 if pf.index("p3-main-rules.txt") > load:
     raise SystemExit("main ruleset is inspected after the anchor is loaded")
+catcher_arm = pf.split("\n  catcher)", 1)[1].split("\n  foreign)", 1)[0]
+if 'ANCHOR="catcher"' not in catcher_arm or "pf-anchor-unreachable" in catcher_arm:
+    raise SystemExit("top-level catcher anchor does not proceed")
+if pf.index('ANCHOR="catcher"') > load:
+    raise SystemExit("catcher anchor is selected after the rules are loaded")
 not_at = pf.index("block=NOT_EFFECTIVE")
 off_at = pf.index('append_harness_field "$SESSION" pfOffWallMs')
 if not_at > off_at or pf.index("sleep 2") > not_at or pf.index("sleep 13") < not_at:
@@ -384,6 +389,8 @@ with tempfile.TemporaryDirectory() as tmp:
         raise SystemExit("ALTQ banner was treated as a main ruleset")
     if classify('anchor "com.apple/*"\npass out all\n') != "hook":
         raise SystemExit("com.apple/* anchor was not treated as reachable")
+    if classify('anchor "catcher" all\n') != "catcher":
+        raise SystemExit("top-level catcher anchor was treated as unreachable")
     if classify("pass out quick all\n") != "foreign":
         raise SystemExit("foreign ruleset without the hook was allowed")
 

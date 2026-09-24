@@ -32,9 +32,11 @@ PF_TOKEN=""
 # 1 only when this run loaded /etc/pf.conf into an empty main ruleset.
 # Cleanup then flushes that main ruleset and leaves the host empty again.
 PF_LOADED_STOCK=0
-# Stock /etc/pf.conf evaluates anchor "com.apple/*" only. A top-level
-# "catcher" anchor is loaded and then ignored: -k drops the live socket,
-# the next connect succeeds, and the graded gap is the ~1s reconnect.
+# The block has to land in an anchor the main ruleset actually evaluates.
+# Stock /etc/pf.conf evaluates anchor "com.apple/*", so that host uses
+# com.apple/catcher. A main ruleset that is only `anchor "catcher"` never
+# reaches that path; this run then loads the same rules into `catcher`.
+# Anything with neither hook is left alone.
 ANCHOR="com.apple/catcher"
 cleanup() {
   if [[ -n "$PLAYER" ]]; then
@@ -181,9 +183,10 @@ enable_out="$(sudo -n /sbin/pfctl -E 2>&1)" || {
   exit 1
 }
 PF_TOKEN="$(printf '%s\n' "$enable_out" | sed -n 's/.*Token *: *//p' | head -n 1)"
-# pfctl -E enables pf and does not load /etc/pf.conf. An empty main ruleset
-# never evaluates com.apple/catcher, so a block loaded there matches nothing
-# and no state is created. The live socket then keeps passing.
+# pfctl -E enables pf and does not load /etc/pf.conf. The anchor below is
+# evaluated only when the main ruleset hooks it. An empty ruleset never
+# does, so a block loaded there matches nothing and the live socket keeps
+# passing. A ruleset of `anchor "catcher"` evaluates that name instead.
 if ! sudo -n /sbin/pfctl -sr >"$SESSION/p3-main-rules.txt" 2>>"$SESSION/p3-pf-kill.txt"; then
   echo "pfctl -sr failed" >&2
   exit 1
@@ -205,6 +208,8 @@ if 'anchor "com.apple/*"' in body:
     sys.stdout.write("hook\n")
 elif not lines:
     sys.stdout.write("empty\n")
+elif 'anchor "catcher"' in body:
+    sys.stdout.write("catcher\n")
 else:
     sys.stdout.write("foreign\n")
 RULESET
@@ -221,9 +226,12 @@ case "$MAIN" in
     PF_LOADED_STOCK=1
     printf '%s\n' "$stock_out" >>"$SESSION/p3-pf-kill.txt"
     ;;
+  catcher)
+    ANCHOR="catcher"
+    ;;
   foreign)
     printf '%s\n' "pf-anchor-unreachable" >"$SESSION/p3-block.txt"
-    echo "pf-anchor-unreachable: main ruleset has no com.apple/* anchor." >&2
+    echo "pf-anchor-unreachable: main ruleset has no com.apple/* or catcher anchor." >&2
     exit 1
     ;;
   *)
@@ -383,6 +391,7 @@ fi
 # rule is actually matching. The engine's inbound stall is 5s, so the hole
 # that remains still spans the 10s grade bar and reaches pf off.
 sleep 2
+# Counters come from the anchor this run loaded, not a hardcoded name.
 if ! sudo -n /sbin/pfctl -a "$ANCHOR" -vsr >"$SESSION/p3-anchor-counters.txt" 2>>"$SESSION/p3-pf-kill.txt"; then
   printf '%s\n' "block=NOT_EFFECTIVE" >"$SESSION/p3-block.txt"
   echo "block=NOT_EFFECTIVE: could not read anchor counters." >&2
