@@ -29,6 +29,9 @@ begin_harness_run "$SESSION" P3
 RULE=""
 PLAYER=""
 PF_TOKEN=""
+# 1 only when this run loaded /etc/pf.conf into an empty main ruleset.
+# Cleanup then flushes that main ruleset and leaves the host empty again.
+PF_LOADED_STOCK=0
 # Stock /etc/pf.conf evaluates anchor "com.apple/*" only. A top-level
 # "catcher" anchor is loaded and then ignored: -k drops the live socket,
 # the next connect succeeds, and the graded gap is the ~1s reconnect.
@@ -40,6 +43,10 @@ cleanup() {
   fi
   sudo -n /sbin/pfctl -a "$ANCHOR" -F all >/dev/null 2>&1 || true
   sudo -n /sbin/pfctl -a catcher -F all >/dev/null 2>&1 || true
+  if [[ "$PF_LOADED_STOCK" == 1 ]]; then
+    sudo -n /sbin/pfctl -F rules >/dev/null 2>&1 || true
+    PF_LOADED_STOCK=0
+  fi
   if [[ -n "$PF_TOKEN" ]]; then
     sudo -n /sbin/pfctl -X "$PF_TOKEN" >/dev/null 2>&1 || true
     PF_TOKEN=""
@@ -55,21 +62,14 @@ require_fixture_play "$SESSION"
 PLAYER=$!
 sleep 5
 PID="$(cat "$SESSION/catcher.pid")"
-# The graded socket is the one Catcher already has open, not whatever
-# `dig api.x.ai` returns. That name is Cloudflare (104.18.0.0/15). The STT
-# stream's peer is Deepgram (api.deepgram.com, a different address), so a
-# table built from api.x.ai never matches the live packets. Partial text and
-# ~32 kB/s then continue for the whole block.
 # lsof is the peer that is actually connected. TCP and UDP both: a QUIC
-# socket is UDP and `-iTCP` does not list it. dig of both names only covers
-# a reconnect to a published address.
+# socket is UDP and `-iTCP` does not list it. dig of api.x.ai only covers a
+# reconnect to a published address. The live socket is already one of those.
 lsof -nP -a -p "$PID" -iTCP:443 -Fn >"$SESSION/p3-lsof-tcp.txt" 2>"$SESSION/p3-lsof.err" || true
 lsof -nP -a -p "$PID" -iUDP:443 -Fn >"$SESSION/p3-lsof-udp.txt" 2>>"$SESSION/p3-lsof.err" || true
 {
   dig +short api.x.ai A || true
   dig +short api.x.ai AAAA || true
-  dig +short api.deepgram.com A || true
-  dig +short api.deepgram.com AAAA || true
 } >"$SESSION/p3-dig.txt" || true
 python3 - "$SESSION" "$SESSION/p3-lsof-tcp.txt" "$SESSION/p3-lsof-udp.txt" "$SESSION/p3-dig.txt" <<'PEERS'
 import ipaddress
@@ -161,7 +161,7 @@ if not pairs:
 PEERS
 IPS="$(tr '\n' ' ' <"$SESSION/p3-table-ips.txt" | sed 's/  */ /g;s/^ //;s/ $//')"
 if [[ -z "$IPS" ]]; then
-  echo "No address for the live STT socket or api.x.ai / api.deepgram.com" >&2
+  echo "No address for the live STT socket or api.x.ai" >&2
   exit 1
 fi
 RULE="$(mktemp)"
@@ -175,11 +175,62 @@ RULE="$(mktemp)"
 } > "$RULE"
 # -E reference-counts. Releasing the token in cleanup does not turn pf off
 # if the host already had it enabled.
+: >"$SESSION/p3-pf-kill.txt"
 enable_out="$(sudo -n /sbin/pfctl -E 2>&1)" || {
   echo "pfctl -E failed: $enable_out" >&2
   exit 1
 }
 PF_TOKEN="$(printf '%s\n' "$enable_out" | sed -n 's/.*Token *: *//p' | head -n 1)"
+# pfctl -E enables pf and does not load /etc/pf.conf. An empty main ruleset
+# never evaluates com.apple/catcher, so a block loaded there matches nothing
+# and no state is created. The live socket then keeps passing.
+if ! sudo -n /sbin/pfctl -sr >"$SESSION/p3-main-rules.txt" 2>>"$SESSION/p3-pf-kill.txt"; then
+  echo "pfctl -sr failed" >&2
+  exit 1
+fi
+python3 - "$SESSION/p3-main-rules.txt" >"$SESSION/p3-ruleset.txt" <<'RULESET'
+import sys
+from pathlib import Path
+
+lines = []
+for line in Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines():
+    stripped = line.strip()
+    if not stripped:
+        continue
+    if stripped.startswith("No ALTQ") or stripped.startswith("ALTQ related"):
+        continue
+    lines.append(stripped)
+body = "\n".join(lines)
+if 'anchor "com.apple/*"' in body:
+    sys.stdout.write("hook\n")
+elif not lines:
+    sys.stdout.write("empty\n")
+else:
+    sys.stdout.write("foreign\n")
+RULESET
+MAIN="$(tr -d '[:space:]' <"$SESSION/p3-ruleset.txt")"
+case "$MAIN" in
+  hook) ;;
+  empty)
+    if ! stock_out="$(sudo -n /sbin/pfctl -f /etc/pf.conf 2>&1)"; then
+      printf '%s\n' "$stock_out" | tee -a "$SESSION/p3-pf-kill.txt" >&2
+      printf '%s\n' "pf-anchor-unreachable" >"$SESSION/p3-block.txt"
+      echo "pf-anchor-unreachable: could not load /etc/pf.conf" >&2
+      exit 1
+    fi
+    PF_LOADED_STOCK=1
+    printf '%s\n' "$stock_out" >>"$SESSION/p3-pf-kill.txt"
+    ;;
+  foreign)
+    printf '%s\n' "pf-anchor-unreachable" >"$SESSION/p3-block.txt"
+    echo "pf-anchor-unreachable: main ruleset has no com.apple/* anchor." >&2
+    exit 1
+    ;;
+  *)
+    echo "Could not classify the main pf ruleset (${MAIN:-missing})." >&2
+    exit 1
+    ;;
+esac
 sudo -n /sbin/pfctl -a "$ANCHOR" -f "$RULE"
 append_harness_field "$SESSION" pfOnWallMs "$(wall_ms)"
 # pf passes a packet that matches an existing state without reading the rule.
@@ -188,6 +239,7 @@ append_harness_field "$SESSION" pfOnWallMs "$(wall_ms)"
 # Darwin does not treat a wildcard source as "any" for -k, so that form kills
 # nothing and the established socket keeps passing. Kill the concrete pair,
 # both directions, from the process sockets and from the state table.
+# p3-pf-kill.txt was truncated before -E so this stderr is kept.
 sudo -n /sbin/pfctl -s states >"$SESSION/p3-states-before.txt" 2>>"$SESSION/p3-pf-kill.txt" || true
 python3 - "$SESSION/p3-states-before.txt" "$SESSION/p3-table-ips.txt" >"$SESSION/p3-state-pairs.txt" <<'STATES'
 import ipaddress
@@ -215,15 +267,26 @@ for line in Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace").spli
         table.add(ip)
 
 endpoint = re.compile(
-    r"(?:\[([0-9A-Fa-f:.%]+)\]|(\d{1,3}(?:\.\d{1,3}){3}))[:.](\d+)"
+    r"\[([0-9A-Fa-f:.%]+)\][:.](\d+)"
+    r"|(\d{1,3}(?:\.\d{1,3}){3})[:.](\d+)"
+    r"|([0-9A-Fa-f:]+(?:%[0-9A-Za-z]+)?)\[(\d+)\]"
 )
+
+def endpoint_ip_port(match):
+    if match.group(1) is not None:
+        return match.group(1), match.group(2)
+    if match.group(3) is not None:
+        return match.group(3), match.group(4)
+    return match.group(5), match.group(6)
+
 emitted = set()
 for line in Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines():
     found = []
     for match in endpoint.finditer(line):
-        ip = normalize(match.group(1) or match.group(2))
+        raw, port = endpoint_ip_port(match)
+        ip = normalize(raw)
         if ip:
-            found.append((ip, match.group(3)))
+            found.append((ip, port))
     if "443" not in {port for _, port in found}:
         continue
     blocked = [ip for ip, _ in found if ip in table]
@@ -236,7 +299,6 @@ for line in Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").spli
             emitted.add(key)
             sys.stdout.write(f"{local} {remote}\n")
 STATES
-: >"$SESSION/p3-pf-kill.txt"
 kill_pair() {
   local src="$1" dst="$2" out
   if [[ -z "$src" || -z "$dst" ]]; then
@@ -287,14 +349,25 @@ for line in Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace").spli
     if ip:
         peers.add(ip)
 endpoint = re.compile(
-    r"(?:\[([0-9A-Fa-f:.%]+)\]|(\d{1,3}(?:\.\d{1,3}){3}))[:.](\d+)"
+    r"\[([0-9A-Fa-f:.%]+)\][:.](\d+)"
+    r"|(\d{1,3}(?:\.\d{1,3}){3})[:.](\d+)"
+    r"|([0-9A-Fa-f:]+(?:%[0-9A-Za-z]+)?)\[(\d+)\]"
 )
+
+def endpoint_ip_port(match):
+    if match.group(1) is not None:
+        return match.group(1), match.group(2)
+    if match.group(3) is not None:
+        return match.group(3), match.group(4)
+    return match.group(5), match.group(6)
+
 for line in Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines():
     hit = False
     port443 = False
     for match in endpoint.finditer(line):
-        ip = normalize(match.group(1) or match.group(2))
-        if match.group(3) == "443":
+        raw, port = endpoint_ip_port(match)
+        ip = normalize(raw)
+        if port == "443":
             port443 = True
         if ip in peers:
             hit = True
@@ -306,9 +379,50 @@ then
   echo "The live :443 state is still installed, so packets would skip the new rule." >&2
   exit 1
 fi
-# 15s after the states are gone. The engine's inbound stall is 5s, so the
-# hole that remains still spans the 10s grade bar and reaches pf off.
-sleep 15
+# 15s after the states are gone. The first 2s are the proof that the out
+# rule is actually matching. The engine's inbound stall is 5s, so the hole
+# that remains still spans the 10s grade bar and reaches pf off.
+sleep 2
+if ! sudo -n /sbin/pfctl -a "$ANCHOR" -vsr >"$SESSION/p3-anchor-counters.txt" 2>>"$SESSION/p3-pf-kill.txt"; then
+  printf '%s\n' "block=NOT_EFFECTIVE" >"$SESSION/p3-block.txt"
+  echo "block=NOT_EFFECTIVE: could not read anchor counters." >&2
+  exit 1
+fi
+python3 - "$SESSION/p3-anchor-counters.txt" >"$SESSION/p3-out-packets.txt" <<'COUNTERS'
+import re
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+out_packets = None
+pending_out = False
+for line in text.splitlines():
+    if "block drop out" in line:
+        pending_out = True
+        continue
+    if pending_out:
+        match = re.search(r"Packets:\s*(\d+)", line)
+        if match:
+            out_packets = int(match.group(1))
+            pending_out = False
+# A missing out rule is the same as a rule that never saw a packet.
+sys.stdout.write("0\n" if out_packets is None else f"{out_packets}\n")
+COUNTERS
+OUT="$(tr -d '[:space:]' <"$SESSION/p3-out-packets.txt")"
+if [[ -z "$OUT" || "$OUT" == "0" ]]; then
+  {
+    echo "block=NOT_EFFECTIVE"
+    echo "--- main rules ---"
+    cat "$SESSION/p3-main-rules.txt"
+    echo "--- anchor counters ---"
+    cat "$SESSION/p3-anchor-counters.txt"
+    echo "--- lsof tcp ---"
+    cat "$SESSION/p3-lsof-tcp.txt"
+  } >"$SESSION/p3-block.txt"
+  echo "block=NOT_EFFECTIVE: catcher anchor out rule saw 0 packets." >&2
+  exit 1
+fi
+sleep 13
 # Rules first, then stamp: -F all clears rules before its slower steps, so a
 # stamp after it lands seconds after traffic can flow again.
 sudo -n /sbin/pfctl -a "$ANCHOR" -F rules >/dev/null 2>&1 || true

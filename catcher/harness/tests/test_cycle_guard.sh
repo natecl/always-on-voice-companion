@@ -229,8 +229,19 @@ if 'ANCHOR="com.apple/catcher"' not in pf or '-a "$ANCHOR"' not in pf or "pfctl 
     raise SystemExit("p3 block is not an evaluated com.apple anchor with pf enabled")
 if "0.0.0.0/0" in pf or "::/0" in pf:
     raise SystemExit("p3 state kill still uses a wildcard source")
-if "api.deepgram.com" not in pf or "-iUDP:443" not in pf:
-    raise SystemExit("p3 block does not name the live Deepgram socket")
+if "api.deepgram.com" in pf or "-iUDP:443" not in pf:
+    raise SystemExit("p3 peer scan regressed")
+if "pf-anchor-unreachable" not in pf or "block=NOT_EFFECTIVE" not in pf:
+    raise SystemExit("p3 does not fail closed when the anchor is unreachable or idle")
+if "PF_LOADED_STOCK" not in pf or "sudo -n /sbin/pfctl -F rules" not in pf or "/etc/pf.conf" not in pf:
+    raise SystemExit("p3 does not load stock pf.conf and restore an empty main ruleset")
+load = pf.index('-a "$ANCHOR" -f "$RULE"')
+if pf.index("p3-main-rules.txt") > load:
+    raise SystemExit("main ruleset is inspected after the anchor is loaded")
+not_at = pf.index("block=NOT_EFFECTIVE")
+off_at = pf.index('append_harness_field "$SESSION" pfOffWallMs')
+if not_at > off_at or pf.index("sleep 2") > not_at or pf.index("sleep 13") < not_at:
+    raise SystemExit("packet proof is not inside the 15s hold, before pfOff")
 kill_line = pf.split("pfctl -k", 1)[1].split("\n", 1)[0]
 if kill_line.rstrip().endswith("&"):
     raise SystemExit("p3 state kill is backgrounded, so the socket can reconnect during the block")
@@ -283,6 +294,8 @@ def heredoc(name):
 peers_py = heredoc("PEERS")
 states_py = heredoc("STATES")
 still_py = heredoc("STILL")
+rules_py = heredoc("RULESET")
+count_py = heredoc("COUNTERS")
 
 def run_py(script, args):
     return subprocess.run(
@@ -304,7 +317,7 @@ with tempfile.TemporaryDirectory() as tmp:
         encoding="utf-8",
     )
     udp.write_text("n10.0.0.5:50003->208.184.56.201:443\n", encoding="utf-8")
-    dig.write_text("api.sv1.deepgram.com.\n104.18.18.80\n", encoding="utf-8")
+    dig.write_text("cname.example.\n104.18.18.80\n", encoding="utf-8")
     got = run_py(peers_py, [str(session), str(tcp), str(udp), str(dig)])
     if got.returncode != 0:
         raise SystemExit(got.stderr)
@@ -316,7 +329,7 @@ with tempfile.TemporaryDirectory() as tmp:
         raise SystemExit(f"mapped peer was not rewritten: {endpoints}")
     if "208.184.56.201" not in table or "104.18.18.80" not in table:
         raise SystemExit(f"table missed a peer or dig address: {table}")
-    if "api.sv1.deepgram.com" in table:
+    if "cname.example" in table:
         raise SystemExit("CNAME leaked into the pf table")
     (session / "none.txt").write_text("n*:443\np99\n", encoding="utf-8")
     missing = run_py(peers_py, [str(session), str(session / "none.txt"), str(session / "none.txt"), str(dig)])
@@ -326,16 +339,22 @@ with tempfile.TemporaryDirectory() as tmp:
     states.write_text(
         "all tcp 10.0.0.5:50000 -> 208.184.56.201:443 ESTABLISHED:ESTABLISHED\n"
         "all tcp 1.2.3.4:443 (10.0.0.8:9) -> 104.18.18.80:443 ESTABLISHED:ESTABLISHED\n"
-        "all tcp 10.9.9.9:1 -> 9.9.9.9:443 ESTABLISHED:ESTABLISHED\n",
+        "all tcp 10.9.9.9:1 -> 9.9.9.9:443 ESTABLISHED:ESTABLISHED\n"
+        "all tcp 2606:4700::6812:1250[443] <- 2606:4700:1::20[50000]\n",
         encoding="utf-8",
     )
-    (session / "p3-table-ips.txt").write_text("208.184.56.201\n104.18.18.80\n", encoding="utf-8")
+    (session / "p3-table-ips.txt").write_text(
+        "208.184.56.201\n104.18.18.80\n2606:4700::6812:1250\n",
+        encoding="utf-8",
+    )
     listed = run_py(states_py, [str(states), str(session / "p3-table-ips.txt")])
     if listed.returncode != 0:
         raise SystemExit(listed.stderr)
     pairs = listed.stdout.splitlines()
     if "10.0.0.5 208.184.56.201" not in pairs:
         raise SystemExit(f"state pair missing: {pairs}")
+    if "2606:4700:1::20 2606:4700::6812:1250" not in pairs:
+        raise SystemExit(f"ipv6 addr[port] state was not parsed: {pairs}")
     if "10.0.0.8 104.18.18.80" not in pairs or "1.2.3.4 104.18.18.80" not in pairs:
         raise SystemExit(f"nat state pair missing: {pairs}")
     if any("9.9.9.9" in pair for pair in pairs):
@@ -352,6 +371,43 @@ with tempfile.TemporaryDirectory() as tmp:
     other = run_py(still_py, [str(clear), str(session / "p3-endpoints.txt")])
     if other.returncode != 0:
         raise SystemExit("another app's Cloudflare state aborted the block: " + other.stderr)
+
+    def classify(text):
+        path = session / "rules.txt"
+        path.write_text(text, encoding="utf-8")
+        got = run_py(rules_py, [str(path)])
+        if got.returncode != 0:
+            raise SystemExit(got.stderr)
+        return got.stdout.strip()
+
+    if classify("No ALTQ support in kernel\nALTQ related functions disabled\n") != "empty":
+        raise SystemExit("ALTQ banner was treated as a main ruleset")
+    if classify('anchor "com.apple/*"\npass out all\n') != "hook":
+        raise SystemExit("com.apple/* anchor was not treated as reachable")
+    if classify("pass out quick all\n") != "foreign":
+        raise SystemExit("foreign ruleset without the hook was allowed")
+
+    def packets(text):
+        path = session / "counters.txt"
+        path.write_text(text, encoding="utf-8")
+        got = run_py(count_py, [str(path)])
+        if got.returncode != 0:
+            raise SystemExit(got.stderr)
+        return got.stdout.strip()
+
+    if packets(
+        "block drop out quick proto tcp from any to <catcher_xai> port = 443\n"
+        "  [ Evaluations: 10 Packets: 0 Bytes: 0 States: 0 ]\n"
+    ) != "0":
+        raise SystemExit("a zero out-rule packet count would hold the block")
+    normal = packets(
+        "block drop out quick proto tcp from any to <catcher_xai> port = 443\n"
+        "  [ Evaluations: 10 Packets: 42 Bytes: 100 States: 0 ]\n"
+        "block drop in quick proto tcp from <catcher_xai> port = 443 to any\n"
+        "  [ Evaluations: 1 Packets: 0 Bytes: 0 States: 0 ]\n"
+    )
+    if normal != "42":
+        raise SystemExit(f"out-rule packet count parsed as {normal}")
 PY
 
 echo "cycle guard ok"
