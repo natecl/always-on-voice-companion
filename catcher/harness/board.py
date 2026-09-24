@@ -39,19 +39,44 @@ def cdhash_from_codesign(text: str) -> str:
     return ""
 
 
+def is_catcher_executable(command: str) -> bool:
+    """True for the Catcher binary under either bundle name.
+
+    `Catcher.app` is the symlink the harness launches. LaunchServices runs
+    the real `CatcherApp.app`, and `ps` prints that path. A truncated `ps`
+    line can also stop at the bundle name, before `Contents/MacOS/CatcherApp`.
+    """
+    executable = command.strip().split(" ", 1)[0]
+    if "/Contents/MacOS/CatcherApp" in executable:
+        return True
+    for bundle in ("/Catcher.app", "/CatcherApp.app"):
+        if bundle + "/" in executable or executable.endswith(bundle):
+            return True
+    return False
+
+
 def orphan_kind(command: str) -> str | None:
-    """CatcherApp from any build, or afplay of this harness's fixture."""
-    if "/Contents/MacOS/CatcherApp" in command:
+    """Catcher from any build, or afplay of this harness's fixture."""
+    if is_catcher_executable(command):
         return "catcher"
     if "afplay" in command and "known-60s.wav" in command:
         return "afplay"
     return None
 
 
+def is_preflight_process(command: str, session: str) -> bool:
+    """The preflight Catcher for this session, whichever bundle name `ps` shows."""
+    return (
+        orphan_kind(command) == "catcher"
+        and "--preflight" in command
+        and session in command
+    )
+
+
 def list_processes() -> list[tuple[int, str]]:
     try:
         listed = subprocess.run(
-            ["ps", "-ax", "-o", "pid=", "-o", "command="],
+            ["ps", "-axww", "-o", "pid=", "-o", "command="],
             capture_output=True, text=True, check=False,
         )
     except OSError:

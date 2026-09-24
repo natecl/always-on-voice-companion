@@ -26,31 +26,37 @@ if ! require_stable_signature "$APP"; then
   exit 1
 fi
 printf 'PREFLIGHT signing PASS source=harness\n' > "$REPORT"
-# The stamp the gate guard compares. Lines the app writes do not carry
-# source=harness, so a board can tell the two apart.
-codesign -dv "$APP" 2>&1 | sed -n 's/^CDHash=//p' | head -n 1 > "$SESSION/preflight_cdhash.txt"
-
-# The preflight Catcher only. Match the app binary, --preflight, and this
-# session root so a different CatcherApp is left alone.
-kill_preflight_app() {
-  local app="$1"
-  local session="$2"
-  local bin="$app/Contents/MacOS/CatcherApp"
-  python3 - "$bin" "$session" <<'PY'
-import os, signal, subprocess, sys
-binary, session = sys.argv[1], sys.argv[2]
+# Same CDHash read as board-env: verbosity 4, then the CDHash= line.
+# Lines the app writes do not carry source=harness.
+python3 - "$ROOT" "$APP" "$SESSION/preflight_cdhash.txt" <<'PY'
+import subprocess, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import board
+app, dest = sys.argv[2], Path(sys.argv[3])
+text = ""
 try:
-    listed = subprocess.run(["ps", "-ax", "-o", "pid=", "-o", "command="], capture_output=True, text=True, check=False)
+    sign = subprocess.run(board.codesign_cdhash_args(app), capture_output=True, text=True)
+    text = (sign.stderr or "") + "\n" + (sign.stdout or "")
 except OSError:
-    raise SystemExit
-for line in listed.stdout.splitlines():
-    stripped = line.strip()
-    if not stripped:
-        continue
-    pid_text, _, command = stripped.partition(" ")
-    if binary in command and "--preflight" in command and session in command:
+    text = ""
+dest.write_text(board.cdhash_from_codesign(text) + "\n", encoding="utf-8")
+PY
+
+# The preflight Catcher only. ps shows CatcherApp.app even when the harness
+# opened the Catcher.app symlink. Match either name, --preflight, and this
+# session root so a different Catcher is left alone.
+kill_preflight_app() {
+  local session="$1"
+  python3 - "$ROOT" "$session" <<'PY'
+import os, signal, sys
+sys.path.insert(0, sys.argv[1])
+import board
+session = sys.argv[2]
+for pid, command in board.list_processes():
+    if board.is_preflight_process(command, session):
         try:
-            os.kill(int(pid_text), signal.SIGKILL)
+            os.kill(pid, signal.SIGKILL)
         except OSError:
             pass
 PY
@@ -97,7 +103,7 @@ while [[ "$SECONDS" -lt "$deadline" ]]; do
   sleep 0.1
 done
 if [[ ! -f "$REPORT" ]] || ! tail -n 1 "$REPORT" | tr -d '\r' | grep -q '^PREFLIGHT RESULT '; then
-  kill_preflight_app "$APP" "$SESSION"
+  kill_preflight_app "$SESSION"
   printf 'PREFLIGHT preflight-finish FAIL error=no-result source=harness\nPREFLIGHT RESULT FAIL failed=1 source=harness\n' >> "$REPORT"
   echo "preflight produced no RESULT within ${LIMIT}s. Wrote FAIL and stopped." >&2
 fi

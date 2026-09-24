@@ -21,6 +21,29 @@ class OrphanTests(unittest.TestCase):
         self.assertIsNone(board.orphan_kind("afplay /tmp/other.wav"))
         self.assertIsNone(board.orphan_kind("python3 board.py"))
 
+    def test_reap_matches_the_real_bundle_and_a_truncated_ps_line(self) -> None:
+        """LaunchServices runs CatcherApp.app even when the harness opened Catcher.app.
+
+        A wide `ps` line includes Contents/MacOS/CatcherApp. A truncated line
+        can stop at the bundle name. Both are the same orphan.
+        """
+        session = "/tmp/catcher-auto/run/preflight"
+        symlink = f"/build/Debug/Catcher.app/Contents/MacOS/CatcherApp --preflight --session-root {session}"
+        real = f"/build/Debug/CatcherApp.app/Contents/MacOS/CatcherApp --preflight --session-root {session}"
+        truncated = "/Users/n/Debug/CatcherApp.app"
+        self.assertEqual(board.orphan_kind(symlink), "catcher")
+        self.assertEqual(board.orphan_kind(real), "catcher")
+        self.assertEqual(board.orphan_kind(truncated), "catcher")
+        self.assertTrue(board.is_preflight_process(symlink, session))
+        self.assertTrue(board.is_preflight_process(real, session))
+        self.assertFalse(board.is_preflight_process(real, "/tmp/other-session/preflight"))
+        self.assertFalse(board.is_preflight_process(truncated, session))
+        self.assertFalse(board.is_preflight_process(
+            f"/build/Debug/CatcherApp.app/Contents/MacOS/CatcherApp --session-root {session}",
+            session,
+        ))
+        self.assertIsNone(board.orphan_kind("/tmp/NotCatcher.app/Contents/MacOS/Other"))
+
     def test_reap_kills_and_records_a_clear_sweep(self) -> None:
         root = Path(self.id().replace(".", "_"))
         # Use a real temp dir via unittest's default tmp is not available; make one.
@@ -218,6 +241,14 @@ class CdhashTests(unittest.TestCase):
         )
         hidden = "Identifier=com.catcher.app\nSignature size=4789\nTeamIdentifier=not set\n"
         self.assertEqual(board.cdhash_from_codesign(hidden), "")
+
+    def test_preflight_stamp_reuses_the_verbose_4_parser(self) -> None:
+        script = (HARNESS / "preflight.sh").read_text(encoding="utf-8")
+        self.assertIn("board.codesign_cdhash_args", script)
+        self.assertIn("board.cdhash_from_codesign", script)
+        self.assertNotRegex(script, r"codesign\s+-d")
+        self.assertIn('kill_preflight_app "$SESSION"', script)
+        self.assertNotIn('kill_preflight_app "$APP"', script)
 
 
 if __name__ == "__main__":
