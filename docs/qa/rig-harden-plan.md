@@ -1,6 +1,6 @@
 # QA rig hardening plan (v1 Recovery Brief §5)
 
-**Status:** PLAN. Nothing in `catcher/harness/**` changes on this branch. The follow-up IMPLEMENT branches from the same base.
+**Status:** IMPLEMENTED on this branch. The Mac self-test on `b14e31a` has not been run. Procedure: [rig-self-test.md](rig-self-test.md).
 
 **Base:** `main` @ `10db5451909ea3ed8f27a4b9ebe6b18df7f62159` (frozen). Not built on PR #14 (`cursor/p3-pfctl-sudo-n-54bb` / `eb9a396`); nothing is cherry-picked from it. Its harness ideas (packet-count fail-gate, durable obs files, `sudo -n` for pfctl) are redone below from `main`. Its five product files are dropped (Nathan veto).
 

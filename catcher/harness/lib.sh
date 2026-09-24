@@ -8,6 +8,12 @@
 # go through --args. There is no direct-exec fallback.
 set -euo pipefail
 
+# Sourced by the gate scripts. Prefer the caller's ROOT, and fall back to
+# this file so a direct source under `set -u` still finds the helpers.
+if [[ -z "${ROOT:-}" ]]; then
+  ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+
 catcher_bin() {
   local app="${CATCHER_APP:-}"
   if [[ -z "$app" || ! -d "$app" ]]; then
@@ -240,5 +246,230 @@ if not found:
     raise SystemExit(1)
 found.sort()
 print(found[-1][1])
+PY
+}
+
+# Write <root>/rig_obs.json atomically. The grader's rig:evidence premise
+# reads this file; a partial write would look like a missing premise.
+rig_obs_write() {
+  local root="$1"
+  local payload="$2"
+  python3 - "$root/rig_obs.json" "$payload" <<'PY'
+import json, os, sys
+path, raw = sys.argv[1], sys.argv[2]
+record = json.loads(raw)
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(record, handle, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.replace(tmp, path)
+PY
+}
+
+# Last line of preflight.txt is the verdict. <cdhash>, when given, must match
+# the stamp preflight.sh wrote for that same run. CATCHER_NO_PREFLIGHT=1
+# skips the check and marks the run ineligible for GREEN.
+require_preflight_pass() {
+  local report="$1"
+  local want="${2:-}"
+  if [[ "${CATCHER_NO_PREFLIGHT:-}" == "1" ]]; then
+    export CATCHER_GREEN_ELIGIBLE=0
+    echo "CATCHER_NO_PREFLIGHT=1: gate is running without a preflight. Not GREEN-eligible." >&2
+    return 0
+  fi
+  if [[ -z "$report" || ! -f "$report" ]]; then
+    echo "No passing preflight report. Run preflight first, or set CATCHER_PREFLIGHT_REPORT. CATCHER_NO_PREFLIGHT=1 skips this and is not GREEN-eligible." >&2
+    return 1
+  fi
+  local last
+  last="$(tail -n 1 "$report" | tr -d '\r')"
+  if [[ "$last" != "PREFLIGHT RESULT PASS"* ]]; then
+    echo "Preflight did not pass ($last). Not starting the gate." >&2
+    return 1
+  fi
+  if [[ -n "$want" ]]; then
+    local stamp got
+    stamp="$(dirname "$report")/preflight_cdhash.txt"
+    got="$(tr -d '[:space:]' < "$stamp" 2>/dev/null || true)"
+    if [[ -z "$got" || "$got" != "$want" ]]; then
+      echo "Preflight CDHash ${got:-missing} does not match ${want}." >&2
+      return 1
+    fi
+  fi
+}
+
+# SIGKILL every leftover CatcherApp and every afplay of the known fixture.
+# Survivors are a failed premise: the next launch would grade a stranger.
+kill_orphans() {
+  python3 "$ROOT/board.py" reap-orphans "$1"
+}
+
+# SIGTERM, then SIGKILL after the harness shutdown's live-tail budget.
+# Prints `exited` or `killed` for the gate's rig_obs.json.
+stop_catcher() {
+  local session="$1"
+  local pid=""
+  if [[ -s "$session/catcher.pid" ]]; then
+    pid="$(tr -cd '0-9' < "$session/catcher.pid")"
+  fi
+  if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+    printf '%s\n' exited
+    return 0
+  fi
+  kill "$pid" 2>/dev/null || true
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null && [[ "$waited" -lt 140 ]]; do
+    sleep 0.25
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null || true
+    printf '%s\n' killed
+    return 0
+  fi
+  printf '%s\n' exited
+}
+
+# pfctl with no password prompt. Root calls the binary; anyone else uses
+# `sudo -n` so a missing sudoers rule exits instead of waiting. Output is
+# appended to PFCTL_LOG when that is set, and also written to stdout.
+pfctl_run() {
+  local status=0
+  local out=""
+  if [[ "$(id -u)" -eq 0 ]]; then
+    out="$(/sbin/pfctl "$@" 2>&1)" || status=$?
+  else
+    out="$(sudo -n /sbin/pfctl "$@" 2>&1)" || status=$?
+  fi
+  if [[ -n "${PFCTL_LOG:-}" ]]; then
+    {
+      printf 'pfctl'
+      printf ' %q' "$@"
+      printf '\n%s\n' "$out"
+    } >> "$PFCTL_LOG"
+  fi
+  printf '%s\n' "$out"
+  return "$status"
+}
+
+volume_line() {
+  if ! command -v osascript >/dev/null 2>&1; then
+    printf '%s\n' "volume=not-observed muted=not-observed"
+    return 0
+  fi
+  local volume muted
+  volume="$(osascript -e 'output volume of (get volume settings)' 2>/dev/null || true)"
+  muted="$(osascript -e 'output muted of (get volume settings)' 2>/dev/null || true)"
+  printf 'volume=%s muted=%s\n' "${volume:-not-observed}" "${muted:-not-observed}"
+}
+
+afplay_ledger() {
+  local session="$1"
+  if [[ -n "${CATCHER_BOARD_RUN:-}" ]]; then
+    printf '%s\n' "$CATCHER_BOARD_RUN/obs/afplay.log"
+  else
+    printf '%s\n' "$session/obs/afplay.log"
+  fi
+}
+
+compile_window_probe() {
+  local src="$ROOT/window_probe.swift"
+  local bin="${TMPDIR:-/tmp}/catcher-window-probe"
+  if [[ ! -x "$bin" || "$src" -nt "$bin" ]]; then
+    if ! swiftc -O -framework AppKit -o "$bin" "$src"; then
+      return 1
+    fi
+  fi
+  printf '%s\n' "$bin"
+}
+
+# Probe Catcher's window. Prints one token. --raise asks it to become front.
+probe_window() {
+  local session="$1"
+  local raise="${2:-}"
+  local pid=""
+  if [[ -s "$session/catcher.pid" ]]; then
+    pid="$(tr -cd '0-9' < "$session/catcher.pid")"
+  fi
+  if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+    printf '%s\n' "NO_PROCESS"
+    return 1
+  fi
+  local width height
+  width="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["rigWindowMinWidth"]))' "$ROOT/thresholds.json")"
+  height="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["rigWindowMinHeight"]))' "$ROOT/thresholds.json")"
+  local helper
+  helper="$(compile_window_probe)" || {
+    printf '%s\n' "NO_HELPER"
+    return 1
+  }
+  local -a args=("$pid" "$session")
+  if [[ "$raise" == "--raise" ]]; then
+    args+=(--raise)
+  fi
+  CATCHER_WINDOW_MIN_W="$width" CATCHER_WINDOW_MIN_H="$height" \
+    CATCHER_APP="${CATCHER_APP:-}" "$helper" "${args[@]}"
+}
+
+# The only afplay entry. Refuses to play unless the probe prints RAISE OK.
+# --prepare raises and records the ledger line without playing.
+# --loop-guard re-probes without raising and does not rewrite rig_obs.json,
+# so a loop that ends when the gate stops Catcher cannot erase a block tag.
+play_fixture() {
+  local session="$1"
+  local mode="${2:-}"
+  local ledger pid token status=0 volume
+  ledger="$(afplay_ledger "$session")"
+  mkdir -p "$(dirname "$ledger")"
+  if [[ "$mode" != "--loop-guard" ]]; then
+    wait_for_recording "$session" || {
+      rig_obs_write "$session" '{"tag":"NO_RECORDING"}'
+      return 1
+    }
+  fi
+  pid=""
+  if [[ -s "$session/catcher.pid" ]]; then
+    pid="$(tr -cd '0-9' < "$session/catcher.pid")"
+  fi
+  if [[ "${CATCHER_RIG_FAULT:-}" == "kill-before-play" && "$mode" != "--loop-guard" && -n "$pid" ]]; then
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  local raise_flag=""
+  if [[ "$mode" != "--loop-guard" ]]; then
+    raise_flag="--raise"
+  fi
+  token="$(probe_window "$session" "$raise_flag")" || status=$?
+  token="$(printf '%s\n' "$token" | tail -n 1 | tr -d '\r')"
+  volume="$(volume_line)"
+  if [[ "$token" != "RAISE OK" ]]; then
+    printf '%s\n' "$token" >&2
+    if [[ "$mode" != "--loop-guard" ]]; then
+      rig_obs_write "$session" "$(python3 -c 'import json,sys; print(json.dumps({"tag": sys.argv[1]}))' "$token")"
+    fi
+    return 1
+  fi
+  local action="play"
+  if [[ "$mode" == "--prepare" ]]; then
+    action="prepare"
+  fi
+  printf 'wallMs=%s gate=%s pid=%s token=%s %s action=%s\n' \
+    "$(wall_ms)" "${CATCHER_GATE:-unknown}" "$pid" "$token" "$volume" "$action" >> "$ledger"
+  if [[ "$mode" == "--prepare" ]]; then
+    return 0
+  fi
+  local started ended
+  started="$(wall_ms)"
+  afplay "$ROOT/fixtures/known-60s.wav"
+  ended="$(wall_ms)"
+  python3 - "$session/afplay_result.txt" "$pid" "$((ended - started))" "$volume" <<'PY'
+import sys
+from pathlib import Path
+path, pid, wall, volume = sys.argv[1:]
+Path(path).write_text(
+    f"exit=0\npid={pid}\nwallMs={wall}\n{volume}\n",
+    encoding="utf-8",
+)
 PY
 }

@@ -80,6 +80,7 @@ class Session:
 
 def run(gate: str, session: Path, **kwargs) -> dict:
     rows, _ = grade.load_rows(session)
+    ensure_rig_obs(session.parent)
     kwargs.setdefault("no_provenance", True)
     return grade.grade_gate(gate, session, rows, **kwargs)
 
@@ -128,6 +129,7 @@ class VocabularyTests(TempRoot):
         import subprocess
 
         session = self.session().seg("system", 0, 1000, "x", "S1").seg("microphone", 0, 1000, "y").write()
+        ensure_rig_obs(session.parent)
         out = self.root / "grade.json"
         status = subprocess.run(
             [sys.executable, str(HARNESS / "grade.py"), "--session", str(session), "--gate", "P6",
@@ -157,7 +159,27 @@ def harness_run(root: Path, gate: str, **overrides) -> dict:
     }
     record.update(overrides)
     (root / "harness_run.json").write_text(json.dumps(record), encoding="utf-8")
+    ensure_rig_obs(root)
     return record
+
+
+def ensure_rig_obs(root: Path) -> None:
+    """A tag=ok observation whose drop samples sit inside the synthetic P3 gap."""
+    path = root / "rig_obs.json"
+    if path.exists():
+        return
+    path.write_text(json.dumps({
+        "tag": "ok",
+        "block": "ok",
+        "ruleset": "com.apple",
+        "anchor": "com.apple/catcher",
+        "statesKilled": 1,
+        "statesLeft": 0,
+        "samples": [
+            {"offsetMs": 2000, "atWallMs": 1790139600000 + 12000, "dropsIn": 1, "dropsOut": 2, "peers443": []},
+            {"offsetMs": 8000, "atWallMs": 1790139600000 + 18000, "dropsIn": 3, "dropsOut": 4, "peers443": []},
+        ],
+    }), encoding="utf-8")
 
 
 class OnMac(TempRoot):
@@ -487,6 +509,32 @@ class P3Tests(TempRoot):
         # The system resumed does not stand in for the microphone.
         session.rows.insert(-1, {"t": "ann", "atMs": 25000, "kind": "resumed", "detail": "transport resumed track=microphone backlogMs=15000"})
         assert_checks_ok_but_unproven(self, run("P3", session.write()))
+
+    def test_missing_rig_obs_is_invalid(self) -> None:
+        session = p6_session(self)
+        rows, _ = grade.load_rows(session)
+        result = grade.grade_gate("P6", session, rows, no_provenance=True)
+        self.assertEqual(result["result"], "invalid")
+        self.assertIn("rig:evidence", failed(result))
+
+    def test_non_ok_rig_tag_is_invalid(self) -> None:
+        session = p6_session(self)
+        (session.parent / "rig_obs.json").write_text(json.dumps({"tag": "NO_PROCESS"}), encoding="utf-8")
+        rows, _ = grade.load_rows(session)
+        result = grade.grade_gate("P6", session, rows, no_provenance=True)
+        self.assertEqual(result["result"], "invalid")
+        self.assertIn("rig:evidence", failed(result))
+
+    def test_drops_outside_the_gap_are_invalid(self) -> None:
+        p3_run(self.root)
+        obs = json.loads((self.root / "rig_obs.json").read_text(encoding="utf-8"))
+        obs["samples"] = [
+            {"offsetMs": 2000, "atWallMs": START_WALL_MS + 27000, "dropsIn": 1, "dropsOut": 1, "peers443": []},
+        ]
+        (self.root / "rig_obs.json").write_text(json.dumps(obs), encoding="utf-8")
+        result = run("P3", p3_good(self).write())
+        self.assertEqual(result["result"], "invalid")
+        self.assertIn("rig:drops-cover-gap", failed(result))
 
 
 class P1GapTests(TempRoot):

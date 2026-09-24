@@ -69,7 +69,7 @@ export XAI_API_KEY=...
 ./catcher/harness/run.sh preflight /tmp/catcher-pre
 ```
 
-Preflight runs inside `Catcher.app` launched through LaunchServices (`open -n -W` when `open` has `--env`, otherwise the same `NSWorkspace` helper as the gates). It never calls `tccutil` and never prompts. `open` does not pass the app's exit status, so `preflight.txt` is the verdict. The script exits 0 only when the last line is `PREFLIGHT RESULT PASS`.
+Preflight runs inside `Catcher.app` launched through LaunchServices (`open -n` when `open` has `--env`, otherwise the same `NSWorkspace` helper as the gates). It does not use `open -W`. It never calls `tccutil` and never prompts. `open` does not pass the app's exit status, so `preflight.txt` is the verdict. The script exits 0 only when the last line is `PREFLIGHT RESULT PASS`. If that line is still missing 40s after launch, the harness kills the preflight process whose command contains that session root and appends `PREFLIGHT preflight-finish FAIL error=no-result source=harness` and `PREFLIGHT RESULT FAIL failed=1 source=harness`. Lines the harness writes carry `source=harness`. Lines the app writes do not.
 
 | Check | PASS when |
 |---|---|
@@ -86,7 +86,13 @@ Preflight runs inside `Catcher.app` launched through LaunchServices (`open -n -W
 
 When `CATCHER_ENGINE=stub`, the four API checks print `PASS skipped=stub`.
 
-Do not start P1 on a FAIL line. The cause table below is the next action for a session trace. A preflight FAIL names the check in `preflight.txt`.
+Do not start P1 on a FAIL line. The board entry is `run.sh board <parent-dir>`. A preflight result other than `PREFLIGHT RESULT PASS` writes `<run>/board.json` (`verdict` `RED`, `stopped` `preflight`, `gatesLaunched` counted from gate directories on disk, `afplayLaunched` counted from `obs/afplay.log`) and returns. No gate directory is created and `afplay` does not start.
+
+`error=no-result` is a hang after signing, not a Screen Recording deny. The cycle still stops.
+
+Each gate that plays the fixture calls `play_fixture`. That waits until a recording exists, then `window_probe` (a harness helper, not part of the app) must print `RAISE OK`: the pid is alive, Catcher is frontmost, and an on-screen layer-0 window is at least 720×520. The probe writes `<session>/window_front` with `source` `harness-cgwindowlist`. Any other token (`NO_PROCESS`, `NOT_VISIBLE`, `NOT_FRONTMOST`, `MULTI_INSTANCE`) is written to `rig_obs.json` and the fixture is not played.
+
+The cause table below is the next action for a session trace. A preflight FAIL names the check in `preflight.txt`.
 
 ## Cause table
 
@@ -115,5 +121,17 @@ First match wins. `TRACE error=` is the underlying error (domain and code, OSSta
 | `segments-received` | `blankDropped>0` and `system=0` | only endpoint spam came back | audio too quiet or not speech |
 | `transcript-write` | `error=` present | assemble/end failed | the error names the path and errno |
 | `transcript-write` | `bytes=0` and `segments=0` | nothing to write | the trace points upstream; this is a symptom |
+
+## P3 packet filter
+
+`catcher/harness/p3_net_kill.sh` changes the packet filter only when `CATCHER_ALLOW_PF=1`. Every `pfctl` invocation is `sudo -n /sbin/pfctl` (absolute path), or `/sbin/pfctl` when the script is already root. `-n` exits when the sudoers rule is missing, so the script does not wait for a password. That exit is block tag `sudo-denied`. `/usr/local/bin/catcher-p3-gate` is not called.
+
+`pfctl -E` enables pf with a reference token, released on cleanup, so a host that already had pf on stays on. The block is loaded into an anchor the main ruleset evaluates: `com.apple/catcher` when `pfctl -sr` shows `anchor "com.apple/*"`, `catcher` when the ruleset is that anchor, or the same `com.apple/catcher` path after this run loads `/etc/pf.conf` into an empty ruleset (those main rules are flushed on cleanup). A ruleset with neither hook is not modified (`ruleset-foreign`).
+
+Live `:443` peers come from `lsof` on the Catcher pid (TCP established and UDP). No live peer is `no-live-peer`. The table is those peers plus `dig api.x.ai`. States are killed per concrete pair, both directions, in the foreground. A kill count of zero is recorded and is not itself a failure. A state that still names a live peer afterwards is `state-survived`.
+
+Samples at 2s, 8s, and 14s after `pfOn` read the anchor rules, the block-drop packet counters, and the pid's `:443` peers. The first sample must show drops (`no-drops` otherwise). Rules disappearing is `rules-vanished`. An established peer that is not in the table is `peer-leak`. One tag is written, the first failure: `ok`, `sudo-denied`, `pf-enable-failed`, `ruleset-foreign`, `no-live-peer`, `rule-not-loaded`, `state-survived`, `no-drops`, `rules-vanished`, `peer-leak`. It is in `<session>/rig_obs.json` with `ruleset`, `anchor`, `statesKilled`, `statesLeft`, and `samples` (`dropsIn`, `dropsOut`, `peers443`). Cleanup flushes the anchor and does not delete those files. If the script dies before the tag is written, the trap writes the step it died in and never `ok`.
+
+`grade.py` treats a non-`ok` tag as `invalid`, and `rig:drops-cover-gap` is `invalid` when the samples that saw drops do not fall inside the graded system gap.
 
 Mid-session Screen Recording revoke and socket reconnect are graded from `blocked`, `degraded`, `gap`, and `resumed` annotations. They do not add a stage line. `degraded` and `resumed` detail text ends in `track=<t>`, and `resumed` carries `backlogMs=<n>` (audio the new socket replays before live). `noAudio` and heartbeat/handshake `degraded` carry `emittedAtMs=`; `noAudio` also carries `observedFromMs=` (capture start). `stages.log` is still never read by `grade.py`; provenance comes from `harness_run.json`, not from stage lines.
