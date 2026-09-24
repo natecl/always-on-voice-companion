@@ -38,6 +38,73 @@ PF_LOADED_STOCK=0
 # reaches that path; this run then loads the same rules into `catcher`.
 # Anything with neither hook is left alone.
 ANCHOR="com.apple/catcher"
+# OBS_START
+# Session files below survive cleanup. The block tag is one of
+# pf-anchor-unreachable, NOT_EFFECTIVE, kill-miss, or ok.
+seal_obs_files() {
+  [[ -f "$SESSION/p3-ruleset.txt" ]] || printf '%s\n' "n/a" >"$SESSION/p3-ruleset.txt"
+  [[ -f "$SESSION/p3-anchor.txt" ]] || printf '%s\n' "n/a" >"$SESSION/p3-anchor.txt"
+  [[ -f "$SESSION/p3-main-rules.txt" ]] || printf '%s\n' "n/a" >"$SESSION/p3-main-rules.txt"
+  [[ -f "$SESSION/p3-lsof-peers.txt" ]] || printf '%s\n' "n/a" >"$SESSION/p3-lsof-peers.txt"
+  [[ -f "$SESSION/p3-kill-counts.txt" ]] || printf '%s\n' "states_killed=n/a" >"$SESSION/p3-kill-counts.txt"
+  [[ -f "$SESSION/p3-out-packets.txt" ]] || printf '%s\n' "Packets:n/a" >"$SESSION/p3-out-packets.txt"
+}
+
+write_block_tag() {
+  local tag="$1" ruleset anchor packets kills
+  case "$tag" in
+    pf-anchor-unreachable|NOT_EFFECTIVE|kill-miss|ok) ;;
+    *)
+      echo "bad block tag: $tag" >&2
+      tag="pf-anchor-unreachable"
+      ;;
+  esac
+  seal_obs_files
+  printf '%s\n' "$tag" >"$SESSION/p3-block.txt"
+  ruleset="$(tr -d '[:space:]' <"$SESSION/p3-ruleset.txt")"
+  anchor="$(tr -d '[:space:]' <"$SESSION/p3-anchor.txt")"
+  packets="$(tr -d '[:space:]' <"$SESSION/p3-out-packets.txt")"
+  kills="$(head -n 1 "$SESSION/p3-kill-counts.txt" | tr -d '[:space:]')"
+  {
+    printf 'ruleset=%s\n' "$ruleset"
+    printf 'anchor=%s\n' "$anchor"
+    printf 'sr=p3-main-rules.txt\n'
+    printf 'peers=p3-lsof-peers.txt\n'
+    printf 'kills=p3-kill-counts.txt\n'
+    printf 'packets=%s\n' "$packets"
+    printf 'block=%s\n' "$tag"
+  } >"$SESSION/p3-obs.txt"
+  echo "p3 block=$tag ruleset=$ruleset anchor=$anchor packets=$packets" >&2
+}
+
+summarize_kills() {
+  python3 - "$SESSION/p3-kill-counts.txt" >"$SESSION/p3-kill-counts.next" <<'KCOUNTS'
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+total = 0
+for line in text.splitlines():
+    if line.startswith("states_killed="):
+        continue
+    match = re.search(r"killed\s+(\d+)\s+states", line)
+    if match:
+        total += int(match.group(1))
+raw = "\n".join(
+    line for line in text.splitlines() if not line.startswith("states_killed=")
+)
+if not raw.strip():
+    sys.stdout.write("states_killed=n/a\n")
+else:
+    if not raw.endswith("\n"):
+        raw += "\n"
+    sys.stdout.write(f"states_killed={total}\n{raw}")
+KCOUNTS
+  mv "$SESSION/p3-kill-counts.next" "$SESSION/p3-kill-counts.txt"
+}
+# OBS_END
 cleanup() {
   if [[ -n "$PLAYER" ]]; then
     kill "$PLAYER" 2>/dev/null || true
@@ -56,6 +123,10 @@ cleanup() {
   if [[ -n "$RULE" ]]; then
     rm -f "$RULE"
   fi
+  # pf is flushed above. The p3-* session files stay for the scoreboard.
+  if [[ ! -s "$SESSION/p3-block.txt" ]]; then
+    write_block_tag pf-anchor-unreachable
+  fi
 }
 trap cleanup EXIT
 launch_catcher "$SESSION" 1
@@ -73,7 +144,7 @@ lsof -nP -a -p "$PID" -iUDP:443 -Fn >"$SESSION/p3-lsof-udp.txt" 2>>"$SESSION/p3-
   dig +short api.x.ai A || true
   dig +short api.x.ai AAAA || true
 } >"$SESSION/p3-dig.txt" || true
-python3 - "$SESSION" "$SESSION/p3-lsof-tcp.txt" "$SESSION/p3-lsof-udp.txt" "$SESSION/p3-dig.txt" <<'PEERS'
+if ! python3 - "$SESSION" "$SESSION/p3-lsof-tcp.txt" "$SESSION/p3-lsof-udp.txt" "$SESSION/p3-dig.txt" <<'PEERS'
 import ipaddress
 import sys
 from pathlib import Path
@@ -161,9 +232,24 @@ if not pairs:
     )
     sys.exit(1)
 PEERS
-IPS="$(tr '\n' ' ' <"$SESSION/p3-table-ips.txt" | sed 's/  */ /g;s/^ //;s/ $//')"
-if [[ -z "$IPS" ]]; then
+then
+  peer_fail=1
+else
+  peer_fail=0
+fi
+if [[ -f "$SESSION/p3-endpoints.txt" ]]; then
+  cp "$SESSION/p3-endpoints.txt" "$SESSION/p3-lsof-peers.txt"
+else
+  printf '%s\n' "n/a" >"$SESSION/p3-lsof-peers.txt"
+fi
+if [[ -f "$SESSION/p3-table-ips.txt" ]]; then
+  IPS="$(tr '\n' ' ' <"$SESSION/p3-table-ips.txt" | sed 's/  */ /g;s/^ //;s/ $//')"
+else
+  IPS=""
+fi
+if [[ "$peer_fail" -ne 0 || -z "$IPS" ]]; then
   echo "No address for the live STT socket or api.x.ai" >&2
+  write_block_tag kill-miss
   exit 1
 fi
 RULE="$(mktemp)"
@@ -176,12 +262,15 @@ RULE="$(mktemp)"
   echo "block drop in quick proto { tcp udp } from <catcher_xai> port 443 to any"
 } > "$RULE"
 # -E reference-counts. Releasing the token in cleanup does not turn pf off
-# if the host already had it enabled.
-: >"$SESSION/p3-pf-kill.txt"
+# if the host already had it enabled. p3-pf-kill.txt is append-only: errors
+# are dumped into it and it is never cleared.
 enable_out="$(sudo -n /sbin/pfctl -E 2>&1)" || {
+  printf '%s\n' "$enable_out" >>"$SESSION/p3-pf-kill.txt"
   echo "pfctl -E failed: $enable_out" >&2
+  write_block_tag pf-anchor-unreachable
   exit 1
 }
+printf '%s\n' "$enable_out" >>"$SESSION/p3-pf-kill.txt"
 PF_TOKEN="$(printf '%s\n' "$enable_out" | sed -n 's/.*Token *: *//p' | head -n 1)"
 # pfctl -E enables pf and does not load /etc/pf.conf. The anchor below is
 # evaluated only when the main ruleset hooks it. An empty ruleset never
@@ -189,6 +278,7 @@ PF_TOKEN="$(printf '%s\n' "$enable_out" | sed -n 's/.*Token *: *//p' | head -n 1
 # passing. A ruleset of `anchor "catcher"` evaluates that name instead.
 if ! sudo -n /sbin/pfctl -sr >"$SESSION/p3-main-rules.txt" 2>>"$SESSION/p3-pf-kill.txt"; then
   echo "pfctl -sr failed" >&2
+  write_block_tag pf-anchor-unreachable
   exit 1
 fi
 python3 - "$SESSION/p3-main-rules.txt" >"$SESSION/p3-ruleset.txt" <<'RULESET'
@@ -205,7 +295,7 @@ for line in Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").spli
     lines.append(stripped)
 body = "\n".join(lines)
 if 'anchor "com.apple/*"' in body:
-    sys.stdout.write("hook\n")
+    sys.stdout.write("com.apple\n")
 elif not lines:
     sys.stdout.write("empty\n")
 elif 'anchor "catcher"' in body:
@@ -215,12 +305,13 @@ else:
 RULESET
 MAIN="$(tr -d '[:space:]' <"$SESSION/p3-ruleset.txt")"
 case "$MAIN" in
-  hook) ;;
+  com.apple) ;;
   empty)
     if ! stock_out="$(sudo -n /sbin/pfctl -f /etc/pf.conf 2>&1)"; then
       printf '%s\n' "$stock_out" | tee -a "$SESSION/p3-pf-kill.txt" >&2
-      printf '%s\n' "pf-anchor-unreachable" >"$SESSION/p3-block.txt"
+      printf '%s\n' "none" >"$SESSION/p3-anchor.txt"
       echo "pf-anchor-unreachable: could not load /etc/pf.conf" >&2
+      write_block_tag pf-anchor-unreachable
       exit 1
     fi
     PF_LOADED_STOCK=1
@@ -230,15 +321,19 @@ case "$MAIN" in
     ANCHOR="catcher"
     ;;
   foreign)
-    printf '%s\n' "pf-anchor-unreachable" >"$SESSION/p3-block.txt"
+    printf '%s\n' "none" >"$SESSION/p3-anchor.txt"
     echo "pf-anchor-unreachable: main ruleset has no com.apple/* or catcher anchor." >&2
+    write_block_tag pf-anchor-unreachable
     exit 1
     ;;
   *)
+    printf '%s\n' "none" >"$SESSION/p3-anchor.txt"
     echo "Could not classify the main pf ruleset (${MAIN:-missing})." >&2
+    write_block_tag pf-anchor-unreachable
     exit 1
     ;;
 esac
+printf '%s\n' "$ANCHOR" >"$SESSION/p3-anchor.txt"
 sudo -n /sbin/pfctl -a "$ANCHOR" -f "$RULE"
 append_harness_field "$SESSION" pfOnWallMs "$(wall_ms)"
 # pf passes a packet that matches an existing state without reading the rule.
@@ -247,7 +342,7 @@ append_harness_field "$SESSION" pfOnWallMs "$(wall_ms)"
 # Darwin does not treat a wildcard source as "any" for -k, so that form kills
 # nothing and the established socket keeps passing. Kill the concrete pair,
 # both directions, from the process sockets and from the state table.
-# p3-pf-kill.txt was truncated before -E so this stderr is kept.
+# p3-pf-kill.txt is append-only, so this stderr stays with the earlier pfctl errors.
 sudo -n /sbin/pfctl -s states >"$SESSION/p3-states-before.txt" 2>>"$SESSION/p3-pf-kill.txt" || true
 python3 - "$SESSION/p3-states-before.txt" "$SESSION/p3-table-ips.txt" >"$SESSION/p3-state-pairs.txt" <<'STATES'
 import ipaddress
@@ -314,9 +409,13 @@ kill_pair() {
   fi
   if ! out="$(sudo -n /sbin/pfctl -k "$src" -k "$dst" 2>&1)"; then
     printf '%s\n' "$out" | tee -a "$SESSION/p3-pf-kill.txt" >&2
+    printf '%s\n' "$out" >>"$SESSION/p3-kill-counts.txt"
+    summarize_kills
+    write_block_tag kill-miss
     exit 1
   fi
   printf '%s\n' "$out" >>"$SESSION/p3-pf-kill.txt"
+  printf '%s\n' "$out" >>"$SESSION/p3-kill-counts.txt"
 }
 while read -r src dst; do
   kill_pair "$src" "$dst"
@@ -326,6 +425,7 @@ while read -r src dst; do
   kill_pair "$src" "$dst"
   kill_pair "$dst" "$src"
 done <"$SESSION/p3-state-pairs.txt"
+summarize_kills
 sudo -n /sbin/pfctl -s states >"$SESSION/p3-states-after.txt" 2>>"$SESSION/p3-pf-kill.txt" || true
 # Only the process's own peers must be gone. A published Cloudflare address
 # can still have some other app's state; that state is not this socket.
@@ -385,6 +485,7 @@ for line in Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").spli
 STILL
 then
   echo "The live :443 state is still installed, so packets would skip the new rule." >&2
+  write_block_tag kill-miss
   exit 1
 fi
 # 15s after the states are gone. The first 2s are the proof that the out
@@ -393,8 +494,9 @@ fi
 sleep 2
 # Counters come from the anchor this run loaded, not a hardcoded name.
 if ! sudo -n /sbin/pfctl -a "$ANCHOR" -vsr >"$SESSION/p3-anchor-counters.txt" 2>>"$SESSION/p3-pf-kill.txt"; then
-  printf '%s\n' "block=NOT_EFFECTIVE" >"$SESSION/p3-block.txt"
-  echo "block=NOT_EFFECTIVE: could not read anchor counters." >&2
+  printf '%s\n' "Packets:n/a" >"$SESSION/p3-out-packets.txt"
+  echo "NOT_EFFECTIVE: could not read anchor counters." >&2
+  write_block_tag NOT_EFFECTIVE
   exit 1
 fi
 python3 - "$SESSION/p3-anchor-counters.txt" >"$SESSION/p3-out-packets.txt" <<'COUNTERS'
@@ -415,22 +517,15 @@ for line in text.splitlines():
             out_packets = int(match.group(1))
             pending_out = False
 # A missing out rule is the same as a rule that never saw a packet.
-sys.stdout.write("0\n" if out_packets is None else f"{out_packets}\n")
+sys.stdout.write("Packets:0\n" if out_packets is None else f"Packets:{out_packets}\n")
 COUNTERS
-OUT="$(tr -d '[:space:]' <"$SESSION/p3-out-packets.txt")"
-if [[ -z "$OUT" || "$OUT" == "0" ]]; then
-  {
-    echo "block=NOT_EFFECTIVE"
-    echo "--- main rules ---"
-    cat "$SESSION/p3-main-rules.txt"
-    echo "--- anchor counters ---"
-    cat "$SESSION/p3-anchor-counters.txt"
-    echo "--- lsof tcp ---"
-    cat "$SESSION/p3-lsof-tcp.txt"
-  } >"$SESSION/p3-block.txt"
-  echo "block=NOT_EFFECTIVE: catcher anchor out rule saw 0 packets." >&2
+OUT="$(sed -n 's/^Packets://p' "$SESSION/p3-out-packets.txt" | head -n 1 | tr -d '[:space:]')"
+if [[ -z "$OUT" || "$OUT" == "0" || "$OUT" == "n/a" ]]; then
+  echo "NOT_EFFECTIVE: catcher anchor out rule saw ${OUT:-0} packets." >&2
+  write_block_tag NOT_EFFECTIVE
   exit 1
 fi
+write_block_tag ok
 sleep 13
 # Rules first, then stamp: -F all clears rules before its slower steps, so a
 # stamp after it lands seconds after traffic can flow again.

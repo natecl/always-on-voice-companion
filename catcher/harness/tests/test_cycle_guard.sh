@@ -231,22 +231,65 @@ if "0.0.0.0/0" in pf or "::/0" in pf:
     raise SystemExit("p3 state kill still uses a wildcard source")
 if "api.deepgram.com" in pf or "-iUDP:443" not in pf:
     raise SystemExit("p3 peer scan regressed")
-if "pf-anchor-unreachable" not in pf or "block=NOT_EFFECTIVE" not in pf:
+if "pf-anchor-unreachable" not in pf or "write_block_tag NOT_EFFECTIVE" not in pf:
     raise SystemExit("p3 does not fail closed when the anchor is unreachable or idle")
+if "write_block_tag kill-miss" not in pf or "write_block_tag ok" not in pf:
+    raise SystemExit("p3 block tag is missing kill-miss or ok")
+for artifact in (
+    "p3-ruleset.txt",
+    "p3-anchor.txt",
+    "p3-main-rules.txt",
+    "p3-lsof-peers.txt",
+    "p3-kill-counts.txt",
+    "p3-out-packets.txt",
+    "p3-block.txt",
+    "p3-obs.txt",
+):
+    if f"$SESSION/{artifact}" not in pf:
+        raise SystemExit(f"p3 artifact {artifact} is not written under the session")
+kill_at = 0
+while True:
+    kill_at = pf.find('>"$SESSION/p3-pf-kill.txt"', kill_at)
+    if kill_at < 0:
+        break
+    if kill_at == 0 or pf[kill_at - 1] != ">":
+        raise SystemExit("p3-pf-kill.txt is truncated instead of appended")
+    kill_at += 1
+if '>>"$SESSION/p3-pf-kill.txt"' not in pf:
+    raise SystemExit("p3-pf-kill.txt does not keep pfctl errors")
+cleanup = pf.split("cleanup() {", 1)[1].split("\n}", 1)[0]
+rm_lines = [line.strip() for line in cleanup.splitlines() if "rm " in line]
+if rm_lines != ['rm -f "$RULE"']:
+    raise SystemExit(f"cleanup removes a p3 artifact: {rm_lines}")
 if "PF_LOADED_STOCK" not in pf or "sudo -n /sbin/pfctl -F rules" not in pf or "/etc/pf.conf" not in pf:
     raise SystemExit("p3 does not load stock pf.conf and restore an empty main ruleset")
 load = pf.index('-a "$ANCHOR" -f "$RULE"')
-if pf.index("p3-main-rules.txt") > load:
+if pf.index('pfctl -sr >"$SESSION/p3-main-rules.txt"') > load:
     raise SystemExit("main ruleset is inspected after the anchor is loaded")
 catcher_arm = pf.split("\n  catcher)", 1)[1].split("\n  foreign)", 1)[0]
 if 'ANCHOR="catcher"' not in catcher_arm or "pf-anchor-unreachable" in catcher_arm:
     raise SystemExit("top-level catcher anchor does not proceed")
 if pf.index('ANCHOR="catcher"') > load:
     raise SystemExit("catcher anchor is selected after the rules are loaded")
-not_at = pf.index("block=NOT_EFFECTIVE")
+foreign_arm = pf.split("\n  foreign)", 1)[1].split("\n  *)", 1)[0]
+foreign_tag = pf.index("write_block_tag pf-anchor-unreachable", pf.index("\n  foreign)"))
+if "write_block_tag pf-anchor-unreachable" not in foreign_arm or foreign_tag > load:
+    raise SystemExit("missing hook does not tag pf-anchor-unreachable before pfOn")
+not_at = pf.index("write_block_tag NOT_EFFECTIVE")
 off_at = pf.index('append_harness_field "$SESSION" pfOffWallMs')
 if not_at > off_at or pf.index("sleep 2") > not_at or pf.index("sleep 13") < not_at:
     raise SystemExit("packet proof is not inside the 15s hold, before pfOff")
+ok_at = pf.index("write_block_tag ok")
+if pf.index("sleep 2") > ok_at or ok_at > pf.index("sleep 13") or ok_at > off_at:
+    raise SystemExit("ok is not written after a nonzero packet count and before pfOff")
+miss_at = 0
+while True:
+    miss_at = pf.find("write_block_tag kill-miss", miss_at)
+    if miss_at < 0:
+        break
+    if miss_at > off_at:
+        raise SystemExit("kill-miss is written after pfOff")
+    miss_at += 1
 kill_line = pf.split("pfctl -k", 1)[1].split("\n", 1)[0]
 if kill_line.rstrip().endswith("&"):
     raise SystemExit("p3 state kill is backgrounded, so the socket can reconnect during the block")
@@ -301,6 +344,7 @@ states_py = heredoc("STATES")
 still_py = heredoc("STILL")
 rules_py = heredoc("RULESET")
 count_py = heredoc("COUNTERS")
+kcounts_py = heredoc("KCOUNTS")
 
 def run_py(script, args):
     return subprocess.run(
@@ -387,7 +431,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
     if classify("No ALTQ support in kernel\nALTQ related functions disabled\n") != "empty":
         raise SystemExit("ALTQ banner was treated as a main ruleset")
-    if classify('anchor "com.apple/*"\npass out all\n') != "hook":
+    if classify('anchor "com.apple/*"\npass out all\n') != "com.apple":
         raise SystemExit("com.apple/* anchor was not treated as reachable")
     if classify('anchor "catcher" all\n') != "catcher":
         raise SystemExit("top-level catcher anchor was treated as unreachable")
@@ -405,7 +449,7 @@ with tempfile.TemporaryDirectory() as tmp:
     if packets(
         "block drop out quick proto tcp from any to <catcher_xai> port = 443\n"
         "  [ Evaluations: 10 Packets: 0 Bytes: 0 States: 0 ]\n"
-    ) != "0":
+    ) != "Packets:0":
         raise SystemExit("a zero out-rule packet count would hold the block")
     normal = packets(
         "block drop out quick proto tcp from any to <catcher_xai> port = 443\n"
@@ -413,8 +457,81 @@ with tempfile.TemporaryDirectory() as tmp:
         "block drop in quick proto tcp from <catcher_xai> port = 443 to any\n"
         "  [ Evaluations: 1 Packets: 0 Bytes: 0 States: 0 ]\n"
     )
-    if normal != "42":
+    if normal != "Packets:42":
         raise SystemExit(f"out-rule packet count parsed as {normal}")
+
+    counts = session / "kills.txt"
+    counts.write_text(
+        "killed 0 states from 1 sources and 1 destinations\n"
+        "killed 2 states from 1 sources and 1 destinations\n",
+        encoding="utf-8",
+    )
+    summed = run_py(kcounts_py, [str(counts)])
+    if summed.returncode != 0:
+        raise SystemExit(summed.stderr)
+    if not summed.stdout.startswith("states_killed=2\n"):
+        raise SystemExit(f"kill counts were not summed: {summed.stdout!r}")
+    if "killed 0 states" not in summed.stdout or "killed 2 states" not in summed.stdout:
+        raise SystemExit("kill count lines were dropped")
+
+obs_start = pf.index("# OBS_START\n") + len("# OBS_START\n")
+obs_end = pf.index("# OBS_END\n")
+funcs = pf[obs_start:obs_end]
+
+def run_obs(tmp, body):
+    script = tmp / "obs.sh"
+    script.write_text(funcs + "\n" + body, encoding="utf-8")
+    got = subprocess.run(
+        ["bash", str(script)],
+        cwd=tmp,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "SESSION": str(tmp)},
+    )
+    if got.returncode != 0:
+        raise SystemExit(got.stderr or got.stdout)
+    names = (
+        "p3-ruleset.txt",
+        "p3-anchor.txt",
+        "p3-main-rules.txt",
+        "p3-lsof-peers.txt",
+        "p3-kill-counts.txt",
+        "p3-out-packets.txt",
+        "p3-block.txt",
+        "p3-obs.txt",
+    )
+    for name in names:
+        path = tmp / name
+        if not path.is_file() or not path.read_text(encoding="utf-8").strip():
+            raise SystemExit(f"{name} missing after {body}")
+    return (tmp / "p3-block.txt").read_text(encoding="utf-8").strip(), (
+        tmp / "p3-obs.txt"
+    ).read_text(encoding="utf-8")
+
+import os
+
+with tempfile.TemporaryDirectory() as raw:
+    tmp = pathlib.Path(raw)
+    (tmp / "p3-ruleset.txt").write_text("foreign\n", encoding="utf-8")
+    (tmp / "p3-anchor.txt").write_text("none\n", encoding="utf-8")
+    (tmp / "p3-main-rules.txt").write_text('pass out quick all\n', encoding="utf-8")
+    (tmp / "p3-lsof-peers.txt").write_text("10.0.0.5 104.18.18.80\n", encoding="utf-8")
+    tag, obs = run_obs(tmp, "write_block_tag pf-anchor-unreachable\n")
+    if tag != "pf-anchor-unreachable" or "ruleset=foreign" not in obs or "anchor=none" not in obs:
+        raise SystemExit(f"missing-hook artifacts: {tag} {obs}")
+    (tmp / "p3-ruleset.txt").write_text("com.apple\n", encoding="utf-8")
+    (tmp / "p3-anchor.txt").write_text("com.apple/catcher\n", encoding="utf-8")
+    (tmp / "p3-out-packets.txt").write_text("Packets:0\n", encoding="utf-8")
+    tag, obs = run_obs(tmp, "write_block_tag NOT_EFFECTIVE\n")
+    if tag != "NOT_EFFECTIVE" or "packets=Packets:0" not in obs:
+        raise SystemExit(f"zero-packet artifacts: {tag} {obs}")
+    (tmp / "p3-ruleset.txt").write_text("catcher\n", encoding="utf-8")
+    (tmp / "p3-anchor.txt").write_text("catcher\n", encoding="utf-8")
+    (tmp / "p3-out-packets.txt").write_text("Packets:42\n", encoding="utf-8")
+    (tmp / "p3-kill-counts.txt").write_text("states_killed=0\n", encoding="utf-8")
+    tag, obs = run_obs(tmp, "write_block_tag ok\n")
+    if tag != "ok" or "ruleset=catcher" not in obs or "anchor=catcher" not in obs or "packets=Packets:42" not in obs:
+        raise SystemExit(f"catcher-anchor artifacts: {tag} {obs}")
 PY
 
 echo "cycle guard ok"
