@@ -175,6 +175,50 @@ class ExecTests(unittest.TestCase):
         self.assertEqual(status, 3)
         self.assertFalse((tmp / "rig_obs.json").exists())
 
+    def test_exec_gate_cli_runs_the_remainder(self) -> None:
+        """The subparser dest must not share a name with the remainder.
+
+        `python3 board.py exec-gate ... -- <cmd>` is how board.sh starts
+        preflight. A remainder also named `command` overwrote the subparser
+        and compose ran instead.
+        """
+        import tempfile
+        tmp = Path(tempfile.mkdtemp())
+        log = tmp / "gate.log"
+        obs = tmp / "rig_obs.json"
+        status = board.main([
+            "exec-gate",
+            "--timeout", "2",
+            "--log", str(log),
+            "--obs", str(obs),
+            "--",
+            sys.executable, "-c", "raise SystemExit(3)",
+        ])
+        self.assertEqual(status, 3)
+        self.assertTrue(log.is_file())
+        self.assertFalse(obs.exists())
+
+
+class CdhashTests(unittest.TestCase):
+    def test_verbose_4_is_required_to_ask_for_cdhash(self) -> None:
+        args = board.codesign_cdhash_args("/tmp/Catcher.app")
+        self.assertEqual(args[:3], ["codesign", "-d", "--verbose=4"])
+        self.assertEqual(args[-1], "/tmp/Catcher.app")
+
+    def test_cdhash_line_is_parsed_and_a_display_without_it_stays_blank(self) -> None:
+        shown = (
+            "Executable=/tmp/Catcher.app/Contents/MacOS/CatcherApp\n"
+            "Identifier=com.catcher.app\n"
+            "CandidateCDHash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "CDHash=57250034b55e54e3ad6798983edf6e62c1553653\n"
+        )
+        self.assertEqual(
+            board.cdhash_from_codesign(shown),
+            "57250034b55e54e3ad6798983edf6e62c1553653",
+        )
+        hidden = "Identifier=com.catcher.app\nSignature size=4789\nTeamIdentifier=not set\n"
+        self.assertEqual(board.cdhash_from_codesign(hidden), "")
+
 
 if __name__ == "__main__":
     unittest.main()

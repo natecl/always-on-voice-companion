@@ -23,6 +23,22 @@ GATES = ("p1", "p2", "p3", "p4", "p5", "p6")
 HERE = Path(__file__).resolve().parent
 
 
+def codesign_cdhash_args(app: str) -> list[str]:
+    """`codesign -d` hides CDHash until verbosity 4."""
+    return ["codesign", "-d", "--verbose=4", app]
+
+
+def cdhash_from_codesign(text: str) -> str:
+    """The CDHash line from codesign's display output, or empty when absent.
+
+    CandidateCDHash is a different field and is not this value.
+    """
+    for line in text.splitlines():
+        if line.startswith("CDHash="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
 def orphan_kind(command: str) -> str | None:
     """CatcherApp from any build, or afplay of this harness's fixture."""
     if "/Contents/MacOS/CatcherApp" in command:
@@ -387,7 +403,9 @@ def main(argv: list[str]) -> int:
     execute.add_argument("--timeout", type=float, required=True)
     execute.add_argument("--log", type=Path, required=True)
     execute.add_argument("--obs", type=Path, required=True)
-    execute.add_argument("command", nargs=argparse.REMAINDER)
+    # Not dest="command": that name is the subparser, and a remainder with
+    # the same dest overwrites it, so exec-gate used to fall through to compose.
+    execute.add_argument("argv", nargs=argparse.REMAINDER)
 
     build = sub.add_parser("compose")
     build.add_argument("--run", type=Path, required=True)
@@ -399,7 +417,7 @@ def main(argv: list[str]) -> int:
     if args.command == "reap-orphans":
         return reap_orphans(args.obs)
     if args.command == "exec-gate":
-        command = list(args.command)
+        command = list(args.argv)
         if command and command[0] == "--":
             command = command[1:]
         if not command:

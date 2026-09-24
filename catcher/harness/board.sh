@@ -69,13 +69,17 @@ write_env() {
 import json, os, platform, subprocess, sys
 from pathlib import Path
 path, root, app, eligible = sys.argv[1:]
+sys.path.insert(0, root)
+import board as board_mod
 cdhash = ""
 plist = ""
 if app and Path(app).is_dir():
-    sign = subprocess.run(["codesign", "-dv", app], capture_output=True, text=True).stderr
-    for line in sign.splitlines():
-        if line.startswith("CDHash="):
-            cdhash = line.split("=", 1)[1]
+    try:
+        sign = subprocess.run(board_mod.codesign_cdhash_args(app), capture_output=True, text=True)
+    except OSError:
+        sign = None
+    if sign is not None:
+        cdhash = board_mod.cdhash_from_codesign(sign.stderr + "\n" + sign.stdout)
     plist_path = Path(app) / "Contents" / "Info.plist"
     if plist_path.is_file():
         read = subprocess.run(
