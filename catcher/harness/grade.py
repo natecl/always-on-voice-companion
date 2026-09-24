@@ -352,6 +352,79 @@ def load_harness_run(session: Path) -> dict | None:
     return None
 
 
+def load_rig_obs(session: Path) -> dict | None:
+    """`<root>/rig_obs.json`, written by the gate before it grades. A missing
+    file or a tag other than `ok` means the rig did not see the effect."""
+    for candidate in (session.parent / "rig_obs.json", session / "rig_obs.json"):
+        if candidate.is_file():
+            try:
+                loaded = json.loads(candidate.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                return None
+            return loaded if isinstance(loaded, dict) else None
+    return None
+
+
+def rig_evidence(gate: Gate, session: Path) -> dict | None:
+    obs = load_rig_obs(session)
+    if obs is None:
+        gate.check("rig:evidence", False, "no rig_obs.json next to the session", PREMISE_CHECK)
+        return None
+    tag = obs.get("tag")
+    gate.check(
+        "rig:evidence",
+        tag == "ok",
+        f"rig_obs tag={tag!r}",
+        PREMISE_CHECK,
+    )
+    return obs
+
+
+def rig_drops_cover_gap(gate: Gate, rows: list[dict], obs: dict | None, pf_on: int) -> None:
+    """The samples that saw drops have to sit inside the graded system gap.
+
+    A gap the rig never saw drops for is a premise failure, not a pass.
+    No system gap yet is the product check's failure, not a second one.
+    """
+    if obs is None or obs.get("tag") != "ok":
+        return
+    _, gap, _ = p3_chain(rows, "system", pf_on)
+    if gap is None:
+        return
+    samples = obs.get("samples")
+    if not isinstance(samples, list):
+        gate.check("rig:drops-cover-gap", False, "rig_obs has no samples", PREMISE_CHECK)
+        return
+    mapped: list[int] = []
+    for sample in samples:
+        if not isinstance(sample, dict):
+            continue
+        drops = int(sample.get("dropsIn") or 0) + int(sample.get("dropsOut") or 0)
+        wall = sample.get("atWallMs")
+        if drops <= 0 or not isinstance(wall, int):
+            continue
+        session_ms = wall_to_session_ms(rows, wall)
+        if session_ms is not None:
+            mapped.append(session_ms)
+    gap_from = int(gap[1]["detail"].get("fromMs", 0))
+    gap_to = int(gap[1]["detail"].get("toMs", 0))
+    if not mapped:
+        gate.check(
+            "rig:drops-cover-gap",
+            False,
+            f"no drop sample mapped into the session; gap {gap_from}-{gap_to}",
+            PREMISE_CHECK,
+        )
+        return
+    window = (min(mapped), max(mapped))
+    gate.check(
+        "rig:drops-cover-gap",
+        gap_from <= window[0] and window[1] <= gap_to,
+        f"drops at session ms {window[0]}-{window[1]} vs gap {gap_from}-{gap_to}",
+        PREMISE_CHECK,
+    )
+
+
 def app_sha(rows: list[dict]) -> str:
     app = str(header(rows).get("app", ""))
     return app.split("+", 1)[1] if "+" in app else ""
@@ -594,6 +667,7 @@ def grade_p3(gate: Gate, session: Path, rows: list[dict], run: dict | None) -> N
     grade_p3_track(gate, session, rows, "system", pf_on, pf_off)
     if mic_gap:
         grade_p3_track(gate, session, rows, "microphone", pf_on, pf_off)
+    rig_drops_cover_gap(gate, rows, load_rig_obs(session), pf_on)
 
 
 def grade_p3_track(gate: Gate, session: Path, rows: list[dict], track: str, pf_on: int, pf_off: int) -> None:
@@ -847,6 +921,7 @@ def grade_gate(
 ) -> dict[str, object]:
     gate = Gate()
     run = load_harness_run(session)
+    rig_evidence(gate, session)
     if revoke_at is None and run is not None and isinstance(run.get("revokeWallMs"), int):
         revoke_at = wall_to_session_ms(rows, run["revokeWallMs"])
     if name in ("P1", "P3", "P5", "P6"):

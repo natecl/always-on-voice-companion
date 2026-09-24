@@ -162,6 +162,22 @@ class GreenEndToEndTests(TempRoot):
         self.assertEqual(report["sha"], "abc123")
         self.assertEqual(report["cdhash"], "deadbeef")
 
+    def test_failing_preflight_is_red_even_when_every_gate_passes(self) -> None:
+        (self.root / "preflight.txt").write_text("PREFLIGHT signing PASS\nPREFLIGHT RESULT FAIL failed=1\n", encoding="utf-8")
+        argv = sys.argv
+        sys.argv = ["verdict.py", "--out", str(self.root / "out"), "--preflight", str(self.root / "preflight.txt")]
+        for name, root in self.build().items():
+            sys.argv += [f"--{name.lower()}", str(root)]
+        try:
+            status = verdict.main()
+        finally:
+            sys.argv = argv
+        report = json.loads((self.root / "out" / "v0-verdict.json").read_text())
+        self.assertEqual(status, 1)
+        self.assertEqual(report["verdict"], "RED")
+        self.assertTrue(any(reason.startswith("preflight ") for reason in report["reasons"]))
+        self.assertEqual(report["gates"]["P1"]["rig"]["tag"], "ok")
+
     def test_one_gate_from_another_build_is_red(self) -> None:
         report = self.verdict(self.build(p3_sha="fff999"))
         self.assertEqual(report["verdict"], "RED")

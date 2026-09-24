@@ -12,7 +12,7 @@ v0 stays red until `v0-verdict.json` is `GREEN` for the SHA being claimed.
 |---|---|---|
 | **M** | `v0-verdict.json` with `"verdict": "GREEN"` for a SHA, produced on a Mac by `run.sh verdict` | The only v0 claim. "Mac GREEN @sha" means this file, with that `sha`. |
 | **G** | One gate's `grade.json` with `result: pass` (provenance checked) | That gate on that SHA. "Fixed P3" needs Tier G for P3 on that SHA. |
-| **L** | `swift test` (Linux VM or `macos-15` CI), `harness/tests` (`test_grade.py`, `test_verdict.py`), scripted or fake transports, including the `macParked` profile | Regression only. |
+| **L** | `swift test` (Linux VM or `macos-15` CI), `harness/tests` (`test_grade.py`, `test_verdict.py`, `test_pf_obs.py`, `test_board.py`), scripted or fake transports, including the `macParked` profile | Regression only. |
 
 Tier L is never cited as P1–P6 evidence in a commit message, PR body, or status update.
 
@@ -24,7 +24,7 @@ Each gate in `grade.json` is `{"result", "evidence", "checks"}`. `checks` is an 
 |---|---|
 | `pass` | Every check passed **and** provenance says a Mac harness run of this build. The only result that counts. |
 | `fail` | A product check failed. |
-| `invalid` | The run did not set up the premise (P4 room not quiet, P3 block too short or resumed while `pf` was on). Not a pass and not a product failure: re-run. |
+| `invalid` | The run did not set up the premise (P4 room not quiet, P3 block too short or resumed while `pf` was on, missing or non-`ok` `rig_obs.json`, P3 drop samples outside the graded gap). Not a pass and not a product failure: re-run. |
 | `unproven` | The checks passed but provenance is missing or not a Mac harness run (graded on Linux, no `harness_run.json`, wrong gate, macOS < 15, `unknown` or `-dirty` or mismatched build SHA, session older than the harness start, no CDHash). **Never a pass.** |
 | `n/a` | Not requested. |
 
@@ -46,13 +46,14 @@ A stub engine header on P1, P3, or P6 is `fail` ("stub engine cannot prove P1/P3
 
    If the window shows a red line under `BLOCKED`, read it: it is the same text as the Console line `Catcher mic authority …` and names the one fix. `audioInputEntitlement=false` with `hardenedRuntime=true` means the bundle was signed without `com.apple.security.device.audio-input`; rebuild with `build-app.sh` (it now fails a build like that). `ownsTCCIdentity=false responsible=Terminal` means it was started from a shell; press **Relaunch Catcher for microphone** or quit and use `open -n`. `status=notDetermined` means Allow can still appear; press **Request microphone** with Catcher in front. `status=denied` means Catcher has a denied row; Re-grant opens Privacy → Microphone where the toggle is. `status=authorized ownsTCCIdentity=true audioInputEntitlement=true` with any denied banner is a bug — copy the Console line and the banner into the report. Quit Zoom before retrying; a call can suppress Allow.
 4. `export XAI_API_KEY=...` for any gate that uses Grok (`P1`, `P3`, `P6`). `CATCHER_ENGINE=grok` is the default. `CATCHER_ENGINE=stub` forces the deterministic engine.
-5. Run preflight before P1. Do not start P1 on a FAIL line; the fix on that line is the next action.
+5. Run preflight before any gate. The board stops on a FAIL line and does not launch P1–P6 or play the fixture. The fix on that line is the next action.
 
    ```bash
    ./catcher/harness/run.sh preflight /tmp/catcher-pre
+   ./catcher/harness/run.sh board /tmp/catcher-auto
    ```
 
-   The command exits 0 only when `/tmp/catcher-pre/preflight.txt` ends in `PREFLIGHT RESULT PASS`. Checks, the sample stage log, and how to read a failure are in [`v0-diagnostics.md`](v0-diagnostics.md).
+   `preflight` exits 0 only when `preflight.txt` ends in `PREFLIGHT RESULT PASS`. `board` writes `board.json` and returns on any other result, with no gate directory and no `afplay`. A missing RESULT within 120s is `preflight-finish` `error=no-result source=harness`: the harness kills that preflight process and launches preflight once more. A second `no-result` stops the board RED. No other FAIL is retried. Checks and the board fields are in [`v0-diagnostics.md`](v0-diagnostics.md). The self-test on the known-good tip is in [`rig-self-test.md`](rig-self-test.md).
 6. Replace `catcher/harness/fixtures/known-60s.wav` with a clear ~60 s reading of `known-60s.ref.txt` before scoring P1. The file in git is a 16 kHz mono PCM16 carrier so the script has something to play. It is not that reading. WER against the reference will fail until you replace it.
 
 ## How a run is laid out
@@ -73,10 +74,15 @@ The path you pass is `CATCHER_SESSION_ROOT`. The app creates one directory per r
   stages.log            stage checkpoints; grade.py does not read this
   grade.json            written by harness/grade.py
   ../harness_run.json   provenance, written before launch (below)
+  ../rig_obs.json       what the rig observed; tag must be ok or the gate is invalid
   ../catcher.pid        pid of the app binary, next to the uuid directory
   ../live_session       absolute path of the first recording (harness only)
+  ../window_front       harness window probe (source harness-cgwindowlist)
   ../revoke_session     P2: that path, copied before tccutil reset
   ../revoke_wall_ms     P2 only, wall-clock milliseconds (also revokeWallMs in harness_run.json)
+
+<run>/board.json        board.py compose: every field names the file it came from
+<run>/obs/              orphans.jsonl, afplay.log, board-env.json (survive cleanup)
 
 <out>/v0-verdict.json   run.sh verdict: six gates re-graded, GREEN or RED
 ```
@@ -96,11 +102,11 @@ CI (`.github/workflows/catcher-ci.yml`) has two Tier L jobs: `library-tests-not-
 | Gate | What you do | Pass (every check; see `grade.json` `checks`) |
 |---|---|---|
 | **P1** | `run.sh p1 <dir>` plays the fixture, `kill -9`s the app, relaunches so crash recovery runs, then grades. Always Grok. | Header engine is Grok. System-track WER ≤ 15 % against `known-60s.ref.txt`. No >2 s hole in system speech (AC RMS windows of `system.pcm` over 0.001, so DC offset is not speech). A recovered session. No `noAudio` whose 10 s window holds sustained speech in either PCM. |
-| **P2** | `CATCHER_ALLOW_TCC_RESET=1 run.sh p2 <dir>`. The script runs `tccutil reset ScreenCapture com.catcher.app` and waits for you to re-grant. The score is the session that was recording at the reset. | An `ann` with `kind: blocked` on that live session within 2 s of the revoke, and no `seg` after that timestamp. |
-| **P3** | As root, `CATCHER_ALLOW_PF=1 run.sh p3 <dir>`. The fixture loops from launch. `api.x.ai:443` is blocked for 15 s and `pfOnWallMs` / `pfOffWallMs` are recorded. No enter: the script waits for `resumed track=system`, then records `backlogMs` + 3 s + 20 s more. | Grok header. Per track (system required; microphone when it has a gap): a `gap` spanning ≥ 10 s (shorter is `invalid`); a `degraded` with that `track=` within 12 s of `pf` on (startup or heartbeat degrades do not count); `degraded` < `gap` < `resumed track=<t>` in file order, the gap covering the block; `resumed` after `pf` off (while `pf` was on is `invalid`) and within 45 s; ≥ 10 words of system `seg` starting at `resumed.atMs + backlogMs + 3 s` (earlier segs are replayed backlog and do not count); no degrade or gap left open after resume; the session runs ≥ 20 s past live. |
-| **P4** | Mute output, stay quiet, `run.sh p4 <dir>` (16 s run). | A `noAudio` with `atMs` within 10 s of capture start (`observedFromMs`); its `emittedAtMs` no later than that + 1.5 s; not the `no frames` path and both PCM files covering capture start to emission (a dead capture fails); no non-blank `seg` and no "audio is flowing" heartbeat before emission. Sustained audio in either PCM (AC RMS over 0.025) or system AC RMS over 0.001 is `invalid`: the room was not quiet or output was not muted. |
+| **P2** | `CATCHER_ALLOW_TCC_RESET=1 run.sh p2 <dir>`. The script runs `tccutil reset ScreenCapture com.catcher.app` and polls the pinned session for a `blocked` ann (10s). It does not read stdin. The score is the session that was recording at the reset. The grant is not restored by the script. | An `ann` with `kind: blocked` on that live session within 2 s of the revoke, and no `seg` after that timestamp. `rig_obs.json` `tag=ok` only if `tccutil` exited 0 and that ann was observed. |
+| **P3** | `CATCHER_ALLOW_PF=1 run.sh p3 <dir>`. `sudo -n /sbin/pfctl` (root calls `/sbin/pfctl` directly). The fixture loops only after the window probe. The anchor is `com.apple/catcher` when the main ruleset evaluates `com.apple/*`, else `catcher` when that anchor is the ruleset, else `/etc/pf.conf` is loaded for an empty ruleset and flushed on cleanup. A ruleset with neither hook is not modified (`ruleset-foreign`). States are killed per live peer, then `api.x.ai:443` stays blocked for 15 s with packet samples at 2s, 8s, and 14s. `pfOnWallMs` / `pfOffWallMs` are recorded. No enter. | Grok header. `rig_obs.json` `tag=ok` only when the block-drop rules dropped packets and the rules stayed loaded. The drop samples must fall inside the graded system gap (`rig:drops-cover-gap`, else `invalid`). Per track (system required; microphone when it has a gap): a `gap` spanning ≥ 10 s (shorter is `invalid`); a `degraded` with that `track=` within 12 s of `pf` on (startup or heartbeat degrades do not count); `degraded` < `gap` < `resumed track=<t>` in file order, the gap covering the block; `resumed` after `pf` off (while `pf` was on is `invalid`) and within 45 s; ≥ 10 words of system `seg` starting at `resumed.atMs + backlogMs + 3 s` (earlier segs are replayed backlog and do not count); no degrade or gap left open after resume; the session runs ≥ 20 s past live. |
+| **P4** | `run.sh p4 <dir>` mutes output, reads it back, holds 16s, and restores the previous mute. It does not read stdin. | A `noAudio` with `atMs` within 10 s of capture start (`observedFromMs`); its `emittedAtMs` no later than that + 1.5 s; not the `no frames` path and both PCM files covering capture start to emission (a dead capture fails); no non-blank `seg` and no "audio is flowing" heartbeat before emission. Sustained audio in either PCM (AC RMS over 0.025) or system AC RMS over 0.001 is `invalid`: the room was not quiet or output was not muted. `rig_obs.json` records the mute readback. |
 | **P5** | `run.sh p5 <stub-dir> <grok-session-dir>`. Forces `CATCHER_ENGINE=stub` and replays the fixture. `verdict` uses the P1 session as the reference. | Header engine `stub`. JSONL row types and keys match the schema and the reference's shape. The reference is a Grok session from the same build SHA. Transcript text is not compared. |
-| **P6** | `run.sh p6 <dir>` while you talk over the fixture at normal conversational volume, arm's length. | Grok header. At least one `seg` on `microphone` and one on `system`, a non-null `speaker` on a system `seg`, no `noAudio` over sustained speech, and median mic speech AC RMS ≥ 2 × the 0.05 `noAudio` floor. Evidence always prints mic p10/p50/p90 (calibration data for the floor). `microphone.pcm` is recorded after the app's microphone gain (`MicrophoneGain`: held speech toward −14 dBFS, at most +24 dB, unity on room tone); `stages.log` `pcm-extract` reports `micGain`/`micGainMax`. |
+| **P6** | `run.sh p6 <dir>` plays the fixture through the speakers. It does not ask anyone to talk. Output must be unmuted and the volume above 0, or the gate stops before `afplay`. | Grok header. At least one `seg` on `microphone` and one on `system`, a non-null `speaker` on a system `seg`, no `noAudio` over sustained speech, and median mic speech AC RMS ≥ 2 × the 0.05 `noAudio` floor. Evidence always prints mic p10/p50/p90 (calibration data for the floor). `microphone.pcm` is recorded after the app's microphone gain (`MicrophoneGain`: held speech toward −14 dBFS, at most +24 dB, unity on room tone); `stages.log` `pcm-extract` reports `micGain`/`micGainMax`. |
 
 P2 and P3 refuse to touch TCC or the packet filter unless the matching `CATCHER_ALLOW_*` variable is `1`.
 

@@ -48,13 +48,30 @@ def grade_root(gate: str, root: Path, *, shape_reference: Path | None, ref: Path
         expect_recovery=gate == "P1",
         shape_reference=shape_reference if gate == "P5" else None,
     )
+    obs = grade.load_rig_obs(session)
     return {
         **graded,
         "session": str(session),
         "sha": grade.app_sha(rows),
         "cdhash": str((run.get("codesign") or {}).get("cdhash", "")),
         "engine": str(grade.header(rows).get("engine", "")),
+        "rig": obs if isinstance(obs, dict) else "not-observed",
     }
+
+
+def preflight_result(path: Path) -> str:
+    """Last PREFLIGHT RESULT line, or a missing marker the board can quote."""
+    if not path.is_file():
+        report = path / "preflight.txt"
+    else:
+        report = path
+    if not report.is_file():
+        return "missing"
+    lines = [line.strip() for line in report.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
+    for line in reversed(lines):
+        if line.startswith("PREFLIGHT RESULT "):
+            return line
+    return "missing"
 
 
 def decide(gates: dict[str, dict[str, object]]) -> tuple[str, list[str], str, str]:
@@ -94,6 +111,7 @@ def main() -> int:
         parser.add_argument(f"--{name.lower()}", type=Path, required=True, help=f"{name} root passed to run.sh")
     parser.add_argument("--shape-reference", type=Path, help="Grok session for P5; defaults to the P1 session")
     parser.add_argument("--ref", type=Path, default=REF)
+    parser.add_argument("--preflight", type=Path, help="preflight dir or preflight.txt; a non-PASS verdict is RED")
     parser.add_argument("--out", type=Path, required=True, help="v0-verdict.json path or a directory for it")
     args = parser.parse_args()
     roots = {name: getattr(args, name.lower()) for name in grade.GATES}
@@ -103,11 +121,18 @@ def main() -> int:
         for name in grade.GATES
     }
     verdict, reasons, sha, cdhash = decide(gates)
+    preflight = None
+    if args.preflight is not None:
+        preflight = preflight_result(args.preflight)
+        if not preflight.startswith("PREFLIGHT RESULT PASS"):
+            reasons.append(f"preflight {preflight}")
+            verdict = "RED"
     report = {
         "verdict": verdict,
         "sha": sha,
         "cdhash": cdhash,
         "reasons": reasons,
+        "preflight": preflight if preflight is not None else "not-requested",
         "shapeReference": str(shape_reference),
         "gates": gates,
         "gradedOn": graded_on(),

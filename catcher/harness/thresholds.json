@@ -18,5 +18,18 @@
   "p3MinLiveWords": 10,
   "p3MinTailMs": 20000,
   "p3FallbackReplayMs": 30000,
-  "p6MicSpeechFloorRatio": 2.0
+  "p6MicSpeechFloorRatio": 2.0,
+  "rigWindowMinWidth": 720,
+  "rigWindowMinHeight": 520,
+  "rigP3SampleMs": [2000, 8000, 14000],
+  "rigPreflightTimeoutS": 120,
+  "rigGateTimeoutS": {
+    "preflight": 300,
+    "p1": 200,
+    "p2": 90,
+    "p3": 360,
+    "p4": 90,
+    "p5": 200,
+    "p6": 150
+  }
 }
